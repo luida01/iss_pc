@@ -960,7 +960,8 @@ void Rasterizer::PrintPipeStats() {
         window = now;
         last_tsc = tsc;
         return;
-    }    const u64 busy = draw_pipe->busy_cycles.load(std::memory_order_relaxed);
+    }
+    const u64 busy = draw_pipe->busy_cycles.load(std::memory_order_relaxed);
     const u64 spin = draw_pipe->spin_cycles.load(std::memory_order_relaxed);
     const u64 sleeps = draw_pipe->sleeps.load(std::memory_order_relaxed);
     std::printf("Draw pipe: %.0f draws/s pipelined, %.0f drains/s that waited, stage A waited "

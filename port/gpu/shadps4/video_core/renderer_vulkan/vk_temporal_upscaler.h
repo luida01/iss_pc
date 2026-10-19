@@ -187,7 +187,9 @@ private:
     CameraMotion& camera_motion;
     SceneTargets& scene_targets;
     int applied_preset = -1;
-    int applied_upscaler = -1;
+    /// tlg: starts at "no upscaler": with the upscaler off, the frame start does not have to
+    /// build the FSR 4 object (nor wait for the GPU) at every start.
+    int applied_upscaler = 0;
     bool dispatched_last_frame = false;
     bool last_active = false, last_jitter = false;
 
