@@ -32,6 +32,11 @@
 .PARAMETER KeepOpen
     No cierra la ventana al terminar cada pasada (para sesiones manuales).
 
+.PARAMETER WarmupSec
+    Pasada de calentamiento antes de medir (por defecto 0 = ninguna). El fix del recompilador
+    invalida la cache de shaders una vez: sin calentar, la primera configuracion mediria la
+    compilacion en vez del rendimiento.
+
 .EXAMPLE
     .\tools\perf-ab.ps1 -DurationSec 180
     .\tools\perf-ab.ps1 -Configs @{ 'prueba' = @{ resolution = '720p'; env = @{ ISS_UPSCALER = 'fsr3' } } } -DurationSec 90
@@ -43,6 +48,7 @@ param(
     [string]$Tag = 'perf-ab',
     [string]$OutDir = '',
     [switch]$KeepOpen,
+    [ValidateRange(0, 600)][int]$WarmupSec = 0,
     [string]$Python = 'python'
 )
 
@@ -78,6 +84,11 @@ if (-not $OutDir) {
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 $rows = @()
+if ($WarmupSec -gt 0) {
+    Write-Host "=== calentamiento ($WarmupSec s, no se mide) ===" -ForegroundColor DarkGray
+    & '.\tools\run-baseline.ps1' -DurationSec $WarmupSec -Resolution '720p' -Tag 'warmup' `
+        -ExtraEnv @{ ISS_UPSCALER = 'off' } -Python $Python | Out-Null
+}
 foreach ($name in $Configs.Keys) {
     $cfg = $Configs[$name]
     # Forma simple: un hashtable plano son variables de entorno.
