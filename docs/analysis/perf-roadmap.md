@@ -104,7 +104,20 @@ Barrido automático de los ajustes y de los toggles del port:
 - VRAM estable ≤ 3800 MB y sin "evicted" en el log.
 - 15-30 min de juego real sin reinicios ni congelaciones (Gate G0).
 
-## 5. Protocolo de medición
+## 4. Estado tras la primera tanda de Agents (2026-10-19, tarde)
+
+| Palanca | Resultado |
+|---|---|
+| **P1 · Política del colector de texturas** | **hecha** (`5fbf4d5`): la caché usa sus propios bytes contra el presupuesto del launcher; el total inflado del driver se descarta; el objetivo no pasa del 90 % de la tarjeta. En la sesión de verificación: **0 expulsiones** (antes 334 por ventana de 5 s) |
+| **P4 · Dial de resolución** | **hecho** (`1318134`): el preset reduce la escena también sin upscaler temporal. Con Native AA el comportamiento es idéntico al anterior |
+| **P13 · Partículas (ReadFirstLane wave64)** | **hecha** (`dc12e8d`): 331 de 346 shaders compute se bajaban mal y la mitad de las partículas se perdía |
+| **Crash de lectura en `PrepareRenderState`** | **hecho** (`0fa8c4d`): la clave del memo de targets no se reiniciaba y, a la cuarta búsqueda, escribía fuera del búfer de 256 B y corrompía el id de imagen del rasterizador. Con canario en el test |
+| **División por cero del invitado** | **hecha** (`e3e249b`): en la PS4 el DIV por cero no da trap; el port emula el resultado y sigue (solo en el rango del invitado) |
+| **Perfil del port** | Las esperas caen del 30-44 % al **1-2 %**: el cuello ya no es el camino de CPU del port, sino el trabajo de GPU de la escena → la palanca que queda es la resolución (P6) |
+| **P2 · Write faults** | Sin resolver: 1358-1823 faults/s. "Hot pages" se descartó (medido peor) |
+| **P3 · ProcessGraphics/ProcessCompute** | Los dos perfiles nuevos (`TLG_DRAW_PROFILE=1`, `TLG_PM4_PROFILE=1`) permiten atribuir el 88 % de ocupación del hilo de grabación; falta la medición en vivo |
+
+## 5. Fase final: checklist (cuando lleguen los tres agentes)
 
 1. `tools\perf-ab.ps1` encadena configuraciones y produce `summary.csv` + `summary.md`.
 2. Cada pasada: 120-180 s, la misma zona, capturas cada 30 s.
