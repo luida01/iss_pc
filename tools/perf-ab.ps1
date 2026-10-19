@@ -56,6 +56,13 @@ if ($Configs.Count -eq 0) {
         '720p-fsr3-jitter'  = @{ resolution = '720p'; env = @{ ISS_UPSCALER = 'fsr3'; ISS_JITTER = '1' }; ini = @{ preset = '0' } }
         '720p-fsr411'       = @{ resolution = '720p'; env = @{ ISS_UPSCALER = 'fsr411' }; ini = @{ preset = '0' } }
         '720p-fsr3-calidad' = @{ resolution = '720p'; env = @{ ISS_UPSCALER = 'fsr3' }; ini = @{ preset = '1' } }
+        # tlg: el preset reduce la escena tambien sin upscaler temporal (la escena se
+        # renderiza a esa resolucion y el post del juego la reesamplea): sin esto el dial
+        # no hacia nada con el upscaler apagado (el arranque por defecto).
+        # TLG_UPSCALE_PRESET es el override por entorno de la clave "preset" de tlg.ini.
+        '720p-calidad'       = @{ resolution = '720p'; env = @{ ISS_UPSCALER = 'off'; TLG_UPSCALE_PRESET = '1' } }
+        '720p-balanceado'    = @{ resolution = '720p'; env = @{ ISS_UPSCALER = 'off'; TLG_UPSCALE_PRESET = '2' } }
+        '720p-performance'   = @{ resolution = '720p'; env = @{ ISS_UPSCALER = 'off'; TLG_UPSCALE_PRESET = '3' } }
         '480p-nativo'       = @{ resolution = '480p'; env = @{ ISS_UPSCALER = 'off' }; ini = @{ preset = '0' } }
         # El fix de ReadFirstLane (wave64) anade barreras: se mide su coste con la variante vieja.
         '720p-rfl-viejo'    = @{ resolution = '720p'; env = @{ ISS_UPSCALER = 'off'; TLG_RFL_ALL = '0' }; ini = @{ preset = '0' } }
