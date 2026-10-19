@@ -42,7 +42,7 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         return;
     }
     if (key == "overlay_corner") {
-        v.overlay_corner = i >= 0 && i <= 3 ? i : 1;
+        v.overlay_corner = i >= 0 && i <= 3 ? i : 0;
         return;
     }
     if (key == "overlay_opacity") {

@@ -98,6 +98,50 @@ std::string GetReadableVersion(u32 version) {
                        VK_VERSION_PATCH(version));
 }
 
+// tlg: one-time probe (docs/analysis/bc1d-auto-fix.md): can this driver create 1D images of the
+// block-compressed formats the game binds? Mirrors what Image creation asks the driver later
+// (image.cpp): mutable and extended usage flags, the block texel view flag when the 2D probe
+// takes it, storage usage with the same fallback to without it. The game only samples and copies
+// these images, so a format refused here is refused on the real creation too (NVIDIA 617.x then
+// faults in the game shortly after).
+bool DriverSupportsBc1D(vk::PhysicalDevice physical_device) {
+    const bool supports_block_texel_view =
+        physical_device
+            .getImageFormatProperties(vk::Format::eBc1RgbaUnormBlock, vk::ImageType::e2D,
+                                      vk::ImageTiling::eOptimal,
+                                      vk::ImageUsageFlagBits::eSampled,
+                                      vk::ImageCreateFlagBits::eBlockTexelViewCompatible)
+            .result == vk::Result::eSuccess;
+    const vk::ImageCreateFlags creation_flags =
+        vk::ImageCreateFlagBits::eMutableFormat | vk::ImageCreateFlagBits::eExtendedUsage |
+        (supports_block_texel_view
+             ? vk::ImageCreateFlags{vk::ImageCreateFlagBits::eBlockTexelViewCompatible}
+             : vk::ImageCreateFlags{});
+    const vk::ImageUsageFlags base_usage = vk::ImageUsageFlagBits::eTransferSrc |
+                                           vk::ImageUsageFlagBits::eTransferDst |
+                                           vk::ImageUsageFlagBits::eSampled;
+    static constexpr vk::Format kFormats[] = {
+        vk::Format::eBc1RgbUnormBlock, vk::Format::eBc1RgbaUnormBlock,
+        vk::Format::eBc1RgbSrgbBlock,  vk::Format::eBc1RgbaSrgbBlock,
+        vk::Format::eBc2UnormBlock,    vk::Format::eBc2SrgbBlock,
+        vk::Format::eBc3UnormBlock,    vk::Format::eBc3SrgbBlock,
+        vk::Format::eBc4UnormBlock,    vk::Format::eBc4SnormBlock,
+        vk::Format::eBc5UnormBlock,    vk::Format::eBc5SnormBlock,
+    };
+    for (const vk::Format format : kFormats) {
+        const auto accepted = [&](vk::ImageUsageFlags usage) {
+            return physical_device
+                       .getImageFormatProperties(format, vk::ImageType::e1D,
+                                                 vk::ImageTiling::eOptimal, usage, creation_flags)
+                       .result == vk::Result::eSuccess;
+        };
+        if (!accepted(base_usage | vk::ImageUsageFlagBits::eStorage) && !accepted(base_usage)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // Anonymous namespace
 
 Instance::Instance(bool enable_validation, bool enable_crash_diagnostic)
@@ -875,24 +919,22 @@ void Instance::CollectDeviceParameters() {
     std::printf("GPU: guest multisampling %s\n",
                 no_msaa ? "off (single-sampled images; TLG_NO_MSAA=0 keeps it)" : "on");
 
-    // tlg: see video_core/amdgpu/tlg_block1d.h. The query uses the plainest usage the game's BC
-    // 1D textures need (sampled, filled by copies).
+    // tlg: see video_core/amdgpu/tlg_block1d.h and docs/analysis/bc1d-auto-fix.md. One-time probe
+    // of BC1-BC5 1D support, before any image or shader exists; the plainest usage the game's BC
+    // 1D textures need (sampled, filled by copies) plus the flags the cache adds.
     const char* block1d_env = std::getenv("TLG_BLOCK1D");
-    const bool bc1d_refused =
-        physical_device
-            .getImageFormatProperties(vk::Format::eBc1RgbaUnormBlock, vk::ImageType::e1D,
-                                      vk::ImageTiling::eOptimal,
-                                      vk::ImageUsageFlagBits::eSampled |
-                                          vk::ImageUsageFlagBits::eTransferDst)
-            .result != vk::Result::eSuccess;
+    const bool bc1d_refused = !DriverSupportsBc1D(physical_device);
     const bool block1d_as_2d = block1d_env && *block1d_env
                                    ? *block1d_env == '1'
                                    : bc1d_refused && driver_id != vk::DriverId::eNvidiaProprietary;
     AmdGpu::block1d_as_2d.store(block1d_as_2d, std::memory_order_relaxed);
     if (bc1d_refused || block1d_as_2d) {
         std::printf("GPU: block-compressed 1D textures %s\n",
-                    block1d_as_2d ? "as 2D images (the driver refuses BC 1D; TLG_BLOCK1D=0 keeps 1D)"
-                                  : "kept 1D although the driver refuses them (TLG_BLOCK1D=1 makes them 2D)");
+                    block1d_as_2d
+                        ? "as 2D images (TLG_BLOCK1D=1 or a refusing driver; the 2D path can "
+                          "repeat HUD/fonts)"
+                        : "kept 1D although the driver refuses them (TLG_BLOCK1D=1 makes them 2D, "
+                          "which can repeat HUD/fonts)");
     }
 
     // tlg: BP09 (CTR d26bcb2): every 1D image as 2D of height 1; read once, before any image or
@@ -905,17 +947,26 @@ void Instance::CollectDeviceParameters() {
 
     // tlg: see video_core/amdgpu/tlg_bc_tiny.h. Set before any image or shader exists.
     const char* bc_tiny_env = std::getenv("TLG_BC_TINY");
-    // TLG_BC_TINY=auto: also decode on any driver that refuses BC 1D and is not given the 2D
-    // promotion (NVIDIA), so the driver never sees a block-compressed 1D image (test branch).
+    // Automatic since 2026-10-19 (docs/analysis/bc1d-auto-fix.md): a driver that refuses BC 1D
+    // and was not explicitly given the 2D promotion (TLG_BLOCK1D=1) decodes BC1-BC5 1D and
+    // under-4-texel textures on the CPU, so no BC 1D image is ever created. AMD's proprietary
+    // driver keeps its default: the 2D promotion crashes it too (iss_pc #16, #31, #49) and it
+    // already decoded here before.
+    // TLG_BC_TINY=1 / 0 force the decision; =auto spells out the automatic one.
     const bool bc_tiny_auto = bc_tiny_env && std::string_view{bc_tiny_env} == "auto";
-    const bool bc_tiny = bc_tiny_auto ? (bc1d_refused && !block1d_as_2d)
-                         : bc_tiny_env && *bc_tiny_env
-                             ? *bc_tiny_env == '1'
-                             : driver_id == vk::DriverId::eAmdProprietary;
+    const bool block1d_forced = block1d_env && *block1d_env && *block1d_env == '1';
+    const bool bc_tiny_auto_on = bc1d_refused && !block1d_forced;
+    const bool bc_tiny = bc_tiny_env && *bc_tiny_env
+                             ? (*bc_tiny_env == '1' || (bc_tiny_auto && bc_tiny_auto_on))
+                             : (driver_id == vk::DriverId::eAmdProprietary || bc_tiny_auto_on);
     AmdGpu::bc_tiny_decode.store(bc_tiny, std::memory_order_relaxed);
     std::printf("GPU: tiny block-compressed textures (BC1-BC5 1D, or under 4 texels) %s\n",
                 bc_tiny ? "decoded on the CPU to plain images, 1D kept 1D (TLG_BC_TINY=0 keeps BC)"
                         : "kept block-compressed (TLG_BC_TINY=1 decodes them on the CPU)");
+    if (bc_tiny_auto_on && !(bc_tiny_env && *bc_tiny_env)) {
+        std::printf("GPU: BC 1D unsupported by driver; decoding BC1-BC5 1D and under-4-texel BC "
+                    "on the CPU (auto; TLG_BC_TINY=0 or TLG_BLOCK1D=1 override)\n");
+    }
 
     // tlg: see video_core/amdgpu/tlg_amd_1d.h. Set before any image exists.
     auto env_flag = [](const char* name, bool fallback) {

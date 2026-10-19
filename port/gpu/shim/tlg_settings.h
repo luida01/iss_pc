@@ -51,7 +51,8 @@ struct Values {
     std::atomic<float> reactive_threshold{0.2f};
     std::atomic<float> reactive_max{0.9f};
     std::atomic<int> debug_view{DebugNone};
-    std::atomic<bool> show_fps{false};
+    /// On at start (gow3_pc ships show_fps=1); F10 toggles it and tlg.ini / TLG_SHOW_FPS override it.
+    std::atomic<bool> show_fps{true};
     /// Sensor mode's aiming speed (the graffiti cursor), percent of the default: 25..200.
     std::atomic<int> sensor_aim{100};
     /// The graffiti guide was shown once; the menu's Controls tab opens it again.
@@ -60,7 +61,8 @@ struct Values {
     /// in percent, corner (0 top left, 1 top right, 2 bottom left, 3 bottom right), layout
     /// (0 one line, 1 one item per line). menu_tab: the menu's last tab.
     std::atomic<unsigned> overlay_items{TlgPerfStats::DefaultItems};
-    std::atomic<int> overlay_scale{100}, overlay_corner{1}, overlay_opacity{50}, overlay_layout{0};
+    /// Readable at 1080p without hiding the image: 115% text, 35% background, top left.
+    std::atomic<int> overlay_scale{115}, overlay_corner{0}, overlay_opacity{35}, overlay_layout{0};
     std::atomic<int> menu_tab{0};
     std::atomic<float> red_orb_multiplier{1.0f};
     std::atomic<bool> red_orbs_supported{false};

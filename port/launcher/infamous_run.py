@@ -233,7 +233,7 @@ DEFAULT_SETTINGS = {
     'game_dir': '' if FROZEN else str(REPO_DIR / 'game' / 'CUSA00223'),
     'game_language': 'auto',       # auto (system language) | a key of GAME_LANGUAGES
     'ui_language': 'auto',         # auto | pt_BR | en_US
-    'show_fps': False,
+    'show_fps': True,          # metrics HUD on at start (F10 toggles); gow3_pc ships show_fps=1
     'display_mode': 'Windowed',    # Windowed | Borderless | Fullscreen (tlg.ini)
     'vsync': True,
     'vram_budget_mb': 3500,  # 5600 runs out of VRAM loading the first level (RTX 2060, 6 GB)

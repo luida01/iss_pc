@@ -28,7 +28,7 @@ PRESET_ITEMS = ('menu:fps_limit', 'menu:frames_queued', 'menu:fsr1', 'menu:rcas'
 FULL_PRESETS = {p['id']: p for p in (REC1, CURRENT, AMD, RX580, SECO, *APOLAR_PRESETS)}
 # Defaults of the launcher settings a full preset may set (infamous_run.DEFAULT_SETTINGS; a test keeps them equal).
 SETTING_DEFAULTS = {'vsync': True, 'gpu_readbacks': '2', 'eager_readback': False, 'write_merge': True,
-                    'show_fps': False, 'precompile_shaders': True}
+                    'show_fps': True, 'precompile_shaders': True}
 # id, settings overrides, item overrides (values as strings; unlisted = default)
 PRESETS = (
     (REC1['id'], REC1['settings'], REC1['items']),

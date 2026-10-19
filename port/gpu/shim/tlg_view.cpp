@@ -4,6 +4,7 @@
 // (LOD table, band distances, default clip planes) equal to the menu's values, so changes are
 // live and survive the game rewriting them (debug LOD modes, script resets).
 #include "tlg_settings.h"
+#include "tlg_toggles.h"
 #include "tlg_view.h"
 
 #include "../../src/view_hook.h"
@@ -46,6 +47,21 @@ void Apply() {
 
 } // namespace
 
+// tlg: the LOD table, the bands and the clip planes live in the game's image, and a page can be
+// read-protected under us (GPU page tracking, the game's own memory work). A fault skips the rest
+// of this pass and the next tick retries; without the recovery point the view thread took the
+// whole run down (evidence 20261019-104920/105508, read at image+0xda08c0).
+[[gnu::noinline]] bool ApplySafely() {
+    sigjmp_buf recover;
+    if (sigsetjmp(recover, 0)) {
+        return false;
+    }
+    runtime_fault_recover = &recover;
+    Apply();
+    runtime_fault_recover = nullptr;
+    return true;
+}
+
 extern "C" uintptr_t tlg_view_region_params(void) {
     return reinterpret_cast<uintptr_t>(region_params);
 }
@@ -65,9 +81,15 @@ extern "C" void tlg_view_attach(unsigned char* guest_image) {
                 s.region_fade.load(), s.near_clip.load(), s.far_clip.load(), s.mip_lod_bias.load());
     TlgSettings::Get().view_supported = true;
     std::thread([] {
+        bool faulted = false;
         for (;;) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            Apply();
+            if (ApplySafely()) {
+                faulted = false;
+            } else if (!faulted) {
+                faulted = true;
+                std::printf("Draw distance: the game's LOD page was unreadable; the next tick retries\n");
+            }
         }
     }).detach();
 }

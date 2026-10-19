@@ -218,8 +218,8 @@ private:
     /// tlg: BP08, the driver's VkPipelineCache blob kept between sessions (see the .cpp).
     void StartDriverCacheSaver();
     void StopDriverCacheSaver();
-    bool SaveDriverCache();
-    bool SaveDriverCacheUnchecked();
+    bool SaveDriverCache(bool clean_exit = false);
+    bool SaveDriverCacheUnchecked(bool clean_exit = false);
     void SeedWorkerCaches();
     bool CheckCacheProfile();
     /// tlg: without TLG_ASYNC_WAIT_MS, a draw waits up to 4 ms for its pipeline build (precompiled

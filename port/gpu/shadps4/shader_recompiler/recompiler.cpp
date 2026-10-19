@@ -62,6 +62,11 @@ void EmitControlFlowGraph(IR::Program& program, Pools& pools, Gcn::CFG& cfg,
 
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
                              RuntimeInfo& runtime_info, const Profile& profile) {
+    // tlg: gow3_pc #398 -- an empty stream means the shader was not translated; reading code[0]
+    // below would go past it.
+    if (code.empty()) {
+        UNREACHABLE_MSG("TranslateProgram received an empty instruction stream");
+    }
     // Ensure first instruction is expected.
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
     if (code[0] != token_mov_vcchi) {

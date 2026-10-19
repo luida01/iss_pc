@@ -35,7 +35,7 @@ MAX_BYTES = 1 << 20
 # launcher settings a preset may carry: key -> 'bool' or the allowed values
 EXPORT_SETTINGS = {'vsync': 'bool', 'show_fps': 'bool', 'eager_readback': 'bool', 'write_merge': 'bool',
                    'precompile_shaders': 'bool', 'gpu_readbacks': ('0', '1', '2')}
-SETTING_DEFAULTS = {'show_fps': False, 'precompile_shaders': True, **gfxlogic.SETTING_DEFAULTS}
+SETTING_DEFAULTS = {'show_fps': True, 'precompile_shaders': True, **gfxlogic.SETTING_DEFAULTS}
 
 # A problem found while reading a file. fatal: nothing can be applied.
 Problem = namedtuple('Problem', 'code detail fatal')

@@ -17,6 +17,9 @@
 #include <filesystem>
 #include <thread>
 #include <xxhash.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "common/backports.h"
 #include "tlg_threads.h"
 #include "tlg_region.h"
@@ -371,11 +374,21 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
 // tlg: BP08 (Mrsuss b972798, 0xCydral bdb9769). The driver's own pipeline cache (the compiled
 // ISA behind every vkCreateGraphicsPipelines) is kept between sessions in
 // <cache>/driver-<serial>/vk_pipeline_cache_<vendor>_<device>_<pipelineCacheUUID>.vkc. The key
-// is in the file name, so a GPU or driver change finds no file and leaves the others alone:
-// nothing is ever deleted (the next save of the same key replaces the file). The file is a
-// header (magic, version, size, XXH3 of the blob) and the blob; it is written to a temporary
-// name and renamed, so a crash leaves the old file or none. Independent of the shader cache
-// folder, which is pruned when the recompiler changes; the driver checks the blob again.
+// is in the file name, so a GPU or driver change finds no file and leaves the others alone: a
+// rejected file is moved to <file>.stale (one copy per key, the previous one replaced) and is
+// never loaded again. The file is a header (magic, version, size, XXH3 of the payload) and the
+// payload; it is written to a unique temporary name, committed to disk (fflush + fsync/_commit)
+// and renamed over the destination (write-through on Windows), so a kill -9, a taskkill or a
+// power loss leaves the previous file or none, never a half-written one. Next to it,
+// <file>.clean (DriverCacheMarker) records that the blob was written whole and what it holds:
+// {magic, version, state, payload size, payload hash}. The marker is written the same way after
+// every save (state Running) and rewritten on an orderly shutdown (state Clean, the
+// destructor). At startup a blob without a matching marker is not loaded: it is moved to
+// <file>.stale and the session starts fresh. TLG_DRIVER_CACHE_STRICT=1 refuses a Running marker
+// too (only an orderly shutdown loads); TLG_DRIVER_CACHE_TRUST_DIRTY=1 accepts blobs without a
+// marker, for a cache written before the marker existed (hash and sizes are still checked).
+// Independent of the shader cache folder, which is pruned when the recompiler changes; the
+// driver checks the blob again.
 namespace {
 constexpr u32 DriverCacheMagic = 0x4B435649; // "IVCK"
 constexpr u32 DriverCacheVersion = 1;
@@ -386,6 +399,28 @@ struct DriverCacheHeader {
     u64 payload_hash;
 };
 static_assert(sizeof(DriverCacheHeader) == 24);
+
+constexpr u32 DriverCacheMarkerMagic = 0x4D434C54; // "TLCM"
+constexpr u32 DriverCacheMarkerVersion = 1;
+enum class DriverCacheState : u32 {
+    Running = 0, ///< The blob was written by a process that had not ended (or was killed).
+    Clean = 1,   ///< The process that wrote the blob ended through the destructor.
+};
+struct DriverCacheMarker {
+    u32 magic;
+    u32 version;
+    u32 state;
+    u32 reserved;
+    u64 payload_size;
+    u64 payload_hash;
+};
+static_assert(sizeof(DriverCacheMarker) == 32);
+
+/// No real blob comes close (a whole-game one is ~300 MB and TLG_DRIVER_CACHE_MAX_MB defaults to
+/// 1024): a bigger file is damage or garbage and is never read into memory. Unlike the save cap,
+/// the load cap is fixed, so lowering TLG_DRIVER_CACHE_MAX_MB does not invalidate an already
+/// saved file.
+constexpr u64 DriverCacheMaxLoadBytes = 4ull << 30; // 4 GiB
 
 std::filesystem::path DriverCacheFile(const Instance& instance) {
     const std::string serial{Common::ElfInfo::Instance().GameSerial()};
@@ -399,21 +434,193 @@ std::filesystem::path DriverCacheFile(const Instance& instance) {
                        instance.GetDeviceID(), uuid);
 }
 
-/// The saved blob for this GPU and driver, empty when there is none or the file is damaged.
+/// <blob>.clean, the record of the last complete write of a blob (see the comment above).
+std::filesystem::path DriverCacheMarkerFile(const std::filesystem::path& blob) {
+    auto marker = blob;
+    marker += ".clean";
+    return marker;
+}
+
+/// Replaces `to` with `from` (same directory). MOVEFILE_WRITE_THROUGH asks NTFS to make the
+/// rename durable before returning, so a power loss does not lose the new file after a save.
+bool DriverCacheRename(const std::filesystem::path& from, const std::filesystem::path& to) {
+#ifdef _WIN32
+    return MoveFileExW(from.c_str(), to.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    std::error_code ec;
+    std::filesystem::rename(from, to, ec);
+    return !ec;
+#endif
+}
+
+/// A unique temporary name next to `base`: a crashed writer leaves its own file behind instead of
+/// one that a later save would truncate, and two writers never touch the same temporary.
+std::filesystem::path DriverCacheTempName(const std::filesystem::path& base) {
+    static std::atomic<u64> sequence{0};
+    auto temp = base;
+    temp += "." +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "." +
+            std::to_string(sequence++) + ".tmp";
+    return temp;
+}
+
+/// Writes `head` and `tail` to a unique temporary next to `file`, commits the temporary to disk
+/// and renames it over `file`: the destination is either its previous content or the new one,
+/// never a mix. `tail` may be empty (the marker).
+bool DriverCacheWriteFile(const std::filesystem::path& file, const void* head, size_t head_size,
+                          std::span<const u8> tail) {
+    const auto temp = DriverCacheTempName(file);
+    bool written = false;
+    {
+        const Common::FS::IOFile io{temp, Common::FS::FileAccessMode::Create};
+        written = io.IsOpen() && io.WriteRaw<u8>(head, head_size) == head_size &&
+                  (tail.empty() || io.Write(tail) == tail.size()) && io.Commit();
+    }
+    if (written && DriverCacheRename(temp, file)) {
+        return true;
+    }
+    std::error_code ec;
+    std::filesystem::remove(temp, ec);
+    return false;
+}
+
+bool DriverCacheWriteMarker(const std::filesystem::path& blob, u64 payload_size, u64 payload_hash,
+                            DriverCacheState state) {
+    const DriverCacheMarker marker{DriverCacheMarkerMagic, DriverCacheMarkerVersion,
+                                   static_cast<u32>(state), 0, payload_size, payload_hash};
+    return DriverCacheWriteFile(DriverCacheMarkerFile(blob), &marker, sizeof(marker), {});
+}
+
+enum class DriverCacheMarkerRead { Missing, Invalid, Valid };
+
+DriverCacheMarkerRead ReadDriverCacheMarker(const std::filesystem::path& blob,
+                                            DriverCacheMarker& marker) {
+    const auto path = DriverCacheMarkerFile(blob);
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec)) {
+        return DriverCacheMarkerRead::Missing;
+    }
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec || size != sizeof(DriverCacheMarker)) {
+        return DriverCacheMarkerRead::Invalid;
+    }
+    const Common::FS::IOFile io{path, Common::FS::FileAccessMode::Read};
+    if (!io.IsOpen() || io.ReadRaw<u8>(&marker, sizeof(marker)) != sizeof(marker) ||
+        marker.magic != DriverCacheMarkerMagic || marker.version != DriverCacheMarkerVersion ||
+        marker.reserved != 0) {
+        return DriverCacheMarkerRead::Invalid;
+    }
+    return DriverCacheMarkerRead::Valid;
+}
+
+/// Moves a blob that failed validation out of the way (one <blob>.stale per key, the previous one
+/// replaced, so the last rejected file is kept as evidence) and drops its marker: the session
+/// starts fresh and the next save writes the file again.
+void RejectDriverCacheBlob(const std::filesystem::path& blob, const char* reason) {
+    auto stale = blob;
+    stale += ".stale";
+    std::error_code ec;
+    if (DriverCacheRename(blob, stale)) {
+        std::printf("GPU: driver pipeline cache %s; starting fresh (moved to %s)\n", reason,
+                    stale.filename().string().c_str());
+    } else {
+        std::printf("GPU: driver pipeline cache %s; starting fresh\n", reason);
+    }
+    std::filesystem::remove(DriverCacheMarkerFile(blob), ec);
+}
+
+/// Deletes .tmp leftovers of a writer that was killed between creation and rename (best effort).
+/// The game is a single process per user data directory: a live writer's temporaries are not
+/// expected here.
+void CleanupDriverCacheTemps(const std::filesystem::path& blob) {
+    std::error_code ec;
+    const auto parent = blob.parent_path();
+    if (!std::filesystem::is_directory(parent, ec)) {
+        return;
+    }
+    const std::string base = blob.filename().string();
+    const std::string prefix = base + ".";
+    size_t removed = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(parent, ec)) {
+        if (ec) {
+            return;
+        }
+        const std::string name = entry.path().filename().string();
+        const bool temp = name.rfind(prefix, 0) == 0 && name.size() >= 4 &&
+                          name.compare(name.size() - 4, 4, ".tmp") == 0;
+        if (temp && std::filesystem::is_regular_file(entry.path(), ec) &&
+            std::filesystem::remove(entry.path(), ec)) {
+            ++removed;
+        }
+    }
+    if (removed) {
+        std::printf("GPU: driver pipeline cache: removed %zu stale temporary file(s)\n", removed);
+    }
+}
+
+/// TLG_DRIVER_CACHE_STRICT=1: only a blob whose marker says Clean (orderly shutdown) loads.
+bool DriverCacheStrict() {
+    static const bool strict = [] {
+        const char* v = std::getenv("TLG_DRIVER_CACHE_STRICT");
+        return v && *v && std::atoi(v) != 0;
+    }();
+    return strict;
+}
+
+/// TLG_DRIVER_CACHE_TRUST_DIRTY=1: a blob without a marker loads (a cache written before the
+/// marker existed); the container hash and sizes are still checked.
+bool DriverCacheTrustDirty() {
+    static const bool trust = [] {
+        const char* v = std::getenv("TLG_DRIVER_CACHE_TRUST_DIRTY");
+        return v && *v && std::atoi(v) != 0;
+    }();
+    return trust;
+}
+
+/// The saved blob for this GPU and driver, empty when there is none or it does not pass
+/// validation (size, container header, XXH3, clean-shutdown marker, driver header). A rejected
+/// file is moved to <file>.stale, never loaded, and the session continues without a cache.
 std::vector<u8> LoadDriverCacheBlob(const Instance& instance) {
     const auto path = DriverCacheFile(instance);
+    CleanupDriverCacheTemps(path);
     std::error_code ec;
     if (!std::filesystem::is_regular_file(path, ec)) {
         std::printf("GPU: driver pipeline cache: none saved for this GPU/driver\n");
         return {};
     }
-    std::vector<u8> file(std::filesystem::file_size(path, ec));
-    if (ec || file.size() < sizeof(DriverCacheHeader) + sizeof(VkPipelineCacheHeaderVersionOne)) {
+    const auto file_size = std::filesystem::file_size(path, ec);
+    if (ec || file_size < sizeof(DriverCacheHeader) + sizeof(VkPipelineCacheHeaderVersionOne) ||
+        file_size > DriverCacheMaxLoadBytes) {
+        RejectDriverCacheBlob(path, "corrupt");
         return {};
     }
+    DriverCacheMarker marker;
+    const auto marker_read = ReadDriverCacheMarker(path, marker);
+    if (marker_read == DriverCacheMarkerRead::Missing && !DriverCacheTrustDirty()) {
+        RejectDriverCacheBlob(path, "has no clean shutdown marker");
+        return {};
+    }
+    if (marker_read == DriverCacheMarkerRead::Invalid) {
+        RejectDriverCacheBlob(path, "marker corrupt");
+        return {};
+    }
+    if (marker_read == DriverCacheMarkerRead::Valid &&
+        marker.payload_size != file_size - sizeof(DriverCacheHeader)) {
+        RejectDriverCacheBlob(path, "corrupt");
+        return {};
+    }
+    if (marker_read == DriverCacheMarkerRead::Valid &&
+        static_cast<DriverCacheState>(marker.state) == DriverCacheState::Running &&
+        DriverCacheStrict()) {
+        RejectDriverCacheBlob(path, "last session ended without an orderly shutdown (strict)");
+        return {};
+    }
+    std::vector<u8> file(static_cast<size_t>(file_size));
     {
         const Common::FS::IOFile io{path, Common::FS::FileAccessMode::Read};
         if (!io.IsOpen() || io.Read(file) != file.size()) {
+            std::printf("GPU: driver pipeline cache unreadable; starting fresh\n");
             return {};
         }
     }
@@ -421,9 +628,15 @@ std::vector<u8> LoadDriverCacheBlob(const Instance& instance) {
     std::memcpy(&header, file.data(), sizeof(header));
     const u8* payload = file.data() + sizeof(header);
     if (header.magic != DriverCacheMagic || header.version != DriverCacheVersion ||
-        header.payload_size != file.size() - sizeof(header) ||
+        header.payload_size != file_size - sizeof(DriverCacheHeader) ||
         XXH3_64bits(payload, header.payload_size) != header.payload_hash) {
-        std::printf("GPU: driver pipeline cache ignored (damaged file, kept)\n");
+        RejectDriverCacheBlob(path, "corrupt");
+        return {};
+    }
+    if (marker_read == DriverCacheMarkerRead::Valid &&
+        (marker.payload_hash != header.payload_hash ||
+         marker.payload_size != header.payload_size)) {
+        RejectDriverCacheBlob(path, "corrupt");
         return {};
     }
     VkPipelineCacheHeaderVersionOne driver;
@@ -432,10 +645,17 @@ std::vector<u8> LoadDriverCacheBlob(const Instance& instance) {
     if (driver.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
         driver.vendorID != instance.GetVendorID() || driver.deviceID != instance.GetDeviceID() ||
         std::memcmp(driver.pipelineCacheUUID, uuid.data(), VK_UUID_SIZE) != 0) {
-        std::printf("GPU: driver pipeline cache ignored (other GPU or driver, kept)\n");
+        RejectDriverCacheBlob(path, "is for another GPU or driver");
         return {};
     }
-    std::printf("GPU: driver pipeline cache loaded (%zu bytes)\n", size_t(header.payload_size));
+    const char* how = "no clean shutdown recorded, hash verified";
+    if (marker_read == DriverCacheMarkerRead::Missing) {
+        how = "no marker, trusted (TLG_DRIVER_CACHE_TRUST_DIRTY)";
+    } else if (static_cast<DriverCacheState>(marker.state) == DriverCacheState::Clean) {
+        how = "clean shutdown";
+    }
+    std::printf("GPU: driver pipeline cache loaded (%zu bytes, %s)\n", size_t(header.payload_size),
+                how);
     return {payload, payload + header.payload_size};
 }
 } // namespace
@@ -454,27 +674,45 @@ struct PipelineCache::DriverCacheSaver {
     bool over_limit_logged = false;
 };
 
-bool PipelineCache::SaveDriverCache() {
+bool PipelineCache::SaveDriverCache(bool clean_exit) {
     // The save is optional (0xCydral 4f16e00): an allocation failure on the saver thread must not
     // end the game; it is skipped and tried again later.
     try {
-        return SaveDriverCacheUnchecked();
+        return SaveDriverCacheUnchecked(clean_exit);
     } catch (const std::exception& e) {
         LOG_WARNING(Render_Vulkan, "tlg: driver pipeline cache save skipped: {}", e.what());
         return false;
     }
 }
 
-bool PipelineCache::SaveDriverCacheUnchecked() {
+bool PipelineCache::SaveDriverCacheUnchecked(bool clean_exit) {
+    // tlg: the marker of the file on disk says Clean only when the last process to touch it shut
+    // down in order; every other exit (window close, crash, kill) leaves Running, and an orderly
+    // shutdown with nothing new to save still records itself here (the blob is left as it is).
+    const auto record_clean_exit = [&] {
+        if (!clean_exit || !driver_saver || driver_saver->saved_hash == 0) {
+            return;
+        }
+        const auto path = DriverCacheFile(instance);
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(path, ec);
+        if (ec || size < sizeof(DriverCacheHeader)) {
+            return;
+        }
+        DriverCacheWriteMarker(path, size - sizeof(DriverCacheHeader), driver_saver->saved_hash,
+                               DriverCacheState::Clean);
+    };
     // Pipelines the compiler workers built are only merged into pipeline_cache when they finish
     // (FinishCompilations): merge copies of all of them into a scratch cache for the blob.
     const u64 created = g_tlg_driver_pipelines_created.load(std::memory_order_relaxed);
     if (driver_saver && created == driver_saver->saved_created) {
+        record_clean_exit();
         return true;
     }
     const auto device = instance.GetDevice();
     auto [scratch_result, scratch] = device.createPipelineCacheUnique({});
     if (scratch_result != vk::Result::eSuccess) {
+        record_clean_exit();
         return false;
     }
     std::vector<vk::PipelineCache> sources{*pipeline_cache};
@@ -482,10 +720,12 @@ bool PipelineCache::SaveDriverCacheUnchecked() {
         sources.push_back(*cache);
     }
     if (device.mergePipelineCaches(*scratch, sources) != vk::Result::eSuccess) {
+        record_clean_exit();
         return false;
     }
     auto [result, blob] = device.getPipelineCacheData(*scratch);
     if (result != vk::Result::eSuccess || blob.size() < sizeof(VkPipelineCacheHeaderVersionOne)) {
+        record_clean_exit();
         return false;
     }
     // tlg: TLG_DRIVER_CACHE_MAX_MB (default 1024, 0 = no limit): a bigger blob is not written,
@@ -505,32 +745,31 @@ bool PipelineCache::SaveDriverCacheUnchecked() {
         if (driver_saver) {
             driver_saver->saved_created = created;
         }
+        record_clean_exit();
         return false;
     }
     const u64 hash = XXH3_64bits(blob.data(), blob.size());
     if (driver_saver && hash == driver_saver->saved_hash) {
         driver_saver->saved_created = created;
+        record_clean_exit();
         return true;
     }
     const auto path = DriverCacheFile(instance);
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
-    auto temp = path;
-    temp += ".tmp";
     const DriverCacheHeader header{DriverCacheMagic, DriverCacheVersion, blob.size(), hash};
-    bool written = false;
-    {
-        const Common::FS::IOFile io{temp, Common::FS::FileAccessMode::Create};
-        written = io.IsOpen() && io.WriteRaw<u8>(&header, sizeof(header)) == sizeof(header) &&
-                  io.Write(blob) == blob.size();
-    }
-    if (written) {
-        std::filesystem::rename(temp, path, ec);
-    }
-    if (!written || ec) {
-        std::filesystem::remove(temp, ec);
+    if (!DriverCacheWriteFile(path, &header, sizeof(header), blob)) {
         LOG_ERROR(Render_Vulkan, "tlg: driver pipeline cache not written to {}", path.string());
+        record_clean_exit();
         return false;
+    }
+    // The blob is complete and renamed into place. The marker says what it holds and how the
+    // session ended; one that cannot be written costs the next session a fresh start (a blob
+    // without a matching marker is not loaded) but does not invalidate the blob.
+    const auto state = clean_exit ? DriverCacheState::Clean : DriverCacheState::Running;
+    if (!DriverCacheWriteMarker(path, blob.size(), hash, state)) {
+        LOG_WARNING(Render_Vulkan, "tlg: driver pipeline cache marker not written for {}",
+                    path.string());
     }
     if (driver_saver) {
         driver_saver->saved_hash = hash;
@@ -736,7 +975,10 @@ PipelineCache::~PipelineCache() {
     StopDriverCacheSaver();
     FinishCompilations();
     if (driver_saver) {
-        SaveDriverCache();
+        // tlg: BP08. The final save also records the orderly shutdown in the marker (state
+        // Clean). Window close ends in std::_Exit (port/gpu/shim/tlggpu.cpp), so in this port
+        // that marker is the exception and blobs normally keep Running.
+        SaveDriverCache(/*clean_exit=*/true);
         delete driver_saver;
         driver_saver = nullptr;
     }

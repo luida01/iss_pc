@@ -327,8 +327,8 @@ struct Image {
     /// tlg: Vulkan has no block-compressed 1D images (inFAMOUS binds BC1/BC4/BC5 1D textures),
     /// so these are 2D images of height 1 on the host, sampled at the middle row.
     bool IsBlock1D() const noexcept {
-        // On for drivers that refuse BC 1D, except NVIDIA (tlg_block1d.h); TLG_BLOCK1D=0/1.
-        // TLG_BC_TINY decodes BC1-BC5 1D textures to plain 1D images instead (tlg_bc_tiny.h).
+        // On for refusing drivers except NVIDIA (tlg_block1d.h); TLG_BLOCK1D=0/1. The CPU decode
+        // (TLG_BC_TINY, automatic on refusing drivers) keeps BC1-BC5 1D images 1D instead.
         const auto type = GetType();
         const auto dfmt = GetDataFmt();
         const bool is_1d = type == ImageType::Color1D || type == ImageType::Color1DArray;

@@ -631,7 +631,7 @@ void OverlayTab() {
     if (ImGui::BeginTable("##overlay_items", 2, ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableNextColumn();
         static const char* const names[] = {"FPS", TL("Frametime", "Tempo de quadro"), "Upscaler", TL("GPU (name and use)", "GPU (nome e uso)"), TL("CPU (game)", "CPU (jogo)"),
-                                            TL("RAM (game / total)", "RAM (jogo / total)"), TL("VRAM (used / available)", "VRAM (usada / disponível)")};
+                                            TL("RAM (game / total)", "RAM (jogo / total)"), TL("VRAM (used / budget)", "VRAM (usada / orçamento)")};
         for (unsigned item = 0; item < 7; ++item) {
             const unsigned bit = 1u << item;
             bool on = (s.overlay_items & bit) != 0;
@@ -1331,7 +1331,7 @@ void GuideBox() {
     const bool pt = UiPortuguese();
     const char* sticks = PadText("L3+R3", "LS+RS", "LS+RS");
     const char* shake = PadText(pt ? "✕ (Xis)" : "✕ (cross)", "A", "B");
-    const char* spray = PadText("R2", "RT", "ZR");
+    const char* spray = PadText("L2", "LT", "ZL");
     char steps[4][200];
     std::snprintf(steps[0], sizeof(steps[0]), pt ? "Toque em %s juntos: liga o modo sensor e a lata já fica de lado."
                                                  : "Tap %s together: sensor mode turns on and the can is held sideways.", sticks);
@@ -1339,8 +1339,10 @@ void GuideBox() {
     std::snprintf(steps[2], sizeof(steps[2]), pt ? "Segure %s para pintar e mire com o analógico esquerdo (pouco inclinado vai devagar)."
                                                  : "Hold %s to spray and aim with the left stick (a small push is slow).", spray);
     std::snprintf(steps[3], sizeof(steps[3]), pt ? "Toque em %s de novo para voltar a andar." : "Tap %s again to walk again.", sticks);
-    const char* keys = TL("Keyboard: hold T or G (can sideways), Y shakes, F sprays, the arrow keys aim.",
-                          "Teclado: segure T ou G (lata de lado), Y sacode, F pinta, as setas miram.");
+    const char* keys = TL("Keyboard: hold T or G (can sideways), Y shakes, R or the right mouse button sprays "
+                          "(L2), the arrow keys or the mouse aim.",
+                          "Teclado: segure T ou G (lata de lado), Y sacode, R ou o botão direito do mouse pinta "
+                          "(L2), as setas ou o mouse miram.");
     const char* again = TL("The Insert menu, Controls tab, shows this again.",
                            "O menu Insert, aba Controle, mostra isto de novo.");
     const float w = 640, pad = 30, inner = w - pad * 2, text_x = pad + 40;

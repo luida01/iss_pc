@@ -40,16 +40,37 @@
 .PARAMETER StartupTimeoutSec
     Maximo de espera hasta que aparezca tlg-probe.exe (por defecto 300).
 
+.PARAMETER AutoPlayScenario
+    Ruta a un JSON de escenario o nombre integrado (resuelto en tools\autoplay,
+    p. ej. intro-g0). Cada paso lleva elapsed_sec, key, hold_ms y delay_ms; las
+    teclas se envian con tools\GameWindow.ps1. Vacio = sin automatizacion.
+
+.PARAMETER ScreenshotIntervalSec
+    Cada cuantos segundos se guarda una captura de la ventana del juego como
+    evidence\<run>\automation-<n>s.png. 0 = desactivado.
+
+.PARAMETER BringToFront
+    Enfoca la ventana del juego al arrancar y cada 30 s durante la sesion.
+
+.PARAMETER CodexFeedback
+    Cada N capturas se lanza tools\Invoke-CodexFeedback.ps1 en segundo plano
+    para que el agente local de Codex analice la ultima captura. 0 = desactivado.
+
 .EXAMPLE
     .\tools\run-baseline.ps1 -DurationSec 900 -Resolution native -Tag baseline-g0
+
+.EXAMPLE
+    .\tools\run-baseline.ps1 -DurationSec 960 -Resolution native -Tag g0-intro `
+        -AutoPlayScenario intro-g0 -ScreenshotIntervalSec 30 -BringToFront -CodexFeedback 2
 
 .EXAMPLE
     .\tools\run-baseline.ps1 -DurationSec 600 -Tag ab-gc3500 `
         -ExtraEnv @{ ISS_GC_BUDGET_MB = '3500'; ISS_PIPELINE_BINARIES = '0' }
 
 .NOTES
-    Requiere PowerShell 7 (pwsh). nvidia-smi es opcional. No automatiza input:
-    la ruta/escena se juega manualmente y debe ser la misma en cada repeticion.
+    Requiere PowerShell 7 (pwsh). nvidia-smi es opcional. Sin -AutoPlayScenario,
+    -ScreenshotIntervalSec, -BringToFront ni -CodexFeedback la sesion se juega a
+    mano y el comportamiento es identico al harness original.
 #>
 [CmdletBinding()]
 param(
@@ -64,7 +85,15 @@ param(
 
     [string]$Python = 'python',
 
-    [ValidateRange(30, 3600)][int]$StartupTimeoutSec = 300
+    [ValidateRange(30, 3600)][int]$StartupTimeoutSec = 300,
+
+    [string]$AutoPlayScenario = '',
+
+    [ValidateRange(0, 3600)][int]$ScreenshotIntervalSec = 0,
+
+    [switch]$BringToFront,
+
+    [ValidateRange(0, 1000)][int]$CodexFeedback = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -86,11 +115,32 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $portDir = Join-Path $repoRoot 'port'
 $evidenceRoot = Join-Path $repoRoot 'evidence'
 $measureScript = Join-Path $PSScriptRoot 'measure-run.ps1'
+$gameWindowScript = Join-Path $PSScriptRoot 'GameWindow.ps1'
+$autoplayDir = Join-Path $PSScriptRoot 'autoplay'
+$codexFeedbackScript = Join-Path $PSScriptRoot 'Invoke-CodexFeedback.ps1'
 
 if (-not (Test-Path -LiteralPath $measureScript -PathType Leaf)) {
     throw "No existe el sampler: $measureScript"
 }
 . $measureScript
+
+# GameWindow.ps1 solo se carga si se pidio automatizacion: sin flags el harness
+# se comporta igual que antes (input manual, sin capturas).
+$script:AutomationRequested = [bool]($AutoPlayScenario -or $ScreenshotIntervalSec -gt 0 -or
+    $BringToFront -or $CodexFeedback -gt 0)
+$script:GameWindowReady = $false
+if ($script:AutomationRequested) {
+    if (-not (Test-Path -LiteralPath $gameWindowScript -PathType Leaf)) {
+        Write-Warning "No existe $gameWindowScript; la automatizacion queda desactivada."
+    } else {
+        try {
+            . $gameWindowScript
+            $script:GameWindowReady = $true
+        } catch {
+            Write-Warning "GameWindow.ps1 no se pudo cargar: $($_.Exception.Message)"
+        }
+    }
+}
 
 # Rutas del proyecto (AGENTS.md). run.py usa TLG_DATA_DIR como raiz de out/ y de
 # tlg.ini (por defecto, port/); las partidas y la cache GPU viven en userdata.
@@ -655,6 +705,360 @@ function Test-PathLikeFlag {
     return $Key -match '(?i)(_DIR|_PATH|_CONFIG|_COMMAND|_ICON|_GLYPHS|_MODS_DIR|_MODS_CONFIG|_PATCHES_DIR|_PATCHES_CONFIG|_PROBE)$'
 }
 
+function Resolve-AutoPlayScenario {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Value,
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$AutoplayDir
+    )
+
+    if (-not (Get-Command Resolve-GameKeyDefinition -ErrorAction SilentlyContinue)) {
+        throw 'Se necesita tools\GameWindow.ps1 para validar las teclas del escenario.'
+    }
+
+    $candidates = [Collections.Generic.List[string]]::new()
+    if ($Value -match '[\\/]' -or $Value -match '\.json$') {
+        if ([IO.Path]::IsPathRooted($Value)) {
+            $candidates.Add($Value)
+        } else {
+            $candidates.Add((Join-Path (Get-Location).Path $Value))
+            $candidates.Add((Join-Path $RepoRoot $Value))
+            $candidates.Add((Join-Path $AutoplayDir $Value))
+        }
+    } else {
+        $candidates.Add((Join-Path $AutoplayDir "$Value.json"))
+        $candidates.Add((Join-Path $RepoRoot "$Value.json"))
+    }
+
+    $source = $null
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $source = [IO.Path]::GetFullPath($candidate)
+            break
+        }
+    }
+    if (-not $source) {
+        throw "Escenario no encontrado: '$Value'. Probado: $($candidates -join ' | ')"
+    }
+
+    try {
+        $json = Get-Content -LiteralPath $source -Raw | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "JSON invalido en ${source}: $($_.Exception.Message)"
+    }
+    $rawSteps = @($json.steps)
+    if ($rawSteps.Count -eq 0) {
+        throw "El escenario $source no define 'steps'."
+    }
+
+    $steps = [Collections.Generic.List[object]]::new()
+    $index = 0
+    $previousElapsed = 0.0
+    foreach ($rawStep in $rawSteps) {
+        $keyText = [string]$rawStep.key
+        if (-not $keyText) { throw "Paso $index sin 'key' en $source." }
+        $keyNames = [Collections.Generic.List[string]]::new()
+        foreach ($part in @($keyText -split '\+')) {
+            $trimmed = $part.Trim()
+            if ($trimmed) { $keyNames.Add((Resolve-GameKeyDefinition -Key $trimmed).Name) }
+        }
+        if ($keyNames.Count -eq 0) { throw "Paso $index con 'key' vacia en $source." }
+
+        $elapsed = $previousElapsed
+        if ($null -ne $rawStep.elapsed_sec -and "$($rawStep.elapsed_sec)" -ne '') {
+            $elapsed = [double]$rawStep.elapsed_sec
+        }
+        $holdMs = 120
+        if ($null -ne $rawStep.hold_ms -and "$($rawStep.hold_ms)" -ne '') {
+            $holdMs = [int]$rawStep.hold_ms
+        }
+        $delayMs = 0
+        if ($null -ne $rawStep.delay_ms -and "$($rawStep.delay_ms)" -ne '') {
+            $delayMs = [int]$rawStep.delay_ms
+        }
+        if ($elapsed -lt 0) { throw "Paso $index con elapsed_sec negativo en $source." }
+        if ($holdMs -lt 1 -or $holdMs -gt 30000) { throw "Paso $index con hold_ms fuera de rango (1-30000)." }
+        if ($delayMs -lt 0) { throw "Paso $index con delay_ms negativo." }
+
+        $steps.Add([pscustomobject]@{
+            index       = $index
+            elapsed_sec = [Math]::Round($elapsed, 1)
+            key         = [string]::Join('+', $keyNames)
+            hold_ms     = $holdMs
+            delay_ms    = $delayMs
+        })
+        $previousElapsed = $elapsed + ($holdMs / 1000.0) + ($delayMs / 1000.0)
+        $index++
+    }
+
+    $sorted = @($steps | Sort-Object -Property elapsed_sec, index)
+    for ($i = 0; $i -lt $sorted.Count; $i++) { $sorted[$i].index = $i }
+
+    $maxLateness = 5.0
+    if ($null -ne $json.max_lateness_sec -and "$($json.max_lateness_sec)" -ne '') {
+        $maxLateness = [double]$json.max_lateness_sec
+    }
+    $planned = $null
+    if ($null -ne $json.planned_duration_sec -and "$($json.planned_duration_sec)" -ne '') {
+        $planned = [double]$json.planned_duration_sec
+    } else {
+        $lastStep = $sorted[$sorted.Count - 1]
+        $planned = $lastStep.elapsed_sec + ($lastStep.hold_ms / 1000.0)
+    }
+
+    return [pscustomobject]@{
+        Name               = if ($json.name) { [string]$json.name } else { [IO.Path]::GetFileNameWithoutExtension($source) }
+        Source             = $source
+        Description        = [string]$json.description
+        Steps              = $sorted
+        MaxLatenessSec     = $maxLateness
+        PlannedDurationSec = [Math]::Round($planned, 1)
+    }
+}
+
+function ConvertTo-SerializableWindow {
+    param($Window)
+    if (-not $Window) { return $null }
+    $foreground = $false
+    try {
+        $foreground = [TlgGameWindow.Native]::GetForegroundWindow().ToInt64() -eq $Window.Handle.ToInt64()
+    } catch { }
+    return [pscustomobject]@{
+        handle     = $Window.HandleHex
+        title      = $Window.Title
+        process_id = $Window.ProcessId
+        dpi        = $Window.Dpi
+        minimized  = $Window.Minimized
+        foreground = $foreground
+        rect       = [pscustomobject]@{
+            left   = $Window.Rect.Left
+            top    = $Window.Rect.Top
+            width  = $Window.Width
+            height = $Window.Height
+        }
+    }
+}
+
+function Start-CodexFeedbackJob {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ImagePath,
+        [Parameter(Mandatory)][string]$EvidenceDir,
+        [string]$ContextFile,
+        [Parameter(Mandatory)][string]$CodexScript,
+        [Parameter(Mandatory)][string]$RepoRoot
+    )
+
+    # Archiva las salidas del analisis anterior para conservar historial por
+    # captura; los nombres canonicos (chatgpt-feedback.*) quedan siempre con el
+    # ultimo resultado.
+    $archiveDir = Join-Path $EvidenceDir 'feedback'
+    $baseName = [IO.Path]::GetFileNameWithoutExtension([IO.Path]::GetFileName($ImagePath))
+    foreach ($name in @('chatgpt-feedback.json', 'chatgpt-feedback.md',
+            'chatgpt-feedback.error.txt', 'chatgpt-feedback.raw.txt',
+            'chatgpt-feedback.stdout.log', 'chatgpt-feedback.stderr.log')) {
+        $file = Join-Path $EvidenceDir $name
+        if (Test-Path -LiteralPath $file -PathType Leaf) {
+            if (-not (Test-Path -LiteralPath $archiveDir)) {
+                New-Item -ItemType Directory -Force -Path $archiveDir | Out-Null
+            }
+            $target = Join-Path $archiveDir ($name -replace '^chatgpt-feedback', "chatgpt-feedback-$baseName")
+            Move-Item -LiteralPath $file -Destination $target -Force
+        }
+    }
+
+    $outLog = Join-Path $EvidenceDir "codex-feedback-$baseName.out.log"
+    $errLog = Join-Path $EvidenceDir "codex-feedback-$baseName.err.log"
+    $pwshPath = (Get-Process -Id $PID).Path
+    $arguments = @(
+        '-NoLogo', '-NoProfile', '-NonInteractive',
+        '-File', (ConvertTo-QuotedArgument $CodexScript),
+        '-ImagePath', (ConvertTo-QuotedArgument $ImagePath),
+        '-EvidenceDir', (ConvertTo-QuotedArgument $EvidenceDir),
+        '-Repo', (ConvertTo-QuotedArgument $RepoRoot),
+        '-TimeoutSec', '240'
+    )
+    if ($ContextFile -and (Test-Path -LiteralPath $ContextFile -PathType Leaf)) {
+        $arguments += @('-ContextFile', (ConvertTo-QuotedArgument $ContextFile))
+    }
+    $process = Start-Process -FilePath $pwshPath -ArgumentList $arguments -PassThru `
+        -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+    return [pscustomobject]@{
+        Process   = $process
+        OutLog    = $outLog
+        ErrLog    = $errLog
+        ImagePath = $ImagePath
+    }
+}
+
+function Invoke-AutomationTick {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)]$Game,
+        [Parameter(Mandatory)]$Config,
+        [object[]]$Steps = @()
+    )
+
+    $native = [TlgGameWindow.Native]
+    $elapsed = ([DateTime]::UtcNow - $State.started_utc).TotalSeconds
+    $dirty = $false
+
+    # 1) Ventana: revalidar la cache y volver a localizarla si desaparecio.
+    $live = $Config.LiveWindow
+    if ($live -and -not $native::IsWindow($live.Handle)) {
+        $live = $null
+        $Config.LiveWindow = $null
+    }
+    if (-not $live) {
+        $live = Get-GameWindow -ProcessId $Game.Id
+        $Config.LiveWindow = $live
+        if ($live) { $State.errors += 'Ventana del juego re-localizada.' }
+    }
+    if ($live) {
+        $State.window = ConvertTo-SerializableWindow -Window $live
+    }
+
+    # 2) Foco (solo con -BringToFront): al inicio y cada 30 s.
+    if ($Config.BringToFront -and $elapsed -ge $State.counters.next_focus_at) {
+        $State.counters.next_focus_at = $elapsed + 30
+        if ($live) {
+            $State.focus.attempts = [int]$State.focus.attempts + 1
+            $ok = $false
+            try { $ok = Set-GameWindowFocus -Window $live -Quiet } catch { }
+            if ($ok) {
+                $State.focus.last_ok = $true
+            } else {
+                $State.focus.failures = [int]$State.focus.failures + 1
+                $State.focus.last_ok = $false
+            }
+            $State.focus.last_at_sec = [Math]::Round($elapsed, 1)
+            try {
+                $State.focus.foreground_title = (Get-ForegroundWindowInfo).Title
+            } catch { }
+            $dirty = $true
+        }
+    }
+
+    # 3) Timeline del escenario: pasos vencidos, con limite de retraso.
+    while ($State.counters.step_index -lt $Steps.Count -and
+        [double]$Steps[$State.counters.step_index].elapsed_sec -le $elapsed) {
+        $index = [int]$State.counters.step_index
+        $step = $Steps[$index]
+        $entry = $State.timeline[$index]
+        $late = $elapsed - [double]$step.elapsed_sec
+        if ($State.max_lateness_sec -gt 0 -and $late -gt $State.max_lateness_sec) {
+            $entry.status = 'skipped'
+            $entry.at_sec = [Math]::Round($elapsed, 1)
+            $entry.note = "retraso de $([Math]::Round($late, 1)) s"
+        } else {
+            $ok = $false
+            if ($live) {
+                try {
+                    $ok = Send-GameKeyScript -ProcessId $Game.Id -Window $live -Steps @($step) -Method Auto
+                } catch {
+                    $State.errors += "Paso $index ($($step.key)): $($_.Exception.Message)"
+                }
+            } else {
+                $State.errors += "Paso $index ($($step.key)): sin ventana del juego."
+            }
+            $entry.status = if ($ok) { 'done' } else { 'failed' }
+            $entry.at_sec = [Math]::Round($elapsed, 1)
+            $entry.ok = $ok
+            if (-not $ok) {
+                $State.errors += "Paso $index ($($step.key)) fallo al enviar la tecla."
+            }
+        }
+        $State.counters.step_index = $index + 1
+        $dirty = $true
+    }
+
+    # 4) Capturas de ventana cada ScreenshotIntervalSec.
+    if ($Config.ScreenshotIntervalSec -gt 0 -and $elapsed -ge $State.counters.next_capture_at) {
+        $planned = [int][Math]::Floor($State.counters.next_capture_at)
+        $fileName = 'automation-{0}s.png' -f $planned
+        $entry = [ordered]@{
+            file        = $fileName
+            planned_sec = $planned
+            at_sec      = $null
+            method      = $null
+            width       = $null
+            height      = $null
+            foreground  = $null
+            error       = $null
+        }
+        if ($live) {
+            try {
+                $shot = Save-WindowScreenshot -Window $live -Quiet `
+                    -Path (Join-Path $Config.EvidenceDir $fileName)
+                if ($shot) {
+                    $entry.at_sec = [Math]::Round($elapsed, 1)
+                    $entry.method = $shot.Method
+                    $entry.width = $shot.Width
+                    $entry.height = $shot.Height
+                    $entry.foreground = $shot.Foreground
+                    $State.counters.captures_since_feedback = [int]$State.counters.captures_since_feedback + 1
+                } else {
+                    $entry.error = 'captura fallida'
+                }
+            } catch {
+                $entry.error = $_.Exception.Message
+            }
+        } else {
+            $entry.error = 'sin ventana del juego'
+        }
+        if ($entry.error) {
+            $State.errors += "Captura $planned s: $($entry.error)"
+        }
+        $State.captures += $entry
+        $State.counters.next_capture_at = $State.counters.next_capture_at + $Config.ScreenshotIntervalSec
+        while ($State.counters.next_capture_at -le $elapsed) {
+            $State.counters.skipped_captures = [int]$State.counters.skipped_captures + 1
+            $State.counters.next_capture_at = $State.counters.next_capture_at + $Config.ScreenshotIntervalSec
+        }
+        $dirty = $true
+    }
+
+    # 5) Feedback de Codex cada N capturas (en segundo plano, sin bloquear).
+    if ($Config.CodexFeedback -gt 0 -and
+        $State.counters.captures_since_feedback -ge $Config.CodexFeedback -and
+        $State.captures.Count -gt 0 -and
+        $Config.CodexScript -and (Test-Path -LiteralPath $Config.CodexScript -PathType Leaf)) {
+        $busy = $false
+        foreach ($job in @($Config.FeedbackJobs)) {
+            if (-not $job.Process.HasExited) { $busy = $true; break }
+        }
+        if (-not $busy) {
+            $last = $State.captures[$State.captures.Count - 1]
+            if ($last.file -and -not $last.error) {
+                $imagePath = Join-Path $Config.EvidenceDir $last.file
+                if (Test-Path -LiteralPath $imagePath -PathType Leaf) {
+                    try {
+                        $job = Start-CodexFeedbackJob -ImagePath $imagePath -EvidenceDir $Config.EvidenceDir `
+                            -ContextFile $Config.ContextFile -CodexScript $Config.CodexScript -RepoRoot $Config.RepoRoot
+                        $Config.FeedbackJobs.Add($job) | Out-Null
+                        $State.counters.captures_since_feedback = 0
+                        $State.feedback += [ordered]@{
+                            image   = $last.file
+                            at_sec  = [Math]::Round($elapsed, 1)
+                            status  = 'started'
+                            pid     = $job.Process.Id
+                            out_log = [IO.Path]::GetFileName($job.OutLog)
+                            err_log = [IO.Path]::GetFileName($job.ErrLog)
+                        }
+                        $dirty = $true
+                    } catch {
+                        $State.errors += "Feedback de Codex: $($_.Exception.Message)"
+                    }
+                }
+            }
+        }
+    }
+
+    return $dirty
+}
+
 function Invoke-Baseline {
     $safeTag = ConvertTo-SafeTag $Tag
     $evidenceDir = New-EvidenceDirectory -Root $evidenceRoot -SafeTag $safeTag
@@ -881,6 +1285,10 @@ function Invoke-Baseline {
     $sampler = $null
     $gameStartUtc = $null
     $gameEndUtc = $null
+    $automation = $null
+    $automationPath = Join-Path $evidenceDir 'automation.json'
+    $automationConfig = $null
+    $feedbackJobs = [Collections.Generic.List[object]]::new()
 
     try {
         $savedEnv = $null
@@ -925,13 +1333,133 @@ function Invoke-Baseline {
                 $result.notes += 'La sesion continua sin CSV de metricas.'
             }
 
+            # Automatizacion opcional: capturas de la ventana, input por timeline
+            # y feedback de Codex. Sin flags, $automation queda en $null y el
+            # bucle mide igual que siempre.
+            $scenario = $null
+            $scenarioSteps = @()
+            if ($script:AutomationRequested) {
+                $automation = [ordered]@{
+                    schema      = 1
+                    enabled     = $true
+                    scenario    = $null
+                    window      = $null
+                    started_at  = $gameStartUtc.ToString('o')
+                    started_utc = $gameStartUtc
+                    finished_at = $null
+                    max_lateness_sec = 5.0
+                    config      = [ordered]@{
+                        screenshot_interval_sec = $ScreenshotIntervalSec
+                        bring_to_front          = [bool]$BringToFront
+                        codex_feedback_every    = $CodexFeedback
+                        capture                 = 'ventana; PrintWindow y respaldo CopyFromScreen'
+                    }
+                    counters    = [ordered]@{
+                        step_index              = 0
+                        next_capture_at         = [double]$ScreenshotIntervalSec
+                        next_focus_at           = 0.0
+                        captures_since_feedback = 0
+                        skipped_captures        = 0
+                    }
+                    timeline    = @()
+                    captures    = @()
+                    feedback    = @()
+                    focus       = [ordered]@{
+                        attempts         = 0
+                        failures         = 0
+                        last_ok          = $null
+                        last_at_sec      = $null
+                        foreground_title = $null
+                    }
+                    errors      = @()
+                }
+                $automationConfig = @{
+                    ScreenshotIntervalSec = $ScreenshotIntervalSec
+                    BringToFront          = [bool]$BringToFront
+                    CodexFeedback         = $CodexFeedback
+                    EvidenceDir           = $evidenceDir
+                    CodexScript           = $codexFeedbackScript
+                    RepoRoot              = $repoRoot
+                    ContextFile           = $automationPath
+                    LiveWindow            = $null
+                    FeedbackJobs          = $feedbackJobs
+                }
+                if (-not $script:GameWindowReady) {
+                    $automation.errors += 'GameWindow.ps1 no disponible: sin capturas ni input.'
+                    $result.errors += 'Automatizacion: GameWindow.ps1 no disponible.'
+                }
+                if ($AutoPlayScenario) {
+                    try {
+                        $scenario = Resolve-AutoPlayScenario -Value $AutoPlayScenario `
+                            -RepoRoot $repoRoot -AutoplayDir $autoplayDir
+                        $scenarioSteps = $scenario.Steps
+                        $automation.max_lateness_sec = $scenario.MaxLatenessSec
+                        $automation.scenario = [pscustomobject]@{
+                            name                 = $scenario.Name
+                            source               = $scenario.Source
+                            description          = $scenario.Description
+                            steps_total          = $scenario.Steps.Count
+                            planned_duration_sec = $scenario.PlannedDurationSec
+                            max_lateness_sec     = $scenario.MaxLatenessSec
+                        }
+                        $automation.timeline = @($scenario.Steps | ForEach-Object {
+                            [ordered]@{
+                                index       = $_.index
+                                elapsed_sec = $_.elapsed_sec
+                                key         = $_.key
+                                hold_ms     = $_.hold_ms
+                                delay_ms    = $_.delay_ms
+                                status      = 'pending'
+                                at_sec      = $null
+                                ok          = $null
+                                note        = $null
+                            }
+                        })
+                        $result.notes += "Automatizacion: escenario '$($scenario.Name)' ($($scenario.Steps.Count) pasos)."
+                    } catch {
+                        $automation.errors += "Escenario: $($_.Exception.Message)"
+                        $result.errors += "Escenario de autoplay: $($_.Exception.Message)"
+                    }
+                }
+                if ($ScreenshotIntervalSec -gt 0) {
+                    $result.notes += "Capturas de ventana cada $ScreenshotIntervalSec s (automation-<n>s.png)."
+                }
+                if ($CodexFeedback -gt 0) {
+                    if ($ScreenshotIntervalSec -gt 0) {
+                        $result.notes += "Feedback de Codex cada $CodexFeedback captura(s)."
+                    } else {
+                        $automation.errors += 'CodexFeedback requiere -ScreenshotIntervalSec > 0.'
+                        $result.errors += 'CodexFeedback sin capturas: no se lanzara ningun analisis.'
+                    }
+                }
+                try { Write-JsonFile -Path $automationPath -Object $automation } catch { }
+            }
+
             $deadline = $gameStartUtc.AddSeconds($DurationSec)
+            $automationDirty = $false
             while ([DateTime]::UtcNow -lt $deadline) {
                 try {
                     $game.Refresh()
                     if ($game.HasExited) { break }
                 } catch {
                     break
+                }
+                if ($null -ne $automation -and $script:GameWindowReady) {
+                    try {
+                        if (Invoke-AutomationTick -State $automation -Game $game `
+                                -Config $automationConfig -Steps $scenarioSteps) {
+                            $automationDirty = $true
+                        }
+                    } catch {
+                        $automation.errors += "Tick: $($_.Exception.Message)"
+                        $automationDirty = $true
+                    }
+                    if ($automationDirty) {
+                        try {
+                            Write-JsonFile -Path $automationPath -Object $automation
+                            $automationDirty = $false
+                        } catch { }
+                    }
                 }
                 Start-Sleep -Milliseconds 250
             }
@@ -1079,6 +1607,57 @@ function Invoke-Baseline {
                 count        = $csvMetrics.sample_count
                 span_sec     = $csvMetrics.sample_span_sec
                 interval_sec = 1
+            }
+        }
+
+        # Cierre de la automatizacion: espera breve al feedback pendiente y
+        # escribe automation.json definitivo con resumen y estado del foco.
+        if ($null -ne $automation) {
+            $pendingFeedback = 0
+            foreach ($job in @($feedbackJobs)) {
+                if (-not $job.Process.HasExited) {
+                    try { $job.Process.WaitForExit(15000) | Out-Null } catch { }
+                }
+                if ($job.Process.HasExited) {
+                    $status = 'finished'
+                } else {
+                    $status = 'still_running'
+                    $pendingFeedback++
+                }
+                foreach ($entry in @($automation.feedback)) {
+                    if ([int]$entry.pid -eq $job.Process.Id) {
+                        $entry.status = $status
+                        if ($status -eq 'finished') {
+                            try { $entry.exit_code = $job.Process.ExitCode } catch { }
+                        }
+                    }
+                }
+            }
+            if ($pendingFeedback -gt 0) {
+                $automation.errors += "$pendingFeedback analisis de Codex seguian en ejecucion al cerrar."
+                $result.notes += "$pendingFeedback analisis de Codex seguian en ejecucion; revisar feedback/ al terminar."
+            }
+            $automation.finished_at = [DateTime]::UtcNow.ToString('o')
+            $executed = @($automation.timeline | Where-Object { $_.status -eq 'done' }).Count
+            $failed = @($automation.timeline | Where-Object { $_.status -eq 'failed' }).Count
+            $skipped = @($automation.timeline | Where-Object { $_.status -eq 'skipped' }).Count
+            $doneCaptures = @($automation.captures | Where-Object { -not $_.error }).Count
+            $automation.summary = [ordered]@{
+                steps_executed   = $executed
+                steps_failed     = $failed
+                steps_skipped    = $skipped
+                captures         = $doneCaptures
+                captures_skipped = [int]$automation.counters.skipped_captures
+                feedback_calls   = @($automation.feedback).Count
+                focus_attempts   = [int]$automation.focus.attempts
+                focus_failures   = [int]$automation.focus.failures
+            }
+            try {
+                Write-JsonFile -Path $automationPath -Object $automation
+                $result.notes += "Automatizacion: $executed pasos ejecutados, $doneCaptures capturas, $skipped pasos saltados."
+                if ($failed -gt 0) { $result.notes += "$failed pasos fallaron al enviar la tecla." }
+            } catch {
+                $result.errors += "automation.json: $($_.Exception.Message)"
             }
         }
 

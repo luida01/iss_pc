@@ -4,14 +4,19 @@
 // AMD's Windows driver (amdvlk64.dll, RX 580) writes through a null pointer at
 // amdvlk64.dll+0xebbbb right after the game's first BC1 1D texture (512x1, iss_pc #16, #31,
 // #49), whether that image is created 1D (unsupported) or 2D of height 1 (TLG_BLOCK1D, #36).
-// With this on, BC1-BC5 textures that are 1D or narrower or shorter than one 4x4 block become
-// plain RGBA8 / R8 / RG8 images (sRGB and snorm kept) filled from a CPU decode of guest memory
-// (texture_cache/tlg_bc_decode.h): the driver never sees a block-compressed image of that
-// shape. 1D ones stay 1D (no TLG_BLOCK1D promotion), which every driver supports.
+// NVIDIA's 617.x driver refuses BC 1D too and faults in the game shortly after one is created
+// (docs/analysis/bc1d-auto-fix.md). With this on, BC1-BC5 textures that are 1D or narrower or
+// shorter than one 4x4 block become plain RGBA8 / R8 / RG8 images (sRGB and snorm kept) filled
+// from a CPU decode of guest memory (texture_cache/tlg_bc_decode.h): the driver never sees a
+// block-compressed image of that shape. 1D ones stay 1D (no TLG_BLOCK1D promotion), which
+// every driver supports.
 //
-// Default: on for AMD's proprietary driver only; TLG_BC_TINY=1 or 0 decides otherwise.
-// vk_instance.cpp sets it once, before any image or shader exists, and the shader profile
-// carries it (it changes which 1D textures the shaders sample as 2D).
+// Default: automatic. Every driver that refuses BC 1D and was not explicitly given the 2D
+// promotion (TLG_BLOCK1D=1) decodes these textures on the CPU; AMD's proprietary driver keeps
+// its default because the 2D promotion crashes it too. TLG_BC_TINY=1 / 0 decide otherwise and
+// TLG_BC_TINY=auto spells out the automatic decision. vk_instance.cpp sets it once, before any
+// image or shader exists, and the shader profile carries it (a change rebuilds the pipeline
+// cache).
 
 #pragma once
 

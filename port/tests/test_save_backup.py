@@ -45,6 +45,25 @@ class SaveBackupTest(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertEqual(len(save_backup.list_backups(self.user)), 2)
 
+    def test_same_second_orders_by_suffix(self):
+        write(self.save, 'v1')
+        first = save_backup.backup(self.user, now=self.clock)
+        write(self.save, 'v2')
+        second = save_backup.backup(self.user, now=self.clock)
+        self.assertEqual(first.name, '20261009-180000')
+        self.assertEqual(second.name, '20261009-180000-2')
+        self.assertEqual(save_backup.list_backups(self.user), [second.name, first.name])
+
+    def test_same_second_keeps_newest(self):
+        write(self.save, 'v')
+        made = [save_backup.backup(self.user, now=self.clock)
+                for _ in range(save_backup.KEEP + 2)]
+        kept = save_backup.list_backups(self.user)
+        self.assertEqual(len(kept), save_backup.KEEP)
+        self.assertEqual(kept[0], made[-1].name)
+        self.assertFalse(made[0].exists())
+        self.assertFalse(made[1].exists())
+
     def test_keeps_newest_ten(self):
         write(self.save, 'v')
         made = [save_backup.backup(self.user, now=self.tick()) for _ in range(12)]

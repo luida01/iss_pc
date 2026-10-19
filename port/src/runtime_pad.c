@@ -5,11 +5,14 @@
  *   WASD left stick, arrow keys right stick, Space Cross, LShift Circle,
  *   E Square, Q Triangle, 1 L1, 3 R1, R L2, F R2, Z L3, C R3,
  *   Enter Options, Tab left touchpad (photo mode), Backspace right touchpad (pause menu),
- *   IJKL d-pad (I up, K down, J left, L right).
+ *   IJKL d-pad (I up, K down, J left, L right),
+ *   H sensor mode (the graffiti spray can, as a gamepad's L3+R3; Z+C together also toggles it)
+ *   and, with Ctrl held, the one-key graffiti assistant (TLG_MOTION_ASSIST; see sample_motion).
  * Mouse (while the window has it, see tlggpu_mouse_take; Esc releases it, a click takes it back):
  *   motion turns the camera (right stick, src/mouse_stick.h), left button R2 (use the power),
  *   right button L2 (aim), middle button R3. X1/X2 and the wheel are free for TLG_KEY_MAP
- *   ("Mouse X1", "Wheel Up", ...). */
+ *   ("Mouse X1", "Wheel Up", ...). While the can is in hand (sensor mode or T/G) the mouse aims
+ *   it and the right button paints (L2, the "[L2] Spray" the game asks for). */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "gpu/tlggpu.h"
@@ -321,16 +324,24 @@ static void load_button_maps(void) {
  * Pro...) reports its gyro/accelerometer through SDL; the orientation integrates the gyro and
  * leans on gravity. Without sensors the tilt is simulated, so motion prompts can be passed with
  * any controller or the keyboard:
- *   keyboard: T / G hold the controller turned sideways (to one side / the other) and, while held,
- *   the arrow keys point it (the graffiti cursor), Y shakes it, F sprays (R2);
+ *   keyboard: H, or Z+C together (the pad's L3+R3), toggles sensor mode; Ctrl+H toggles the
+ *   one-key graffiti assistant (TLG_MOTION_ASSIST=1 arms it at start). Without sensor mode,
+ *   T / G hold the controller turned sideways (to one side / the other) and, while held, the
+ *   arrow keys point it (the graffiti cursor), Y shakes it, R sprays (L2, the prompt the game
+ *   asks for) and F sprays (R2);
  *   gamepad: "sensor mode", toggled by a tap on TLG_MOTION_BUTTON (default "misc1": Share/Capture;
  *   any SDL button name) or on L3+R3 together. Sensor mode is the spray can of the graffiti (the
  *   only scene that asks for motion; the others use the touchpad): the controller is held on its
- *   side, as the game asks ("Hold Wireless Controller Sideways"), the left stick (or the right)
- *   points it left/right and up/down (the graffiti cursor; it stays where it is left) and the
- *   bottom face button (cross / A / Nintendo B) shakes it; R2 still sprays. The sticks and that
- *   button are hidden from the game, so the character neither walks, jumps nor turns the camera.
- *   A notice on screen tells the mode; leaving it puts the controller upright again.
+ *   side, as the game asks ("Hold Wireless Controller Sideways"); cross / A / Nintendo B shakes it
+ *   (Y on the keyboard) and L2 sprays (R or the right mouse button; F or the left mouse button is
+ *   R2, which the graffiti prompt does not ask for). The mouse,
+ *   either stick or the arrow keys (keyboard) point it (the graffiti cursor; it stays where it is
+ *   left). The sticks and Cross are hidden from the game, so the character neither walks, jumps
+ *   nor turns the camera. A notice on screen tells the mode; leaving it puts the controller
+ *   upright again. The assistant, while sensor mode is on, keeps the can sideways, sweeps the aim
+ *   in a slow spiral, shakes ~2 Hz and sprays in pulses (see motion_assist_at), so the tutorial
+ *   completes with no input; it only acts in sensor mode and stops after TLG_MOTION_ASSIST_SECS
+ *   (150 s by default) or with Ctrl+H.
  * TLG_MOTION=off disables real sensors (simulation still works). */
 static int injected_motion; /* TLG_PAD_FILE tokens: 1 tilt_right (T), 2 tilt_left (G), 4 shake (Y) */
 typedef struct { float w, x, y, z; } Quat;
@@ -365,6 +376,70 @@ static float aim_curve(float v) {
     const float t=fminf((a-dead)/(1.f-dead),1.f);
     return v<0 ? -t*t : t*t;
 }
+static int ui_pt(void) { const char *lang=getenv("TLG_UI_LANG"); return !(lang && !strncmp(lang,"en",2)); }
+/* Keyboard edges for the sensor-mode toggles: H, and Z+C as the pad's L3+R3. */
+static int key_mode_held_h, key_mode_held_zc;
+
+/* The one-key graffiti assistant (TLG_MOTION_ASSIST=1, or Ctrl+H in game): while sensor mode is
+ * on it keeps the can on its side (the mode does), sweeps the aim in a slow spiral so the whole
+ * stencil is covered (not just a ring), shakes the can in ~2 Hz bursts and sprays in pulses, so
+ * the tutorial completes with no input. It never acts outside sensor mode, so normal gameplay is
+ * untouched; leaving sensor mode pauses it and it stops on its own after TLG_MOTION_ASSIST_SECS
+ * seconds (default 150; 0 never). TLG_MOTION_ASSIST_LOG=1 prints the pattern every 0.6 s as
+ * "Runtime: motion assist t=... yaw=... pitch=... shake=... spray=..." lines. */
+typedef struct { float yaw, aim_pitch; int shake, spray; } MotionAssist;
+/* Pure and deterministic (no state or time source): what the assistant asks for t seconds after
+ * it started. The aim follows a lissajous figure: yaw = 0.75*sin(2*pi*0.37*t) and
+ * aim_pitch = 0.60*sin(2*pi*0.35*t). Two close but not equal frequencies, so the path fills the
+ * stencil instead of tracing rings: a spiral left a quarter of it unpainted, the figure covers
+ * 99% of it in 30 s (measured in docs/analysis/motion-assist.md, checked by tests/test_motion_
+ * assist.c). The shake turns on the first 0.2 s of each 0.5 s (2 Hz) and the spray (L2+R2) the
+ * rest, so the two never fight: while one is asked, the other is off. Tests can walk t and check
+ * the pattern without the game. */
+static MotionAssist motion_assist_at(float t) {
+    const float yaw=0.75f*sinf(6.2831853f*0.37f*t);
+    const float aim_pitch=0.60f*sinf(6.2831853f*0.35f*t);
+    const float cycle=fmodf(t,0.5f);
+    return (MotionAssist){yaw,aim_pitch,cycle<0.2f,cycle>=0.2f};
+}
+static struct { int loaded, on, finished, running, turned, log; float used, seconds; uint64_t log_next; } assist={.seconds=150.f};
+static void motion_assist_load(void) {
+    if (assist.loaded) return;
+    assist.loaded=1;
+    const char *e=getenv("TLG_MOTION_ASSIST");
+    assist.on=e && *e && strcmp(e,"0")!=0;
+    e=getenv("TLG_MOTION_ASSIST_SECS");
+    assist.seconds=e && *e ? (float)atof(e) : 150.f;
+    if (assist.seconds<0) assist.seconds=0;
+    e=getenv("TLG_MOTION_ASSIST_LOG");
+    assist.log=e && *e=='1';
+}
+/* Turns sensor mode on/off from any source (keyboard or pad), with the notice, the log line and
+ * the graffiti guide the first time it turns on. */
+static void motion_set_mode(int on) {
+    if (motion.mode==on) return;
+    motion.mode=on;
+    const int pt=ui_pt();
+    tlggpu_overlay_notice(on ? (pt ? "Modo sensor LIGADO (lata de spray): A sacode, L2 pinta, analógico esquerdo mira"
+                                    : "Sensor mode ON (spray can): cross shakes, L2 sprays, left stick aims")
+                            : (pt ? "Modo sensor desligado" : "Sensor mode off"), 3.0f);
+    printf("Runtime: sensor mode %s\n",on ? "on" : "off");
+    if (on) tlggpu_graffiti_guide(0); /* the steps, the first time only */
+    else assist.turned=0;
+}
+/* Ctrl+H: arms/disarms the assistant. Turning it on also turns sensor mode on if it was off
+ * (that is the whole tutorial in one key); turning it off never touches the mode. */
+static void motion_assist_toggle(void) {
+    motion_assist_load();
+    assist.on=!assist.on;
+    assist.used=0; assist.finished=0; assist.running=0;
+    if (assist.on && !motion.mode) { assist.turned=1; motion_set_mode(1); }
+    const int pt=ui_pt();
+    tlggpu_overlay_notice(assist.on ? (pt ? "Assistente do grafite LIGADO: pinta sozinho no modo sensor (Ctrl+H desliga)"
+                                           : "Graffiti assistant ON: it paints by itself in sensor mode (Ctrl+H stops)")
+                                   : (pt ? "Assistente do grafite desligado" : "Graffiti assistant off"), 3.0f);
+    printf("Runtime: motion assist %s (%.0f s budget, Ctrl+H)\n",assist.on ? "on" : "off",assist.seconds);
+}
 static void sample_motion(PadData *d, SDL_Gamepad *g, const bool *k) {
     const uint64_t now=now_us();
     float dt=motion.last_us ? (float)(now-motion.last_us)*1e-6f : 0.f;
@@ -382,15 +457,26 @@ static void sample_motion(PadData *d, SDL_Gamepad *g, const bool *k) {
         }
         real=SDL_GetGamepadSensorData(g,SDL_SENSOR_GYRO,gyro,3) && SDL_GetGamepadSensorData(g,SDL_SENSOR_ACCEL,accel,3);
     }
+    motion_assist_load();
+    /* Sensor mode from the keyboard: H, or Z+C together (the pad's L3+R3). Ctrl+H toggles the
+     * graffiti assistant instead (the same key, modified). */
+    if (k) {
+        const int h=k[SDL_SCANCODE_H], zc=k[SDL_SCANCODE_Z] && k[SDL_SCANCODE_C];
+        if ((h && !key_mode_held_h) || (zc && !key_mode_held_zc)) {
+            if (h && (k[SDL_SCANCODE_LCTRL] || k[SDL_SCANCODE_RCTRL])) motion_assist_toggle();
+            else motion_set_mode(!motion.mode);
+        }
+        key_mode_held_h=h; key_mode_held_zc=zc;
+    }
     /* Simulated tilt: target roll/pitch from keys or the modifier + right stick. */
     float roll=0, pitch=0;
     int shake=0, simulated=0;
     if ((k && k[SDL_SCANCODE_T]) || (injected_motion & 1)) { roll=1.5708f; simulated=1; }
     if ((k && k[SDL_SCANCODE_G]) || (injected_motion & 2)) { roll=-1.5708f; simulated=1; }
     if ((k && k[SDL_SCANCODE_Y]) || (injected_motion & 4)) { shake=1; simulated=1; }
-    /* Keyboard: while T or G holds the can on its side, the arrow keys point it (they leave the
-     * camera alone meanwhile, see read_pad). */
-    const int key_can=k && (k[SDL_SCANCODE_T] || k[SDL_SCANCODE_G]);
+    /* Keyboard: while T or G holds the can on its side, or in sensor mode, the arrow keys point
+     * it (they leave the camera alone meanwhile, see sample_host). */
+    const int key_can=k && (motion.mode || k[SDL_SCANCODE_T] || k[SDL_SCANCODE_G]);
     if (key_can) {
         const float speed=0.6f*tlggpu_sensor_aim_scale();
         motion.yaw-=(float)(k[SDL_SCANCODE_RIGHT]-k[SDL_SCANCODE_LEFT])*speed*dt;
@@ -401,20 +487,14 @@ static void sample_motion(PadData *d, SDL_Gamepad *g, const bool *k) {
     if (g) {
         const int sticks=SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_LEFT_STICK) && SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_RIGHT_STICK);
         const int toggle=sticks || (motion_button()>=0 && SDL_GetGamepadButton(g,(SDL_GamepadButton)motion_button()));
-        if (toggle && !motion.toggle_held) {
-            motion.mode=!motion.mode;
-            const char *lang=getenv("TLG_UI_LANG");
-            const int pt=!(lang && !strncmp(lang,"en",2));
-            tlggpu_overlay_notice(motion.mode ? (pt ? "Modo sensor LIGADO (lata de spray): X sacode, R2 pinta, analógico esquerdo mira"
-                                                    : "Sensor mode ON (spray can): cross shakes, R2 sprays, left stick aims")
-                                              : (pt ? "Modo sensor desligado" : "Sensor mode off"), 3.0f);
-            printf("Runtime: sensor mode %s\n",motion.mode ? "on" : "off");
-            if (motion.mode) tlggpu_graffiti_guide(0); /* the steps, the first time only */
-        }
+        if (toggle && !motion.toggle_held) motion_set_mode(!motion.mode);
         motion.toggle_held=toggle;
         if (sticks) d->buttons&=~(uint32_t)(BTN_L3|BTN_R3);
-        if (motion.mode) {
-            roll=1.5708f; /* on its side, like a spray can */
+    }
+    if (motion.mode) {
+        /* On its side, like a spray can, with or without a gamepad. */
+        roll=1.5708f;
+        if (g) {
             if (SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_SOUTH)) shake=1;
             /* Either stick points the can while it is held (a rate, so the aim stays where it was
              * left), as far as ~80 degrees each way. Right = turn right, up = tip up. The speed
@@ -429,12 +509,45 @@ static void sample_motion(PadData *d, SDL_Gamepad *g, const bool *k) {
             const float speed=1.2f*tlggpu_sensor_aim_scale(); /* the menu's Controls tab */
             motion.yaw-=aim_curve(sx)*speed*dt;
             motion.aim_pitch-=aim_curve(sy)*speed*dt;
-            motion.yaw=fminf(fmaxf(motion.yaw,-1.4f),1.4f);
-            motion.aim_pitch=fminf(fmaxf(motion.aim_pitch,-1.2f),1.2f);
-            d->buttons&=~(uint32_t)BTN_CROSS;
-            d->left_x=d->left_y=128;
-            d->right_x=d->right_y=128;
-            simulated=1;
+            d->left_x=d->left_y=d->right_x=d->right_y=128; /* no walking, no camera */
+        }
+        motion.yaw=fminf(fmaxf(motion.yaw,-1.4f),1.4f);
+        motion.aim_pitch=fminf(fmaxf(motion.aim_pitch,-1.2f),1.2f);
+        d->buttons&=~(uint32_t)BTN_CROSS; /* cross jumps; not wanted while holding the can */
+        simulated=1;
+    }
+    /* The one-key assistant: it only acts in sensor mode, so it never paints during normal
+     * gameplay. It can pause (mode off) and resume; the seconds are a budget of sensor-mode time.
+     * The spray asks for both triggers (L2, the "[L2] Spray" prompt = R or the right mouse
+     * button, and R2 = F or the left mouse button), so it paints whichever one the scene reads. */
+    const int assist_run=assist.on && motion.mode && !assist.finished;
+    if (assist_run && !assist.running) {
+        assist.running=1; assist.log_next=0;
+        printf("Runtime: motion assist running (Ctrl+H stops; %.0f s budget)\n",assist.seconds);
+    }
+    if (!assist_run && assist.running) {
+        assist.running=0;
+        printf("Runtime: motion assist stopped (%s)\n",assist.finished ? "done" : "sensor mode off");
+    }
+    if (assist_run) {
+        assist.used+=dt;
+        if (assist.seconds>0 && assist.used>=assist.seconds) {
+            assist.finished=1;
+            const int pt=ui_pt();
+            tlggpu_overlay_notice(pt ? "Assistente do grafite concluído (Ctrl+H repete)"
+                                     : "Graffiti assistant finished (Ctrl+H again)", 4.0f);
+            printf("Runtime: motion assist finished after %.1f s\n",assist.used);
+            if (assist.turned) motion_set_mode(0); /* it turned the mode on to paint; walk again */
+        } else {
+            const MotionAssist a=motion_assist_at(assist.used);
+            motion.yaw=a.yaw; motion.aim_pitch=a.aim_pitch; /* the spiral overrides the sticks */
+            if (a.shake) shake=1;
+            if (a.spray) { d->buttons|=BTN_L2|BTN_R2; d->l2=d->r2=255; }
+            if (assist.log && now>=assist.log_next) {
+                assist.log_next=now+600000; /* 0.6 s: in step with neither the 0.5 s shake cycle nor spray */
+                printf("Runtime: motion assist t=%.1f yaw=%.3f pitch=%.3f shake=%d spray=%d\n",
+                       assist.used,a.yaw,a.aim_pitch,a.shake,a.spray);
+            }
         }
     }
     if (real && !simulated) {
@@ -736,7 +849,15 @@ static void sample_host(PadData *d) {
     key_axis(&d->left_y,k[SDL_SCANCODE_W],k[SDL_SCANCODE_S]);
     key_axis(&d->right_x,k[SDL_SCANCODE_LEFT],k[SDL_SCANCODE_RIGHT]);
     key_axis(&d->right_y,k[SDL_SCANCODE_UP],k[SDL_SCANCODE_DOWN]);
-    if (k[SDL_SCANCODE_T] || k[SDL_SCANCODE_G]) d->right_x=d->right_y=128; /* the arrows point the can */
+    if (motion.mode) {
+        /* Sensor mode from the keyboard: the arrows point the can (sample_motion), the mouse
+         * aims it (sample_mouse) and the character stands still: the sticks and Cross are hidden
+         * from the game, just like with a gamepad. */
+        d->buttons&=~(uint32_t)BTN_CROSS;
+        d->left_x=d->left_y=d->right_x=d->right_y=128;
+    } else if (k[SDL_SCANCODE_T] || k[SDL_SCANCODE_G]) d->right_x=d->right_y=128; /* the arrows point the can */
+    /* Z+C is the keyboard's L3+R3 (the sensor-mode chord): a toggle, not a stick push. */
+    if (k[SDL_SCANCODE_Z] && k[SDL_SCANCODE_C]) d->buttons&=~(uint32_t)(BTN_L3|BTN_R3);
     apply_swipe(d,g,k);
     apply_mouse_touch(d);
 }

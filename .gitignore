@@ -37,6 +37,7 @@ port/dist/
 # Dados locais deste fork (nunca versionar)
 /userdata/
 /userdata-official/
+/userdata-g0-*/
 /evidence/
 /dist/
 /.venv-qt/

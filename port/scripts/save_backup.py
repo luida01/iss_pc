@@ -7,10 +7,18 @@ first backs up the current saves, so it can always be undone.
 """
 import datetime
 from pathlib import Path
+import re
 import shutil
 
 KEEP = 10
 STAMP = '%Y%m%d-%H%M%S'
+BACKUP_NAME = re.compile(r'([0-9]{8}-[0-9]{6})(?:-([0-9]+))?')
+
+
+def _backup_order(name):
+    """(timestamp, sequence) of a backup folder; other names keep their own order."""
+    match = BACKUP_NAME.fullmatch(name)
+    return (match[1], int(match[2] or 1)) if match else (name, 0)
 
 
 def backups_dir(user_dir):
@@ -18,9 +26,10 @@ def backups_dir(user_dir):
 
 
 def list_backups(user_dir):
-    """Backup names, newest first."""
+    """Backup names, newest first (same-second backups order by their -N suffix)."""
     root = backups_dir(user_dir)
-    return sorted((p.name for p in root.iterdir() if p.is_dir()), reverse=True) if root.is_dir() else []
+    return sorted((p.name for p in root.iterdir() if p.is_dir()), key=_backup_order,
+                  reverse=True) if root.is_dir() else []
 
 
 def _has_saves(savedata):
@@ -39,9 +48,14 @@ def _copy(user_dir, now):
     root = backups_dir(user_dir)
     root.mkdir(parents=True, exist_ok=True)
     base = (now or datetime.datetime.now()).strftime(STAMP)
-    target, n = root / base, 2
-    while target.exists():
-        target, n = root / f'{base}-{n}', n + 1
+    # Pruning may have removed the unsuffixed folder or left gaps: number the new one after the
+    # highest already used, so it never sorts behind an older backup of the same second.
+    n = 1
+    for entry in root.iterdir():
+        stamp, sequence = _backup_order(entry.name)
+        if stamp == base:
+            n = max(n, sequence + 1)
+    target = root / (base if n == 1 else f'{base}-{n}')
     shutil.copytree(savedata, target)
     return target
 

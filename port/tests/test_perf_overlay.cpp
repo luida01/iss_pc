@@ -60,9 +60,10 @@ int main() {
     setenv("TLG_CONFIG", path, 1);
 #endif
     auto& v = TlgSettings::Get();
-    assert(v.overlay_items == P::DefaultItems && v.overlay_scale == 100 && v.overlay_corner == 1);
+    assert(v.show_fps && v.overlay_items == P::DefaultItems && v.overlay_scale == 115 && v.overlay_corner == 0);
+    assert(v.overlay_opacity == 35 && v.overlay_layout == 0);
     TlgSettings::Load();
-    assert(v.overlay_items == (P::FrameTime | P::Gpu | P::Cpu | P::Vram));
+    assert(v.show_fps && v.overlay_items == (P::FrameTime | P::Gpu | P::Cpu | P::Vram));
     assert(v.overlay_scale == 300 && v.overlay_corner == 2 && v.overlay_opacity == 0);
     assert(v.overlay_layout == 1 && v.menu_tab == 3);
     v.overlay_items = P::Fps | P::Ram;
@@ -81,7 +82,8 @@ int main() {
         out << "overlay_corner=9\nmenu_tab=-1\noverlay_scale=10\n";
     }
     TlgSettings::Load();
-    assert(v.overlay_corner == 1 && v.menu_tab == 0 && v.overlay_scale == 50);
+    // An out-of-range corner falls back to 0, the built-in default (tlg_settings.cpp).
+    assert(v.overlay_corner == 0 && v.menu_tab == 0 && v.overlay_scale == 50);
     std::remove(path);
     std::puts("PASS: performance overlay");
 }

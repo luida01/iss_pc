@@ -49,13 +49,31 @@ Evidencia: `evidence/20261019-092448-source-720p-b3500-r2/`
 
 Escena: título + intro (texto “Seven years ago… Conduits… DUP” y cinemática del vehículo). El juego renderiza ~2000 draws/frame y alcanza estado de gameplay/cinemática; no se observó OOM ni cierre durante 120 s.
 
-### Run largo de 15 min (en curso)
+### Run largo de 15 min (cerrado por el usuario a los 436.8 s)
 
 Evidencia: `evidence/20261019-092725-source-720p-b3500-15m/`
 
-- Iniciado a las 09:27:25; duración solicitada 900 s.
-- A los ~4 min: VRAM 3866 MB, RAM 6.3 GB, GPU 39–40 % (cinemática), sin errores.
-- Resultado final: **PENDIENTE** (se actualiza al terminar).
+| Métrica | Valor |
+|---|---|
+| Estado | `early_exit` (el usuario cerró el juego) |
+| Duración medida | **436.8 s** de 900 s solicitados |
+| FPS mediana | **35.1** |
+| FPS p95 (ventanas de 5 s) | **55.4** |
+| Frame pacing mediano | 32.63 ms |
+| Frame pacing p99 | 66.82 ms |
+| VRAM máxima | **3891 / 4096 MB** |
+| RAM máxima (working set) | **7338 MB** |
+| RAM privada máxima | 8452 MB |
+| GPU utilización mediana | 62 % (máx 73 °C, 33.1 W) |
+| CPU mediana / máxima | 17.5 % / 31.6 % |
+| Muestras | 436 (1 s) |
+| `log_issues` | `[]`; sin `Out of device memory`, OOM ni fault |
+
+La salida fue ordenada (`stop_reason=game_exit`, `forced_stop=false`); no fue un crash del port.
+La sesión estuvo la mayor parte del tiempo en título/intro/cinemática, no en gameplay sostenido.
+Además, las capturas de ese run se tomaron de la pantalla completa y muestran una ventana de
+navegador en primer plano, así que **no sirven como evidencia visual del juego**. El run no cumple
+el requisito de 15–30 min de juego real del Gate G0.
 
 ## Observaciones del log
 
@@ -73,11 +91,11 @@ Evidencia: `evidence/20261019-092725-source-720p-b3500-15m/`
 
 ## Veredicto provisional
 
-**Viable en 4 GB para sesiones cortas a 720p**, con muy poco margen de VRAM (261 MB en el pico) y una caché de texturas que reporta 2.4× su presupuesto. No se puede declarar Gate G0 hasta completar 15–30 min de juego real y confirmar que no hay OOM al cargar zonas nuevas.
+**Viable en 4 GB para sesiones cortas a 720p**, con muy poco margen de VRAM (261 MB en el pico) y una caché de texturas que reporta 2.4× su presupuesto. El run de 436.8 s no muestra crash ni OOM, pero el usuario lo cerró y no llegó a gameplay sostenido; además las capturas no enfocaban la ventana del juego. No se puede declarar Gate G0 hasta completar 15–30 min de juego real con capturas de la ventana y confirmar que no hay OOM al cargar zonas nuevas.
 
 ## Próximos experimentos
 
-1. Completar el run de 15 min y revisar VRAM máxima, OOM y transición intro → gameplay.
+1. Completar el run de 15 min con `-AutoPlayScenario intro-g0` y capturas de la ventana del juego; revisar VRAM máxima, OOM y transición intro → gameplay.
 2. A/B de presupuesto: `ISS_GC_BUDGET_MB=2300` y `2000` con la misma escena.
 3. A/B de resolución: 720p vs 1080p/native, misma ruta.
 4. A/B de MSAA (`ISS_NO_MSAA=1`) y readbacks realmente desactivados (`TLG_STALE_READBACK=0`, `TLG_DEFERRED_READBACK=0`).

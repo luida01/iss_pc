@@ -277,6 +277,12 @@ if (WIN32)
     target_compile_options(pad-map-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
     target_include_directories(pad-map-test PRIVATE .. ../src)
     target_link_libraries(pad-map-test PRIVATE PkgConfig::SDL3 bcrypt -pthread)
+    # The graffiti assistant's pattern (src/runtime_pad.c): it must sweep the stencil.
+    add_executable(motion-assist-test EXCLUDE_FROM_ALL ../tests/test_motion_assist.c ../src/compat_win.c)
+    set_target_properties(motion-assist-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(motion-assist-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    target_include_directories(motion-assist-test PRIVATE .. ../src)
+    target_link_libraries(motion-assist-test PRIVATE PkgConfig::SDL3 bcrypt -pthread m)
     add_executable(mouse-stick-test EXCLUDE_FROM_ALL ../tests/test_mouse_stick.c)
     set_target_properties(mouse-stick-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
     target_compile_options(mouse-stick-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
@@ -474,9 +480,11 @@ add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_sup
 target_include_directories(upscaler-support-test PRIVATE shim)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 add_executable(orb-multiplier-test EXCLUDE_FROM_ALL ../tests/test_orb_multiplier.cpp
-    shim/tlg_orbs.cpp shim/tlg_settings.cpp shim/tlg_view.cpp)
+    shim/tlg_orbs.cpp shim/tlg_settings.cpp shim/tlg_view.cpp
+    ../src/compat_win.c ../tests/test_fault_recovery_stubs.cpp)
 target_include_directories(orb-multiplier-test PRIVATE shim)
 target_compile_options(orb-multiplier-test PRIVATE -UNDEBUG)
+target_link_libraries(orb-multiplier-test PRIVATE bcrypt)
 add_executable(stat-multipliers-test EXCLUDE_FROM_ALL ../tests/test_stat_multipliers.cpp
     shim/tlg_settings.cpp)
 target_include_directories(stat-multipliers-test PRIVATE shim)

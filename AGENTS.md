@@ -91,7 +91,8 @@ $env:ISS_USER_DIR = 'C:\Users\luisd\proyectos\infamous-port\userdata'
 python port\run.py
 ```
 
-- `F10` muestra FPS; `Insert` abre el menú del port.
+- `F10` muestra/oculta el HUD de métricas (FPS, frametime, GPU, VRAM); aparece por defecto arriba a la izquierda.
+- `Insert` abre el menú del port. Guía de teclado, ratón y mando Xbox 360: `docs/controls.md`.
 - Los logs van a `port\out\logs\run-*.log`.
 - Cada experimento guarda: log, `result.json`, CSV de métricas, capturas y flags exactos.
 - Una mejora necesita **3 repeticiones** de la misma escena o una evidencia equivalente.
@@ -134,10 +135,15 @@ Reglas para subagentes:
 - [x] Vista del juego base+1.07 creada y verificada (`eboot.bin` SHA256 `2D1CA7...9039AB`).
 - [x] Build Windows reproducible: `port/build.sh` exit 0; `tlg-probe.exe`, `tlg-gpu-capabilities.exe`, `tlg-play.exe`.
 - [x] Primera ejecución en RTX 3050 4 GB: 120 s a 720p, 32.8 FPS mediana, VRAM máx 3835 MB, RAM 7490 MB, sin OOM.
-- [ ] Baseline de 15–30 min con métricas (run de 15 min en curso; intro/cinemática).
+- [x] BC 1D automático, caché de pipelines crash-safe y blindaje del hilo de vista (los crashes de
+      `evidence/20261019-104920`/`105508` eran del hilo de vista, no de la caché).
+- [x] Asistente de motion del graffiti con patrón propio y test (`motion-assist-test`).
+- [ ] Baseline de 15–30 min de juego real con métricas y capturas de la ventana del juego.
+- [x] Run largo de 436.8 s sin crash ni OOM; el usuario cerró el juego (`early_exit`). No cuenta como Gate G0.
 - [ ] Gate G0.
 
 Evidencia del baseline corto: `evidence/20261019-092448-source-720p-b3500-r2/`.
+Run largo parcial: `evidence/20261019-092725-source-720p-b3500-15m/` (título/intro, sin gameplay sostenido).
 
 ## 9. Trampas conocidas
 
@@ -148,3 +154,8 @@ Evidencia del baseline corto: `evidence/20261019-092448-source-720p-b3500-r2/`.
 - **`ISS_BC_TINY=1`** es un workaround para texturas BC minúsculas en AMD; en NVIDIA úsalo solo como experimento A/B.
 - **Releases manuales:** los merges upstream no publican release; no confundir “sin release hoy” con abandono.
 - **`tools/` está ignorado por Git** en el upstream; los scripts locales viven ahí, pero para versionarlos hay que moverlos a `scripts/devtools/` o ajustar `.gitignore`.
+- **La herramienta `execute` puede colgarse**: un bucle de simulación pesado en JavaScript dejó el
+  hilo del servidor de opencode al 100 % de CPU y la sesión del agente 52 minutos sin avanzar
+  (2026-10-19). Las simulaciones cortas se hacen en Python (`tools/`), no en `execute`; si una
+  sesión de subagente lleva más de 10 minutos sin escribir, se cancela por la API
+  (`POST /api/session/<id>/interrupt`) y se retoma el trabajo en el agente principal.
