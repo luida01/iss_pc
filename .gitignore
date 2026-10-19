@@ -33,3 +33,10 @@ port/pgo/
 port/user/
 /game/
 port/dist/
+
+# Dados locais deste fork (nunca versionar)
+/userdata/
+/userdata-official/
+/evidence/
+/dist/
+/.venv-qt/

@@ -47,10 +47,12 @@ def module(path):
             if key in table and table[key] != identity:
                 raise ValueError('conflicting module/library IDs')
             table[key] = identity
-    def identity(name):
+    def identity(name, strict=True):
         parts = name.split('#')
         if len(parts) != 3:
-            raise ValueError(f'unsupported symbol encoding {name!r}')
+            if strict:
+                raise ValueError(f'unsupported symbol encoding {name!r}')
+            return None
         n, lib, mod = parts
         return (n, libraries[lib], modules[mod])
     symbols = []
@@ -59,7 +61,8 @@ def module(path):
         n, info, other, section, value, size = unpack('<IBBHQQ', table, pos)
         name = string(n)
         symbols.append(dict(name=name, type=info & 15, binding=info >> 4, section=section,
-                            value=value, size=size, identity=identity(name) if name else None))
+                            value=value, size=size,
+                            identity=identity(name, strict=False) if name else None))
     relocations = []
     for ot, st in ((0x61000029, 0x6100002d), (0x6100002f, 0x61000031)):
         table = span(blob, tags[ot], tags[st])
@@ -108,6 +111,8 @@ def link(game, out):
     main_modules = {identity:key for key,identity in main['modules'].items()}
     def imported(symbol):
         key = symbol['identity']
+        if key is None:
+            raise ValueError(f'unsupported libc import encoding {symbol["name"]!r}')
         if key not in identities:
             n,lib,mod = key
             name = (f'{n}#{main_libraries[lib]}#{main_modules[mod]}'
