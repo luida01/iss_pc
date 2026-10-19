@@ -405,6 +405,11 @@ add_executable(recompiler-fixes-test EXCLUDE_FROM_ALL ../tests/test_recompiler_f
 target_include_directories(recompiler-fixes-test PRIVATE shim shadps4 third_party/gcn/include)
 target_compile_options(recompiler-fixes-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(recompiler-fixes-test PRIVATE tlggpu)
+# tlg: CreateFileMapping2 (las secciones respaldadas por el page file) solo esta en el API set
+# onecore; tlg-probe lo enlaza y este target de test tambien lo necesita en Windows.
+if (WIN32)
+    target_link_libraries(recompiler-fixes-test PRIVATE onecore)
+endif()
 # tlg: first-run shader compilation, gate G4.1: translates a shader cache again from its .meta
 # files alone and compares the SPIR-V (local tool: needs the player's game files).
 add_executable(shader-replay EXCLUDE_FROM_ALL ../tests/shader_replay.cpp
