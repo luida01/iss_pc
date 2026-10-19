@@ -59,6 +59,8 @@ if ($Configs.Count -eq 0) {
         '480p-nativo'       = @{ resolution = '480p'; env = @{ ISS_UPSCALER = 'off' }; ini = @{ preset = '0' } }
         # El fix de ReadFirstLane (wave64) anade barreras: se mide su coste con la variante vieja.
         '720p-rfl-viejo'    = @{ resolution = '720p'; env = @{ ISS_UPSCALER = 'off'; TLG_RFL_ALL = '0' }; ini = @{ preset = '0' } }
+        # Con la CPU como cuello, encolar dos frames deja al hilo grabador adelantar trabajo.
+        '720p-frames2'      = @{ resolution = '720p'; env = @{ ISS_UPSCALER = 'off' }; ini = @{ preset = '0'; frames_queued = '2' } }
     }
 }
 
