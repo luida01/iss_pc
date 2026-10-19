@@ -81,10 +81,15 @@ inline bool LaneDivergence() {
 /// Lowers v_readfirstlane in every compute shader wider than a 32-lane host wave (not only in
 /// those that also use ballots or v_mbcnt): the two host halves of a wave64 swap the value
 /// through LDS so both read the first active lane of the whole wave, in uniform flow, unless the
-/// value is provably the same in every lane. TLG_RFL_ALL=0/1; default off (experiment: adds two
-/// workgroup barriers per lowered instruction).
+/// value is provably the same in every lane.
+/// tlg: default on (correctness fix): on a 32-wide host the host broadcast is per subgroup, so
+/// the upper half of a wave64 read its own lane 32 instead of the wave's first lane. In the
+/// append pattern (one lane reserves the slot with an atomic and broadcasts the base) that base
+/// was 0 for the upper half: every item of the upper half was written over the lower half's and
+/// half of the list was lost (the missing particles). TLG_RFL_ALL=0 restores the old behaviour
+/// (A/B: it drops two workgroup barriers per lowered instruction).
 inline bool ReadFirstLaneAll() {
-    static const bool enabled = Detail::EnvFlag("TLG_RFL_ALL", [] { return false; });
+    static const bool enabled = Detail::EnvFlag("TLG_RFL_ALL", &Detail::AlwaysOn);
     return enabled;
 }
 
@@ -107,7 +112,9 @@ inline void LogStates(Log&& log) {
     log("TLG_WQM", WholeQuadMode(), "S_WQM_B64 grows the mask to quads");
     log("TLG_LANE_DIVERGENCE", LaneDivergence(),
         "mbcnt masks, lane ids and atomic results make a branch divergent");
-    log("TLG_RFL_ALL", ReadFirstLaneAll(), "wave64 ReadFirstLane lowered in every wide compute shader");
+    log("TLG_RFL_ALL", ReadFirstLaneAll(),
+        "wave64 ReadFirstLane lowered in every wide compute shader (upper half of a wave64 reads "
+        "the wave's first lane, not its own lane 32)");
 }
 
 } // namespace Shader::Toggles

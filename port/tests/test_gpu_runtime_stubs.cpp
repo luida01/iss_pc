@@ -4,6 +4,12 @@
 #include <cstdint>
 #include <cstddef>
 #include <setjmp.h>
+#if defined(_WIN32) && !defined(sigjmp_buf)
+// The Windows build maps sigjmp_buf to the port's own type (src/compat_win.h). The test
+// targets that need the mapping get it on the command line; this one does not.
+#include "../src/compat_win.h"
+using sigjmp_buf = tlg_jmp_buf;
+#endif
 // Renderer tests have no guest process. Clock/host-thread services work; guest accesses abort.
 extern "C" {
 thread_local sigjmp_buf* runtime_fault_recover = nullptr;

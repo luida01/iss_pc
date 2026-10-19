@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// The wave64 ReadFirstLane as the port lowers it (lower_wave64_pass.cpp): the two host halves of
+// the wave swap the value through LDS, so the whole wave reads the first active lane of the even
+// half (the wave's first lane). The address mask clears bit 2 of the slot address, so both
+// halves read the same slot.
+#version 450
+#extension GL_KHR_shader_subgroup_ballot : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Out {
+    uint data[];
+} out_buf;
+shared uint scratch[2];
+void main() {
+    uint idx = gl_LocalInvocationIndex;
+    uint value = idx * 100u + 7u;
+    uint base = subgroupBroadcastFirst(value);
+    uint slot = idx >> 5;                     // the host subgroup (0: even half, 1: odd half)
+    scratch[slot] = base;                    // every host subgroup writes its own slot
+    barrier();                               // (workgroup scope, like the port's lowering)
+    out_buf.data[idx] = scratch[slot & ~1u]; // both halves read the even half's slot
+    barrier();
+}

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <span>
 #include "common/backports.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -24,6 +25,27 @@
 using namespace Shader;
 
 static int failures = 0;
+
+// The environment switches of the recompiler are read once per process. The MSYS2/MinGW build
+// has no POSIX setenv; _putenv_s is its equivalent (an empty value removes the variable).
+static void SetEnv(const char* name, const char* value, bool overwrite) {
+#ifdef _WIN32
+    if (!overwrite && std::getenv(name)) {
+        return;
+    }
+    _putenv_s(name, value);
+#else
+    setenv(name, value, overwrite ? 1 : 0);
+#endif
+}
+
+static void UnsetEnv(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
 
 static void Check(bool ok, const char* what) {
     std::printf("%s: %s\n", ok ? "ok" : "FAIL", what);
@@ -83,6 +105,153 @@ static BarrierResult RunBarrierPass(u32 threads, const char* spirv_path = nullpt
         Check(bool(out) && !code.empty(), "multi-wave compute shader emits SPIR-V");
     }
     return result;
+}
+
+// The append pattern of a compute shader: the wave reserves a slot with an atomic in its first
+// lane and broadcasts the base with a ReadFirstLane, so every lane writes at base + its index.
+// The guest wave64 has 64 lanes; on a 32-wide host it is two host subgroups of 32, and the host's
+// broadcast (OpGroupNonUniformBroadcastFirst) is per subgroup: the upper half of the wave read
+// its own lane 32, which reserved nothing, and wrote its items over the lower half's.
+struct AppendPattern {
+    static constexpr u32 kWaveLanes = 64;
+    static constexpr u32 kHostLanes = 32;
+
+    // What a lane holds before the broadcast: the lane that reserved the slot holds the base,
+    // the others hold 0 (they never reserved anything).
+    static u32 Reserved(u32 lane, u32 base) {
+        return lane == 0 ? base : 0;
+    }
+
+    // The base the lane sees after the ReadFirstLane, for the three forms of the shader.
+    enum class Form {
+        Reference,  // the PS4 wave64: the first active lane of the wave
+        HostPerHalf,// the host's per subgroup broadcast: the upper half reads its own lane 32
+        Exchange,   // the LDS exchange of the wave64 lowering: the whole wave reads lane 0
+    };
+
+    static u32 Base(Form form, u32 lane, u32 base) {
+        switch (form) {
+        case Form::Reference:
+        case Form::Exchange:
+            return base;
+        case Form::HostPerHalf:
+            // The host broadcast is per subgroup: the lower half reads lane 0's value (the
+            // base) and the upper half reads lane 32's value (nothing: it reserved no slot).
+            return Reserved(lane < kHostLanes ? 0 : kHostLanes, base);
+        }
+        return 0;
+    }
+
+    // The slot the lane writes, and the slots the wave touches as a set.
+    static u32 Slot(Form form, u32 lane, u32 base) {
+        return Base(form, lane, base) + lane;
+    }
+    static u32 Slots(Form form, u32 base) {
+        std::set<u32> slots;
+        for (u32 lane = 0; lane < kWaveLanes; ++lane) {
+            slots.insert(Slot(form, lane, base));
+        }
+        return static_cast<u32>(slots.size());
+    }
+    // The slots of the wave's own list (the ones the wave reserved, base..base+63).
+    static bool WritesInsideTheList(Form form, u32 base) {
+        for (u32 lane = 0; lane < kWaveLanes; ++lane) {
+            const u32 slot = Slot(form, lane, base);
+            if (slot < base || slot >= base + kWaveLanes) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+// The shader the wave64 lowering produces for the append pattern, and what it computes.
+struct ReadFirstLaneForm {
+    u32 broadcasts{};      // ReadFirstLane instructions in the shader (the host broadcast)
+    u32 barriers{};        // workgroup barriers the lowering added
+    u32 exchanges{};       // LDS loads of the exchange
+    u32 writes{};          // LDS writes (the test's own one plus the exchange's)
+    bool even_half_slot{}; // the load reads the even half's slot (bit 2 of the address cleared)
+};
+
+// Builds the append pattern in a 64-thread compute shader (in divergent flow when asked) and
+// runs the wave64 lowering on it.
+static ReadFirstLaneForm RunReadFirstLaneForm(bool varying, bool divergent, u32 threads = 64,
+                                                const char* spirv_path = nullptr) {
+    Info info{};
+    info.hw_stage = HwStage::Compute;
+    info.sw_stage = SwStage::Compute;
+    RuntimeInfo runtime{};
+    runtime.Initialize(HwStage::Compute, SwStage::Compute);
+    runtime.hw.cs.shared_memory_size = 256;
+    runtime.hw.cs.workgroup_size = {threads, 1, 1};
+    Common::ObjectPool<IR::Inst> pool;
+    IR::Block body(pool);
+    IR::Block merge(pool);
+    IR::IREmitter ir(body);
+    const IR::U32 tid = ir.GetAttributeU32(IR::Attribute::LocalInvocationId, 0);
+    // The atomic's result: only the lane that reserves the slot holds it.
+    const IR::U32 reserved = IR::U32{ir.SharedAtomicIAdd(ir.Imm32(0u), ir.Imm32(1u), false)};
+    const IR::U32 source =
+        varying ? reserved : IR::U32{ir.GetAttributeU32(IR::Attribute::WorkgroupId, 0)};
+    const IR::U32 base = ir.ReadFirstLane(source);
+    ir.WriteShared(32, base, ir.Imm32(0u));
+    ir.Epilogue();
+    IR::Program program(info);
+    program.blocks.push_back(&body);
+    program.post_order_blocks.push_back(&body);
+    if (divergent) {
+        // A branch on the lane id: the ReadFirstLane inside it is in divergent flow.
+        program.blocks.push_back(&merge);
+        program.post_order_blocks.push_back(&merge);
+        const IR::U1 cond{ir.INotEqual(ir.BitwiseAnd(tid, ir.Imm32(1u)), ir.Imm32(0u))};
+        program.syntax_list.push_back(
+            {.data = {.if_node = {.cond = cond, .body = &body, .merge = &merge}},
+             .type = IR::AbstractSyntaxNode::Type::If});
+        program.syntax_list.push_back({.data = {.block = &body},
+                                       .type = IR::AbstractSyntaxNode::Type::Block});
+        program.syntax_list.push_back({.data = {.end_if = {.merge = &merge}},
+                                       .type = IR::AbstractSyntaxNode::Type::EndIf});
+        program.syntax_list.push_back({.data = {.block = &merge},
+                                       .type = IR::AbstractSyntaxNode::Type::Block});
+    } else {
+        program.syntax_list.push_back({.data = {.block = &body},
+                                       .type = IR::AbstractSyntaxNode::Type::Block});
+    }
+    program.syntax_list.push_back({.type = IR::AbstractSyntaxNode::Type::Return});
+    Profile profile{};
+    profile.subgroup_size = 32;
+    profile.supported_spirv = 0x00010600; // the group operations need SPIR-V 1.3
+    profile.support_int64 = true;
+    Optimization::LowerWave64BallotPass(program, runtime, profile);
+
+    ReadFirstLaneForm form{};
+    form.broadcasts = Count(body, IR::Opcode::ReadFirstLane);
+    form.barriers = Count(body, IR::Opcode::Barrier);
+    form.writes = Count(body, IR::Opcode::WriteSharedU32);
+    for (const IR::Inst& inst : body.Instructions()) {
+        if (inst.GetOpcode() != IR::Opcode::LoadSharedU32) {
+            continue;
+        }
+        ++form.exchanges;
+        // The exchange reads the even half's slot: the slot address with bit 2 cleared, so both
+        // host halves of the wave read the same slot (the wave's first lane).
+        const IR::Value address = inst.Arg(0);
+        const IR::Inst* op = address.IsImmediate() ? nullptr : address.Inst();
+        form.even_half_slot = form.even_half_slot ||
+                              (op && op->GetOpcode() == IR::Opcode::BitwiseAnd32 &&
+                               op->Arg(1).IsImmediate() && op->Arg(1).U32() == ~7u);
+    }
+    if (spirv_path) {
+        // The SPIR-V of the lowered shader (for spirv-val).
+        Optimization::CollectShaderInfoPass(program, profile);
+        Backend::Bindings bindings{};
+        const auto code = Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
+        std::ofstream out(spirv_path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u32));
+        Check(bool(out) && !code.empty(), "the lowered wave64 shader emits SPIR-V");
+    }
+    return form;
 }
 
 // A 64-thread compute block with one ReadFirstLane (of a lane-varying value when `varying`) and
@@ -245,15 +414,16 @@ static u32 ReadLanePastWorkgroup(u32 host_subgroup) {
 
 int main(int argc, char** argv) {
     // Exercise the new paths unless the caller chose (no game serial here: the default needs one).
-    setenv("TLG_LDS_SMALL", "1", 0);
-    setenv("TLG_LDS_MULTI", "1", 0);
-    setenv("TLG_LDS_READLANE", "1", 0);
-    setenv("TLG_LANE_DIVERGENCE", "1", 0);
-    setenv("TLG_BP06", "1", 0); // default off: exercise it unless the caller chose
+    SetEnv("TLG_LDS_SMALL", "1", false);
+    SetEnv("TLG_LDS_MULTI", "1", false);
+    SetEnv("TLG_LDS_READLANE", "1", false);
+    SetEnv("TLG_LANE_DIVERGENCE", "1", false);
+    SetEnv("TLG_BP06", "1", false); // default off: exercise it unless the caller chose
     const bool small = Toggles::SmallGroupLdsBarriers();
     const bool multi = Toggles::MultiWaveLdsBarriers();
     const bool wqm = Toggles::WholeQuadMode();
-    std::printf("TLG_LDS_SMALL=%d TLG_LDS_MULTI=%d TLG_WQM=%d\n", small, multi, wqm);
+    std::printf("TLG_LDS_SMALL=%d TLG_LDS_MULTI=%d TLG_WQM=%d TLG_RFL_ALL=%d\n", small, multi, wqm,
+                Toggles::ReadFirstLaneAll() ? 1 : 0);
 
     const BarrierResult wave = RunBarrierPass(64);
     Check(wave.workgroup == 3 && wave.subgroup == 0, "64 threads: workgroup barriers (unchanged)");
@@ -329,6 +499,41 @@ int main(int argc, char** argv) {
     Check(ReadFirstLaneBarriers(false) == 0, "ReadFirstLane of a uniform value is left alone");
     Check(BallotReadsSlotPair(), "wave64 ballot on a 32-wide host: both halves read the slot pair");
 
+    // The append pattern (the wave reserves a slot with an atomic and broadcasts the base): on
+    // a 32-wide host the whole wave has to read the wave's first lane. Without the exchange the
+    // host broadcast is per subgroup and the upper half of the wave reads its own lane 32.
+    const ReadFirstLaneForm append = RunReadFirstLaneForm(true, false);
+    // The exchange is a LDS write, two workgroup barriers and a LDS load (the host broadcast of
+    // the exchange stays in the shader: it is the even half's first active lane).
+    Check(append.exchanges == (rfl_all ? 1u : 0u) && append.barriers == (rfl_all ? 2u : 0u) &&
+              append.writes == (rfl_all ? 2u : 1u),
+          "append pattern: the ReadFirstLane is exchanged through LDS (TLG_RFL_ALL)");
+    Check(!rfl_all || append.even_half_slot,
+          "append pattern: the exchange reads the even half's slot (the wave's first lane)");
+    Check(AppendPattern::Base(AppendPattern::Form::Reference, 0, 100) == 100 &&
+              AppendPattern::Base(AppendPattern::Form::Exchange, 63, 100) == 100 &&
+              AppendPattern::Base(AppendPattern::Form::HostPerHalf, 63, 100) == 0,
+          "append pattern: only the per subgroup broadcast loses the upper half of the wave");
+    Check(AppendPattern::Slots(AppendPattern::Form::Reference, 100) == 64 &&
+              AppendPattern::Slots(AppendPattern::Form::Exchange, 100) == 64 &&
+              !AppendPattern::WritesInsideTheList(AppendPattern::Form::HostPerHalf, 100),
+          "append pattern: the per subgroup broadcast writes the upper half outside the list");
+    // A ReadFirstLane in divergent flow cannot be exchanged (the barrier would sit in non
+    // uniform control flow): it stays a host broadcast and the log says so.
+    const ReadFirstLaneForm divergent = RunReadFirstLaneForm(true, true);
+    Check(divergent.broadcasts == 1 && divergent.barriers == 0 && divergent.exchanges == 0,
+          "append pattern in divergent flow: the ReadFirstLane is left alone");
+    // Two waves in the workgroup: each wave has its own slot pair.
+    const ReadFirstLaneForm two_waves = RunReadFirstLaneForm(true, false, 128);
+    Check(two_waves.exchanges == (rfl_all ? 1u : 0u) && two_waves.barriers == (rfl_all ? 2u : 0u) &&
+              (!rfl_all || two_waves.even_half_slot),
+          "append pattern in a 128-thread workgroup: one exchange, the wave's own slot pair");
+    if (!spirv.empty()) {
+        // The SPIR-V of the lowered shader, next to the multi-wave one (for spirv-val).
+        const auto path = (std::filesystem::path{spirv}.parent_path() / "wave64-rfl.spv").string();
+        RunReadFirstLaneForm(true, false, 64, path.c_str());
+    }
+
     Check(WqmQuadBroadcasts(Gcn::OperandField::VccLo, Gcn::OperandField::ExecLo) ==
               (wqm ? 4u : 0u),
           "s_wqm_b64 vcc, exec grows the mask to quads with TLG_WQM");
@@ -359,13 +564,13 @@ int main(int argc, char** argv) {
         // Backport switches: tlg.ini choices apply unless the environment sets the entry; only the
         // live ones can be switched while the game runs.
         using Common::Backports::Id;
-        unsetenv("TLG_BP10");
+        UnsetEnv("TLG_BP10");
         Common::Backports::ApplyConfig(static_cast<std::size_t>(Id::VertexIndexBarriers), false);
         Check(!Common::Backports::On(Id::VertexIndexBarriers), "ini choice turns BP10 off");
-        setenv("TLG_BP10", "1", 1);
+        SetEnv("TLG_BP10", "1", true);
         Common::Backports::ApplyConfig(static_cast<std::size_t>(Id::VertexIndexBarriers), true);
         Check(!Common::Backports::On(Id::VertexIndexBarriers), "environment variable wins over the ini (state kept)");
-        unsetenv("TLG_BP10");
+        UnsetEnv("TLG_BP10");
         Check(Common::Backports::SetLive(Id::VertexIndexBarriers, true) &&
                   Common::Backports::On(Id::VertexIndexBarriers),
               "a live backport can be switched in game");

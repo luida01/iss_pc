@@ -355,13 +355,10 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
     const auto census = CountLaneOps(program);
     const bool lane_math = census.lane_math;
     const std::string lane_ops = census.Describe();
-    if (!lane_ops.empty()) {
-        LOG_WARNING(Render_Recompiler, "tlg: wave64 compute shader {:#x} ({} threads, {}x{}x{}): {}",
-                    program.info.pgm_hash, num_threads, size_x, size_y, size_z, lane_ops);
-    }
 
     std::vector<IR::Inst*> worklist;
     std::vector<IR::Inst*> divergent_ballots;
+    u32 divergent_readfirstlanes{};
     const auto uniform_blocks = FindWave64UniformBlocks(program);
     for (IR::Block* block : program.blocks) {
         const bool is_uniform = std::ranges::contains(uniform_blocks, block);
@@ -381,14 +378,29 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
         for (IR::Inst& inst : block->Instructions()) {
             if (inst.GetOpcode() == IR::Opcode::ReadLane && inst.Arg(1).IsImmediate()) {
                 push_worklist(inst);
-            } else if (inst.GetOpcode() == IR::Opcode::ReadFirstLane && is_uniform &&
-                       (lane_math ||
-                        (Toggles::ReadFirstLaneAll() && !IsProvablyWaveUniform(inst.Arg(0))))) {
+            } else if (inst.GetOpcode() == IR::Opcode::ReadFirstLane) {
+                if (!is_uniform) {
+                    // tlg: a ReadFirstLane in divergent flow cannot be exchanged through LDS
+                    // (the barrier would sit in non uniform control flow). It stays a host
+                    // broadcast, which on a 32-wide host gives the upper half of the wave the
+                    // value of its own lane 32. Counted, so the log says which shaders still
+                    // have it.
+                    ++divergent_readfirstlanes;
+                    continue;
+                }
                 // tlg: append pattern: the wave counts its items (ballot / prefix mask), one
                 // lane reserves space with an atomic and ReadFirstLane broadcasts the base.
                 // On 32-wide hardware the second half read its own first lane, which never
                 // reserved anything (inFAMOUS: flickering lights and steam).
-                worklist.push_back(&inst);
+                // tlg: the exchange is needed whenever the value can differ between lanes, not
+                // only in the shaders that also use a ballot or v_mbcnt: 331 of the game's
+                // compute shaders use ReadFirstLane alone, and every one of them gave its
+                // upper half a base of 0 (the items were written twice and half of the list was
+                // lost: the missing particles).
+                if ((lane_math || Toggles::ReadFirstLaneAll()) &&
+                    !IsProvablyWaveUniform(inst.Arg(0))) {
+                    worklist.push_back(&inst);
+                }
             } else if (inst.GetOpcode() == IR::Opcode::Ballot) {
                 const auto is_unpack = [](const IR::Use& use) {
                     return use.user->GetOpcode() == IR::Opcode::UnpackUint2x32;
@@ -423,6 +435,20 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
     if (!divergent_ballots.empty()) {
         LOG_INFO(Render_Recompiler, "shader {:#x}: {} divergent ballots kept per 32-lane half",
                  program.info.pgm_hash, divergent_ballots.size());
+    }
+    // tlg: the census line (one per compute shader wider than a 32-lane wave that uses lane
+    // operations) says what the shader does with its lanes and what the host cannot do with
+    // it: a ReadFirstLane in divergent flow stays a per-subgroup broadcast (its upper half
+    // reads its own lane 32 instead of the wave's first lane).
+    if (!lane_ops.empty()) {
+        const std::string divergent =
+            divergent_readfirstlanes
+                ? fmt::format(" ({} ReadFirstLane in divergent flow, not lowered)",
+                              divergent_readfirstlanes)
+                : std::string{};
+        LOG_WARNING(Render_Recompiler,
+                    "tlg: wave64 compute shader {:#x} ({} threads, {}x{}x{}): {}{}",
+                    program.info.pgm_hash, num_threads, size_x, size_y, size_z, lane_ops, divergent);
     }
     if (worklist.empty()) {
         return;

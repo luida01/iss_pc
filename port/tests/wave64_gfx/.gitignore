@@ -1,0 +1,2 @@
+# The SPIR-V modules are generated with glslang (see the probe's header comment).
+*.spv

@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// The wave64 ReadFirstLane as the port emits it when the shader is not lowered: the host's
+// subgroup broadcast (OpGroupNonUniformBroadcastFirst). On a 32-wide host the guest's wave64
+// is two host subgroups, so the upper half of the wave reads its own lane 32.
+#version 450
+#extension GL_KHR_shader_subgroup_ballot : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Out {
+    uint data[];
+} out_buf;
+void main() {
+    uint idx = gl_LocalInvocationIndex;
+    uint value = idx * 100u + 7u; // a value that differs in every lane
+    uint base = subgroupBroadcastFirst(value);
+    out_buf.data[idx] = base;
+}
