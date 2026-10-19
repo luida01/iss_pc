@@ -66,6 +66,35 @@ struct ImageInfo {
     bool IsCompatible(const ImageInfo& info) const;
     void UpdateSize();
 
+    // tlg: the fields the bind path reads, together at the front: the descriptor's format and
+    // size, the depth flag and the resource counts. They were spread over the structure (the
+    // mip layout alone is 256 bytes), so every bound texture missed the cache once per field
+    // group. The rest (the metadata addresses, the mip layout) is only read when the image is
+    // created or uploaded.
+    ImageProperties props{};
+    vk::Format pixel_format = vk::Format::eUndefined;
+    SubresourceExtent resources{};
+    Extent3D size{1, 1, 1};
+    u32 num_bits{};
+    u32 num_samples = 1;
+    u32 pitch{};
+    AmdGpu::TileMode tile_mode = AmdGpu::TileMode::DisplayLinearAligned;
+    // The lookup path (the address the guest gave) and the rest.
+    VAddr guest_address{};
+    u32 guest_size{};
+    /// tlg: the guest's sample count, for sizes in guest memory (TLG_NO_MSAA makes
+    /// num_samples 1; see video_core/amdgpu/tlg_msaa.h).
+    u32 guest_samples = 1;
+    /// tlg: the guest's BC format of an is_bc_decoded image (pixel_format is the decoded one).
+    vk::Format bc_format = vk::Format::eUndefined;
+    AmdGpu::ImageType type;
+    AmdGpu::ArrayMode array_mode = AmdGpu::ArrayMode::ArrayLinearAligned;
+    u8 bank_swizzle{};
+    bool alt_tile{};
+
+    VAddr stencil_addr{};
+    u32 stencil_size{};
+
     struct {
         VAddr cmask_addr;
         VAddr fmask_addr;
@@ -73,21 +102,6 @@ struct ImageInfo {
         s32 htile_clear_mask = -1;
     } meta_info{};
 
-    ImageProperties props{};
-    vk::Format pixel_format = vk::Format::eUndefined;
-    /// tlg: the guest's BC format of an is_bc_decoded image (pixel_format is the decoded one).
-    vk::Format bc_format = vk::Format::eUndefined;
-    AmdGpu::ImageType type;
-    SubresourceExtent resources;
-    Extent3D size{1, 1, 1};
-    u32 num_bits{};
-    u32 num_samples = 1;
-    /// tlg: the guest's sample count, for sizes in guest memory (TLG_NO_MSAA makes
-    /// num_samples 1; see video_core/amdgpu/tlg_msaa.h).
-    u32 guest_samples = 1;
-    u32 pitch{};
-    AmdGpu::TileMode tile_mode = AmdGpu::TileMode::DisplayLinearAligned;
-    AmdGpu::ArrayMode array_mode = AmdGpu::ArrayMode::ArrayLinearAligned;
     struct MipInfo {
         u32 size;
         u32 pitch;
@@ -95,13 +109,6 @@ struct ImageInfo {
         u32 offset;
     };
     std::array<MipInfo, 16> mips_layout;
-    VAddr guest_address{};
-    u32 guest_size{};
-    u8 bank_swizzle{};
-    bool alt_tile{};
-
-    VAddr stencil_addr{};
-    u32 stencil_size{};
 };
 
 /// tlg: TLG_BC_TINY: the plain format a tiny image of this BC format is decoded to (sRGB and

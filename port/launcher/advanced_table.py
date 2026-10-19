@@ -124,6 +124,12 @@ _ROWS = (
       'A porcentagem do orçamento de VRAM que a cache de texturas sempre guarda, mesmo quando o resto do port precisa do '
       'espaço: abaixo dela o coletor não libera as texturas que o jogo está usando. Menor libera mais VRAM e custa detalhe.'),
      {'lo': 5, 'hi': 100, 'unit': '%'}),
+    ('read', 'GC_HARD_SHARE', 'int', '93', ('VRAM hard mark', 'Marca dura de VRAM'),
+     ('The percent of the card\'s memory above which the driver itself is in trouble (it moves allocations out to system '
+      'memory, and the game slows down). Only used when the driver\'s memory total fits in the card.',
+      'A porcentagem da memória da placa acima da qual o próprio driver passa por aperto (move alocações para a memória do '
+      'sistema, e o jogo fica mais lento). Só vale quando o total de memória do driver cabe na placa.'),
+     {'lo': 50, 'hi': 100, 'unit': '%'}),
     ('read', 'STREAM_MEMORY', 'choice', 'cached', ('Where small copies stage', 'Onde as cópias pequenas ficam'),
      ('Where 128 MB of scratch memory for small copies lives: cached RAM, uncached RAM or video memory.',
       'Onde ficam 128 MB de memória temporária para cópias pequenas: RAM com cache, sem cache ou memória de vídeo.'),

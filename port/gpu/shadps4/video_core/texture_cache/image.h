@@ -84,7 +84,6 @@ public:
 };
 
 struct Image {
-    u64 perf_generation = 0;
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,
                    Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);
     ~Image();
@@ -149,8 +148,11 @@ struct Image {
 
 public:
     struct BackingImage;
-    // tlg: fields every binding of the image reads, together ahead of the large ImageInfo
-    // (they were spread over several cache lines: one miss each per texture per draw).
+    // tlg: the fields every binding of the image reads, together ahead of everything else, so
+    // that a bound texture costs one cache line and not three: the flags and the binding state,
+    // the image's backing and the descriptor's data (inside `info`, whose own hot fields are at
+    // its front). The rest of the structure is read when the image is created, uploaded or
+    // collected, not when it is bound.
     ImageFlagBits flags = ImageFlagBits::Dirty;
     struct {
         u32 is_bound : 1;
@@ -165,12 +167,13 @@ public:
         u32 depth_target : 1;
         u32 vo_surface : 1;
     } usage{};
+    BackingImage* backing{};
+    ImageInfo info;
     bool scene_proxy = false; ///< tlg: SceneTargets holds a reduced-size proxy of it
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
     VAddr guest_begin = 0; ///< info.guest_address
     VAddr guest_end = 0;   ///< info.guest_address + info.guest_size
-    BackingImage* backing{};
     /// tlg: gc tick of the last LRU touch; skips the LRU list (a cache miss) when current.
     mutable u64 lru_touched_tick = ~0ULL;
     u64 tick_accessed_last{};
@@ -179,8 +182,8 @@ public:
     u64 image_uid{};
     /// tlg: order of the last GPU write, to sync images sharing memory (texture_cache.h).
     u64 alias_generation{};
+    u64 perf_generation = 0;
 
-    ImageInfo info;
     Vulkan::Runtime* runtime;
     Common::SlotVector<ImageView>* slot_image_views;
     vk::ImageAspectFlags aspect_mask = vk::ImageAspectFlagBits::eColor;

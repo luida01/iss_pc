@@ -198,7 +198,66 @@ el log de presión (`N BC decodes (X MiB, Y ms)`), junto con `N images created a
 imágenes que el colector tuvo que volver a crear): si en la próxima sesión el decode aparece con
 miles de bytes, es que el ciclo de recreación sigue vivo y se verá en el mismo log.
 
-## 7. Pendiente (fuera de mi alcance, para el director del port)
+## 7. El camino de ligadura: los datos de la cache en la línea de caché
+
+Medición del padre (sesión de 150 s, SAFETY TRUST, 720p, `TLG_DRAW_PROFILE=1`): el *bind* es el
+15,16 % del cuadro (83 ms → 12,6 ms), con 8.602 ciclos por llamada; el desglose por fase da
+`bind` 15,16 %, `descriptors` 1,45 % y `state` 1,61 % (el `vk-record` 20,57 % es del driver). Con
+2-6 buffers, 2-10 texturas y 0-8 samplers por draw son unas 20 operaciones de ligadura: 8.602/20
+≈ 430 ciclos por operación, que es **latencia de memoria**, no cálculo.
+
+### Qué se midió
+
+`port/tests/test_cache_layout.cpp` (nuevo) mide la disposición real de las estructuras de la
+cache y hace el mismo recorrido que hace la ligadura sobre un grupo de imágenes:
+
+* **Antes** (`sizeof(Image)` 744): los campos que la ligadura lee (el estado de ligadura, el
+  *backing* de la imagen y los datos del descriptor: `props`, `pixel_format`, `resources`,
+  `size`) estaban repartidos en **3 líneas de caché** por imagen, y el conjunto caliente
+  completo (con la dirección del invitado) en **8**.
+* **Después**: la misma API, los campos declarados primero (`image.h`, `image_info.h`): la
+  ligadura lee **1 línea de caché** por imagen y el conjunto caliente, **2**.
+
+| Grupo de imágenes | Antes | Después | Ganancia |
+|---|---|---|---|
+| 1.024 | 3 ns / 7,5 ciclos por ligadura | 2 ns / 7,1 | — (cabe en la L2) |
+| 3.300 | 3 ns / 9,8 | 3 ns / 7,6 | 1,3× |
+| 8.192 | 11 ns / 32,3 | 3 ns / 10,5 | **3,1×** |
+| 32.768 | 25 ns / 75,2 | 16 ns / 48,2 | **1,6×** |
+| Líneas de caché por imagen ligada | 3 | **1** | 3× menos fallos |
+
+El grupo crece durante la sesión (el log cuenta 731 imágenes registradas en un solo cuadro), y
+cuanto más grande, más cuenta el ahorro: con 8.192 imágenes la parte de la cache en la ligadura
+pasa de 32 a 10 ciclos.
+
+### Recorridos O(n) por draw
+
+Revisados: **no hay ninguno** en el camino de dibujo.
+`FindImage` usa el memo de 1.024 entradas (O(1)); si falla, `ForEachImageInRegion` recorre el
+cubucket de la tabla de páginas (2 niveles, 1-3 imágenes por página). `FindTexture` →
+`Image::FindView` recorre las vistas del *backing* (1-4). `GetSampler` es un hash más un
+candado. En la cache de buffers, `ObtainBuffer` → `GetArena` es una tabla de páginas (16 KB) y
+los rangos son un `boost::icl::interval_set` (O(log n)).
+
+### Lo que falta y necesita al renderer
+
+El arreglo de la disposición quita 2 de los 3 fallos de caché por textura ligada, pero el
+*working set* sigue siendo el array de imágenes: 3.300 imágenes × 752 B = 2,4 MB (con 8.192,
+6 MB). La versión que de verdad lo arregla es un **array paralelo compacto** con los campos de
+la ligadura (32 B por imagen → 105 KB con 3.300 imágenes, cabe en la L2) o **devolver un
+puntero en vez de un id**, y las dos cosas las tiene que leer el renderer
+(`renderer_vulkan/vk_rasterizer.cpp`, fuera de mi alcance): la cache puede ofrecer el array, pero
+el cambio de la llamada está en el renderer. Lo mismo con los samplers: `GetSampler` toma un
+candado por ligadura de sampler (el memo del renderer lo evita en la mayoría de los casos).
+
+**Medible en la sesión final**: con `TLG_DRAW_PROFILE=1` y la misma escena (SAFETY TRUST, 720p,
+150 s), comparar el *bind* del antes/después: el % del cuadro y los ciclos por llamada
+(`bind 15,16 %, 8.602 ciclos por llamada`). El cambio no necesita ninguna variable de entorno
+nueva: es la disposición de las estructuras, siempre activa. El test
+`port/tests/test_cache_layout.py` deja el número medido a la vista (líneas de caché por imagen
+y ns por ligadura) para comparar con la sesión.
+
+## 8. Pendiente (fuera de mi alcance, para el director del port)
 
 1. **El buffer cache es el dueño de la VRAM.** El total que declara el driver (4757 MiB) lo
    comparten la cache de texturas y las *arenas* del buffer cache, y la diferencia (~900 MB) es
@@ -213,18 +272,23 @@ miles de bytes, es que el ciclo de recreación sigue vivo y se verá en el mismo
 3. **Falta el reparto medido** cache ↔ buffer cache con el binario nuevo: la línea nueva del log
    lo da (`<cache> MiB in the cache … driver total <X> MiB of the card's <Y> MiB`). Con ese
    número se decide el ajuste final del presupuesto de los presets.
+4. **El array paralelo de la ligadura** (los campos hot de cada imagen en una estructura
+   compacta) lo tiene que leer el renderer: la cache puede ofrecerlo, pero la llamada está en
+   `renderer_vulkan/**`.
 
-## 8. Ficheros tocados
+## 9. Ficheros tocados
 
 ```
 port/gpu/shadps4/video_core/texture_cache/gc_budget.h            (nuevo: la política)
 port/gpu/shadps4/video_core/texture_cache/texture_cache.{h,cpp}  (el colector y la contabilidad)
-port/gpu/shadps4/video_core/texture_cache/image.h                 (DeviceBytes)
+port/gpu/shadps4/video_core/texture_cache/image.h                 (DeviceBytes, la disposicion)
+port/gpu/shadps4/video_core/texture_cache/image_info.h            (la disposicion)
 port/launcher/presets_vram.py                                    (nuevo: los dos presets)
 port/launcher/infamous_run.py                                    (la curva del presupuesto)
 port/launcher/advanced_table.py                                  (TLG_GC_POLICY, TLG_GC_FLOOR_SHARE)
 port/launcher/qt/gfxlogic.py, port/launcher/qt/i18n/strings.json  (la curva, el registro y los textos)
 port/tests/test_gc_budget.cpp, port/tests/test_gc_budget.py       (nuevos)
+port/tests/test_cache_layout.cpp, port/tests/test_cache_layout.py (nuevos: la disposicion)
 port/tests/test_bc_decode.cpp                                    (el banco de pruebas del decode)
 port/tests/test_qt_screens_a.py                                  (la lista de presets)
 ```
