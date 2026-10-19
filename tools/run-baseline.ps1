@@ -1269,6 +1269,14 @@ function Invoke-Baseline {
         TLG_DATA_DIR    = $dataDir
         ISS_USER_DIR    = $userDir
         TLG_FRAME_STATS = '1'
+        # Los defaults que aplica el launcher (port/launcher/infamous_run.py DEFAULT_ENV): al
+        # lanzar port\run.py directamente no pasan, y el presupuesto de VRAM es el que decide si
+        # el colector de texturas expulsa o no.
+        ISS_GC_BUDGET_MB       = '3500'
+        ISS_PIPELINE_BINARIES  = '0'
+        ISS_UPSCALER           = 'off'
+        ISS_JITTER             = '0'
+        ISS_OBJECT_MOTION      = '0'
         PYTHONUNBUFFERED = '1'
         PYTHONIOENCODING = 'utf-8'
     }
