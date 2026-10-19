@@ -88,22 +88,22 @@ public:
     /// Times one phase. The cost when the profile is off is a branch per phase.
     class Scope {
     public:
-        explicit Scope(DrawPhase phase) : phase{phase} {
-            if (Enabled()) {
+        explicit Scope(DrawPhase phase) : phase{phase}, enabled{Enabled()} {
+            if (enabled) {
                 start = __rdtsc();
             }
         }
         Scope(const Scope&) = delete;
         Scope& operator=(const Scope&) = delete;
         ~Scope() {
-            if (!Enabled()) {
-                return;
+            if (enabled) {
+                Add(phase, __rdtsc() - start);
             }
-            Add(phase, __rdtsc() - start);
         }
 
     private:
         DrawPhase phase;
+        bool enabled;
         u64 start{};
     };
 
