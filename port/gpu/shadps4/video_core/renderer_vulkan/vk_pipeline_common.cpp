@@ -10,6 +10,7 @@
 
 #include "common/logging/log.h"
 #include "shader_recompiler/resource.h"
+#include "video_core/renderer_vulkan/vk_draw_profile.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
@@ -74,6 +75,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, u32 count,
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
     const vk::PipelineLayout layout = *pipeline_layout;
+    DrawProfile::AddCommand(DrawProfile::VkCommand::PushConstants);
     scheduler.Record([layout, stage_flags, push_data](vk::CommandBuffer cmdbuf) {
         cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);
     });
@@ -85,6 +87,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, u32 count,
     const std::span<const vk::WriteDescriptorSet> writes{set_writes.data(), count};
 
     if (uses_push_descriptors) {
+        DrawProfile::AddCommand(DrawProfile::VkCommand::Descriptors);
         if (!scheduler.IsRecordingDeferred()) {
             scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
                 cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
@@ -125,6 +128,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, u32 count,
     // Descriptor set updates are device calls: they stay on this thread. The pool may hold more
     // writes than this draw's, so drop them before the call (no element is constructed: the
     // vector only grows, see EnsureSetWrites).
+    DrawProfile::AddCommand(DrawProfile::VkCommand::Descriptors);
     const auto desc_set = desc_heap.Commit(*desc_layout);
     set_writes.resize(count);
     for (auto& set_write : set_writes) {

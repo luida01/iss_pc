@@ -1336,6 +1336,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const u32 first_instance = instance_offset;
     {
         DrawProfile::Scope scope{DrawPhase::Draw};
+        DrawProfile::AddCommand(DrawProfile::VkCommand::Draw);
         scheduler.Record([=](vk::CommandBuffer cmdbuf) {
             const auto draw = [&] {
                 if (is_indexed) {
@@ -2371,6 +2372,7 @@ void Rasterizer::EmitVertexBuffers() {
         v.bindings.size() * sizeof(v.bindings[0]) + v.attributes.size() * sizeof(v.attributes[0]) +
         num_buffers * (sizeof(vk::Buffer) + 3 * sizeof(vk::DeviceSize)) + 128);
     if (dynamic_input) {
+        DrawProfile::AddCommand(DrawProfile::VkCommand::VertexInput);
         scheduler.Record([bindings = scheduler.RecordData(std::span<const vk::VertexInputBindingDescription2EXT>{v.bindings.data(), v.bindings.size()}),
                           attributes = scheduler.RecordData(std::span<const vk::VertexInputAttributeDescription2EXT>{
                               v.attributes.data(), v.attributes.size()})](
@@ -2383,6 +2385,7 @@ void Rasterizer::EmitVertexBuffers() {
     }
     const auto buffers = scheduler.RecordData(std::span<const vk::Buffer>{v.host_buffers.data(), num_buffers});
     const auto offsets = scheduler.RecordData(std::span<const vk::DeviceSize>{v.host_offsets.data(), num_buffers});
+    DrawProfile::AddCommand(DrawProfile::VkCommand::VertexBuffers);
     if (dynamic_input) {
         scheduler.Record([num_buffers, buffers, offsets](vk::CommandBuffer cmdbuf) {
             cmdbuf.bindVertexBuffers(0, num_buffers, buffers.data(), offsets.data());
@@ -2541,6 +2544,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 }
 
 void Rasterizer::EmitIndexBuffer() {
+    DrawProfile::AddCommand(DrawProfile::VkCommand::Index);
     scheduler.Record([handle = index_bind.handle, offset = index_bind.offset,
                       type = index_bind.type](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindIndexBuffer(handle, offset, type);
@@ -4009,7 +4013,10 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
     dynamic_state.CommitWith(instance.IsDepthBoundsSupported(),
                              instance.IsDynamicColorWriteMaskSupported(),
                              instance.IsAttachmentFeedbackLoopLayoutSupported(),
-                             [&](auto&& command) { scheduler.Record(std::move(command)); });
+                             [&](auto&& command) {
+                                 DrawProfile::AddCommand(DrawProfile::VkCommand::Dynamic);
+                                 scheduler.Record(std::move(command));
+                             });
 }
 
 void Rasterizer::UpdateViewportScissorState() const {

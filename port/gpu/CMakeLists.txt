@@ -519,6 +519,11 @@ target_compile_options(draw-profile-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 add_executable(scene-preset-test EXCLUDE_FROM_ALL ../tests/test_scene_preset.cpp)
 target_include_directories(scene-preset-test PRIVATE shadps4)
 target_compile_options(scene-preset-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+# tlg: the memo of the barrier tracker's queries (the cost of the walk it avoids).
+add_executable(access-memo-test EXCLUDE_FROM_ALL ../tests/test_access_memo.cpp
+    shadps4/video_core/renderer_vulkan/vk_barrier_tracker.cpp)
+target_include_directories(access-memo-test PRIVATE shadps4)
+target_compile_options(access-memo-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 add_executable(graphics-settings-test EXCLUDE_FROM_ALL ../tests/test_graphics_settings.cpp
     shim/tlg_settings.cpp)
 target_include_directories(graphics-settings-test PRIVATE shim)

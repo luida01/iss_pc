@@ -7,6 +7,7 @@
 #include "tlg_toggles.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_draw_profile.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
@@ -879,10 +880,25 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
         .range_start = offset,
         .range_end = offset + size - 1,
     };
-    bool has_access = barrier_tracker.FindRange(range, Access::Write);
-    if (check_read_access && !has_access) {
-        has_access |= barrier_tracker.FindRange(range, Access::Read);
+    // tlg: the same range is queried again for every draw that binds the buffer (the tree
+    // of the tracker has scattered nodes: the walk is a chain of cache misses). The memo
+    // answers the repeated query. Only the "yes" answers are memoized: the ranges of the
+    // tracker only grow (an insert merges them) until it is cleared, which bumps the epoch,
+    // so a "yes" stays a "yes"; a "no" can become a "yes" with the next insert.
+    const u64 resource = range.resource;
+    if (const u32 flags = access_queries.Find(resource, range.range_start, range.range_end);
+        (flags & AccessQueryMemo::WriteFlag) != 0) {
+        return true; // a write access is pending (it stays pending until the tracker clears)
     }
+    bool has_access = barrier_tracker.FindRange(range, Access::Write);
+    u32 flags = has_access ? AccessQueryMemo::WriteFlag : 0u;
+    if (check_read_access && !has_access) {
+        has_access = barrier_tracker.FindRange(range, Access::Read);
+        if (has_access) {
+            flags |= AccessQueryMemo::ReadFlag;
+        }
+    }
+    access_queries.Remember(resource, range.range_start, range.range_end, flags);
     return has_access;
 }
 
@@ -985,6 +1001,7 @@ void Runtime::FlushBarriers() {
         TLG_IMG_TRACE("FlushBarriers: EndRendering\n");
     }
     scheduler.EndRendering();
+    DrawProfile::AddCommand(DrawProfile::VkCommand::Barrier);
     if (trace_flush) {
         TLG_IMG_TRACE("FlushBarriers: EndRendering done\n");
     }
@@ -1013,6 +1030,7 @@ void Runtime::FlushBarriers() {
     image_barriers.clear();
     barrier_tracker.Clear();
     ++access_epoch;
+    access_queries.NewEpoch();
 }
 
 } // namespace Vulkan

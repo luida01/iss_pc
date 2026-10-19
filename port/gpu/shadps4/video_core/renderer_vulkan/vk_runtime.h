@@ -5,6 +5,7 @@
 
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/renderer_vulkan/vk_access_memo.h"
 #include "video_core/renderer_vulkan/vk_barrier_tracker.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image.h"
@@ -132,6 +133,10 @@ private:
     };
     std::array<AccessMemo, 512> access_memo{};
     u32 access_epoch = 1;
+    // tlg: the memo of the queries to the barrier tracker (vk_access_memo.h): the same range
+    // is asked again for every draw that binds the buffer, and the walk of the tracker is a
+    // chain of cache misses.
+    AccessQueryMemo access_queries;
 };
 
 } // namespace Vulkan

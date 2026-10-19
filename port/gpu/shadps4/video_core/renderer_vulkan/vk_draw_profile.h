@@ -71,6 +71,33 @@ public:
         return Get().recorder;
     }
 
+    /// The Vulkan commands the port records, by kind (the profile counts them: the driver's
+    /// command recording is the other half of the cost of a draw, and the way to lower it
+    /// is to record fewer commands).
+    enum class VkCommand : u32 {
+        Draw = 0,       ///< the draw itself (with the pipeline bind)
+        VertexInput,    ///< the vertex input state
+        VertexBuffers,  ///< the vertex buffers
+        Index,          ///< the index buffer
+        Dynamic,        ///< the dynamic state (viewport, scissor, depth, blend)
+        PushConstants,  ///< the push constants
+        Descriptors,    ///< the descriptor writes
+        Barrier,        ///< a pipeline barrier
+        RenderPass,     ///< the begin/end of a render pass
+        Count,
+    };
+
+    /// Counts one recorded command of the given kind.
+    static void AddCommand(VkCommand kind) {
+        Get().commands_by_kind[static_cast<u32>(kind)].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /// The number of Vulkan commands the recording thread recorded (the profile divides the
+    /// driver's time by them: many cheap commands cost more than a few expensive ones).
+    [[nodiscard]] static std::atomic<u64>& Commands() {
+        return Get().commands;
+    }
+
     /// Adds the cycles of one phase and counts the call.
     static void Add(DrawPhase phase, u64 cycles) {
         auto& counters = Phase(phase);
@@ -78,11 +105,13 @@ public:
         counters.calls.fetch_add(1, std::memory_order_relaxed);
     }
 
-    /// Adds the cycles the Vulkan recording thread spent recording a chunk.
-    static void AddRecorder(u64 cycles) {
+    /// Adds the cycles the Vulkan recording thread spent recording a chunk, and how many
+    /// commands it recorded.
+    static void AddRecorder(u64 cycles, size_t commands) {
         auto& counters = Recorder();
         counters.cycles.fetch_add(cycles, std::memory_order_relaxed);
         counters.calls.fetch_add(1, std::memory_order_relaxed);
+        Get().commands.fetch_add(commands, std::memory_order_relaxed);
     }
 
     /// Times one phase. The cost when the profile is off is a branch per phase.
@@ -131,6 +160,14 @@ public:
         }
         const u64 rec_cycles = self.recorder.cycles.exchange(0, std::memory_order_relaxed);
         const u64 rec_calls = self.recorder.calls.exchange(0, std::memory_order_relaxed);
+        const u64 rec_commands = self.commands.exchange(0, std::memory_order_relaxed);
+        static constexpr const char* command_names[] = {
+            "draw",   "vertex-in", "vertex-buffers", "index",  "dynamic",
+            "push-c", "descriptors", "barrier",       "pass"};
+        u64 kind_total = 0;
+        for (u32 i = 0; i < u32(VkCommand::Count); ++i) {
+            kind_total += self.commands_by_kind[i].load(std::memory_order_relaxed);
+        }
         if (rec_cycles) {
             const double share =
                 window_cycles ? 100.0 * double(rec_cycles) / double(window_cycles) : 0.0;
@@ -138,6 +175,24 @@ public:
                         "vk-record", share,
                         rec_calls ? double(rec_cycles) / double(rec_calls) : 0.0,
                         static_cast<unsigned long long>(rec_calls));
+            if (rec_commands) {
+                std::printf(", %llu commands (%.1f per draw, %.0f cycles per command)",
+                            static_cast<unsigned long long>(rec_commands),
+                            draws ? double(rec_commands) / double(draws) : 0.0,
+                            double(rec_cycles) / double(rec_commands));
+            }
+            if (kind_total) {
+                std::printf("\n  %-12s", "vk-commands");
+                for (u32 i = 0; i < u32(VkCommand::Count); ++i) {
+                    const u64 count = self.commands_by_kind[i].exchange(0, std::memory_order_relaxed);
+                    if (!count) {
+                        continue;
+                    }
+                    std::printf(" %s=%.1f", command_names[i],
+                                draws ? double(count) / double(draws) : 0.0);
+                }
+                std::printf(" (per draw)");
+            }
         }
         if (total) {
             std::printf("\n  %-12s %7.2f%% of the window, %8.0f cycles/draw", "draw total",
@@ -180,6 +235,8 @@ private:
 
     std::array<Counters, PhaseCount> phases{};
     Counters recorder{};
+    std::atomic<u64> commands{0};
+    std::array<std::atomic<u64>, u32(VkCommand::Count)> commands_by_kind{};
 };
 
 } // namespace Vulkan

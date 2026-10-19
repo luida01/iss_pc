@@ -168,6 +168,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         return;
     }
     // The attachment infos live on this stack frame: the recorded closure keeps copies.
+    DrawProfile::AddCommand(DrawProfile::VkCommand::RenderPass);
     Record([info = rendering_info, color_attachments, depth_attachment,
             stencil_attachment](vk::CommandBuffer cmdbuf) mutable {
         info.pColorAttachments = color_attachments.data();
@@ -405,11 +406,13 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
         }
         // current_cmdbuf only changes after SyncRecording(), which waits for this thread.
         // tlg: the time the driver's command recording takes (TLG_DRAW_PROFILE=1): the other
-        // half of the draw's cost, the half that is not in the draw recording thread.
+        // half of the draw's cost, the half that is not in the draw recording thread. The
+        // number of commands is counted too: the time per command says whether the cost is
+        // in the driver or in the number of commands.
         const u64 record_start = DrawProfile::Enabled() ? __rdtsc() : 0;
-        chunk->Execute(current_cmdbuf);
+        const size_t commands = chunk->Execute(current_cmdbuf);
         if (record_start) {
-            DrawProfile::AddRecorder(__rdtsc() - record_start);
+            DrawProfile::AddRecorder(__rdtsc() - record_start, commands);
         }
         {
             std::scoped_lock lk{recorder_mutex};

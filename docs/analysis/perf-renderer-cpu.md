@@ -52,7 +52,35 @@ Las dos medidas que el port imprime y que valen para esta comparación:
   GPU pasó **esperando** al hilo de grabación, por sitio de espera.
 * `Frame stats: ... <pct>% ...` y `Draw pipe: ... stage A waited <pct>%, stage B busy <pct>%`.
 
-### 2.1 Antes (sesión `20261019-130735-g0-manual-paint`, log tal cual)
+### 2.1 La medición en vivo (2026-10-19, SAFETY TRUST, 150 s, 720p nativo, sin upscaler)
+
+Con `TLG_DRAW_PROFILE=1` (12 – 23 FPS, 83 ms de frame, 198.000 draws por ventana de 5 s,
+GPU al 30 – 45 %):
+
+| Fase | % del frame | ciclos por llamada | llamadas por ventana |
+|---|---|---|---|
+| targets | 1,00 % | 660 | 197.988 |
+| **bind** | **15,16 %** | **8.602** | 230.830 |
+| state | 1,61 % | 1.067 | 197.988 |
+| inputs | 2,64 % | 1.747 | 197.988 |
+| dynamic | 1,01 % | 667 | 197.988 |
+| descriptors | 1,45 % | 825 | 230.830 |
+| draw | 0,10 % | 67 | 197.988 |
+| reset | 1,16 % | 768 | 197.988 |
+| submit | 0,60 % | 399 | 197.988 |
+| **vk-record** | **20,57 %** | **203.900** (por chunk) | 13.210 |
+| **total** | **24,74 %** | 16.364 por draw | |
+
+Y el decode PM4 (de su propio tiempo): register 1,6 %, **draw 11,4 %** (9.675 ciclos por
+paquete de draw), dispatch 4,1 %; 2.947.381 paquetes de registro, 200.470 de draw y 32.842
+de dispatch por ventana.
+
+**Lo que dice ese perfil, en una línea**: de todo el frame, el port son 24,74 % (el 60 %
+resto es el juego durmiendo a la espera de sus hilos, que es otro agente). Dentro de ese 25 %,
+la mitad es el **driver** grabando comandos (20,57 %) y una cuarta parte es el **bind**
+(15,16 %). El resto de fases son ruido (< 3 % cada una).
+
+### 2.2 Antes (sesión `20261019-130735-g0-manual-paint`, log tal cual)
 
 | Sitio | Función | Máx. en la ventana | Dónde está |
 |---|---|---|---|
@@ -72,16 +100,42 @@ Es decir: **el 53 % de las esperas son un solo sitio** — la espera por etiquet
 (`WaitRegMem`) en `ProcessGraphics`, y su equivalente en la cola de cómputo. El resto son
 "fin de submission" y "rasterizer" (el drain dentro de `OnWriteFault`/`OnSubmit`).
 
-### 2.2 Después
+### 2.3 Después
 
-Pendiente de la sesión final: los tres cambios de arriba se miden con
+Pendiente de la sesión final: los tres cambios de abajo se miden con
 `tools/perf-ab.ps1` (ver §6). Lo que se puede afirmar sin ejecutar el juego:
 
 | Cambio | Efecto esperado y por qué | Cómo se mide |
 |---|---|---|
-| Preset de resolución activo | Los ~140 draws de la escena pasan de 1 920×1 080 a 1 280×720 (Quality): **44 % de los píxeles**. El coste de GPU de la escena baja en la misma proporción; el de CPU (mismos draws) no cambia. | `TLG_FRAME_STATS=1` → la línea `reduced-size draws` pasa de `0/frame` a `~140/frame`, y el frame time baja con la GPU menos ocupada |
-| Clave del memo | −9 ns por lookup × 9 targets/draw × ~86 000 draws/s ≈ **−7 ms de CPU por segundo** (≈ 0,8 % de un núcleo) | micro-benchmark `draw-profile-test` (10,5 → 1,5 ns) |
-| `TLG_DRAW_PROFILE=1` / `TLG_PM4_PROFILE=1` | No cambia el rendimiento: lo que falta es poder *atribuir* el 88 % de ocupación del hilo de grabación | una línea nueva en el log cada 5 s |
+| **Memo de las consultas al tracker de barreras** (`Runtime::IsBufferAccessed`): el mismo rango se pregunta en cada draw que liga el buffer, y el recorrido del árbol (nodos dispersos) es una cadena de fallos de caché. El memo responde sin recorrerlo. Medido en el micro-benchmark: **7,9 ns → 2,3 ns por consulta (71 % menos)** | Menos trabajo en la fase "bind" (2 – 6 consultas por draw) | `access-memo-test` (7,9 → 2,3 ns) y la fase "bind" del perfil |
+| **Clave del memo de objetivos de render** | −9 ns por lookup × 9 targets/draw × ~40.000 draws/s ≈ **−3,2 ms de CPU por segundo** | micro-benchmark `draw-profile-test` (10,5 → 1,5 ns) |
+| **Contadores de comandos Vulkan por tipo** (`TLG_DRAW_PROFILE=1`): el perfil ahora dice cuántos comandos se graban por draw y de qué tipo (`draw`, `vertex-buffers`, `index`, `dynamic`, `push-c`, `descriptors`, `barrier`, `pass`) | No cambia el rendimiento: es lo que falta para atacar el 20,57 % del driver | una línea más en el log |
+| Preset de resolución activo | Los ~140 draws de la escena pasan de 1 920×1 080 a 1 280×720 (Quality): **44 % de los píxeles**. El coste de GPU de la escena baja en la misma proporción; el de CPU (mismos draws) no cambia. | `reduced-size draws` pasa de `0/frame` a `~140/frame` |
+
+### 2.4 Qué hay dentro de las dos fases caras (para la siguiente iteración)
+
+**"bind" (8.602 ciclos por llamada).** El bind hace, por draw: los buffers (2 – 6) con su
+`ObtainBuffer` (la caché de buffers) y su `IsBufferAccessed`; las texturas (2 – 10) con su
+descripción memoizada, `GetImage`, `MarkFound`, `FindTexture` y la transición de layout; y los
+samplers (0 – 8) con su memo. Con 8.602 ciclos para ~20 operaciones son **~430 ciclos por
+operación**: es la latencia de memoria, no el cálculo. El culpable son los arrays de la
+caché de texturas (`slot_images`, una imagen por recurso, con la estructura grande) y de la
+caché de buffers: cada acceso a una imagen que el draw anterior no tocó es un fallo de caché.
+**La caché de texturas está fuera del alcance de este agente** (es del agente de VRAM), así
+que el arreglo de fondo es allí: agrupar los campos que cada binding lee (como ya se hizo
+con `Image::binding`/`usage`) o devolver un puntero al image desde el memo en vez de un id.
+
+**"vk-record" (13.600 ciclos de driver por draw).** Es el driver grabando los comandos. Con
+los contadores nuevos se verá cuántos comandos se graban por draw y de qué tipo: si son
+~10 comandos a ~1.300 ciclos cada uno, el coste es del driver y el objetivo es **emitir menos
+comandos** (los `vkCmdBindVertexBuffers` repetidos, los push constants por draw y los estados
+redundantes son los candidatos). Si son muchos más, el culpable es un estado que se marca
+sucio en cada draw.
+
+**Los 3.300 draws por frame** son del juego (inFAMOUS dibuja esa escena): el port no puede
+agruparlos sin cambiar lo que se dibuja. Lo que sí se puede es no *grabar* trabajo por draw
+que no cambia (el estado dinámico ya sólo se emite cuando cambia: la fase "dynamic" son 667
+ciclos, el 1 % del frame).
 
 ## 3. Causa raíz por punto
 
@@ -258,9 +312,10 @@ siendo falso y ningún draw se reduce (ni hay imagen proxy ni copia).
 | `renderer_vulkan/vk_rasterizer.cpp` | El inicio de frame no depende del movimiento de cámara | build |
 | `renderer_vulkan/scene_resolution.h` | Una sola tabla de divisores (`SceneResolution::PresetScale`); `ForPreset` la usa | `scene-preset-test` |
 | `renderer_vulkan/vk_target_memo.h` (nuevo) | La clave del memo se construye en un bucle reutilizado: sin `memset` de 256 bytes ni copia de 256 bytes por target y draw | `draw-profile-test`: 10,5 → 1,5 ns (85 %) |
-| `renderer_vulkan/vk_draw_profile.h` (nuevo) | `TLG_DRAW_PROFILE=1`: coste por fase de un draw y del hilo de grabación de Vulkan | `draw-profile-test` (contadores) |
+| `renderer_vulkan/vk_access_memo.h` (nuevo) + `vk_runtime.{h,cpp}` | El memo de las consultas al tracker de barreras: la misma pregunta en cada draw que liga el buffer, respondida sin recorrer el árbol | `access-memo-test`: 7,9 → 2,3 ns (71 %) |
+| `renderer_vulkan/vk_draw_profile.h` (nuevo) | `TLG_DRAW_PROFILE=1`: coste por fase de un draw, del hilo de grabación de Vulkan **y el número de comandos Vulkan por tipo** | `draw-profile-test` (contadores) |
 | `amdgpu/liverpool.{h,cpp}` | `TLG_PM4_PROFILE=1`: coste del decode PM4 por clase de paquete, y las esperas summed | build |
-| `tests/test_draw_profile.cpp`, `tests/test_scene_preset.cpp` (nuevos) | Test del memo, del perfil y de los presets | en verde |
+| `tests/test_draw_profile.cpp`, `tests/test_scene_preset.cpp`, `tests/test_access_memo.cpp` (nuevos) | Test del memo, del perfil, de los presets y del memo de barreras | en verde |
 
 **Fuera del alcance, pero duplicación muerta que hay que borrar**:
 `TlgSettings::PresetScale` (`port/gpu/shim/tlg_settings.cpp:407`) repite la misma tabla de
@@ -279,6 +334,8 @@ lo tenga: con `SceneResolution::PresetScale` como única tabla, `PresetScale` so
 | Espera por el fence (`GPU ticks 51 %`) | `video_core/buffer_cache/fault_manager.cpp`, `texture_cache.cpp` | Fuera del alcance; la espera es real (la GPU) |
 | Coste por fase dentro del draw | `renderer_vulkan/**` | **Instrumentado** (`TLG_DRAW_PROFILE=1`); falta la medición con el juego |
 | Coste del decode PM4 | `amdgpu/liverpool.cpp` | **Instrumentado** (`TLG_PM4_PROFILE=1`); falta la medición con el juego |
+| Latencia de memoria de la fase "bind" | `video_core/texture_cache/**` (los arrays de imágenes) | **Fuera del alcance**: es el agente de VRAM. Aquí sólo se puede reducir el *número* de accesos desde el renderer |
+| Coste del driver al grabar comandos | `renderer_vulkan/**` (los comandos que se emiten) | Los contadores por tipo ya están; falta ver cuántos se emiten por draw |
 
 ## 6. Cómo se mide en la sesión final
 

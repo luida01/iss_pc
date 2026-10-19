@@ -616,15 +616,20 @@ public:
         return storage + offset;
     }
 
-    void Execute(vk::CommandBuffer cmdbuf) {
+    /// Runs the commands in order and returns how many there were (the profile divides the
+    /// time the driver takes by them).
+    size_t Execute(vk::CommandBuffer cmdbuf) {
+        size_t count = 0;
         for (CommandBase* command = first; command;) {
             CommandBase* const next = command->next;
             command->Execute(cmdbuf);
             command->~CommandBase();
             command = next;
+            ++count;
         }
         first = last = nullptr;
         used = 0;
+        return count;
     }
 
     [[nodiscard]] bool Empty() const noexcept {
