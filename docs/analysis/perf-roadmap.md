@@ -110,7 +110,27 @@ Barrido automático de los ajustes y de los toggles del port:
 3. Se comparan mediana, p95, VRAM máxima, RAM máxima y el aspecto (capturas).
 4. 3 repeticiones por cambio; el que gana se queda.
 
-## 6. Lo que NO se va a hacer
+## 6. Fase final: checklist (cuando lleguen los tres agentes)
+
+1. **Integrar**: commits de los agentes (renderer, VRAM/GC, shaders) + el fix de partículas (`dc12e8d`)
+   + el enlace `onecore` del test de shaders.
+2. **Build limpio**: `bash build.sh` (rama MSYS: compila la librería GPU y los tres ejecutables) y
+   `ninja` de los targets de test afectados. Sin errores ni warnings nuevos.
+3. **Tests**: `motion-assist-test`, `pad-map-test`, `perf-overlay-test`, `bc-decode-test`,
+   `orb-multiplier-test`, `recompiler-fixes-test`, `test_gc_budget`, `test_draw_profile` y la suite
+   Python (`python -m unittest discover -s port/tests -t port/tests`; 7 fallos ambientales
+   preexistentes: WSL, PySide6, bloqueos de fichero en Windows, cp1252).
+4. **Primera medición (A/B)**: `tools\perf-ab.ps1 -DurationSec 120` con la matriz por defecto
+   (720p nativo, fsr3, fsr3+jitter, fsr411, fsr3+preset Quality, 480p, y la variante vieja del
+   fix de partículas). Salida: `evidence/perf-ab-<ts>/summary.csv` y `summary.md`.
+5. **Elegir configuración**: la que de más FPS con el detalle intacto en las capturas; si hace
+   falta, un A/B en caliente con `tools\toggle.ps1` sobre la opción ganadora.
+6. **Sesión manual larga** (Gate G0): 15-30 min con capturas cada 30 s, HUD visible, y el
+   grafiti probado con el modo de pintado. Sin frames > 500 ms, sin expulsiones de textura
+   sostenidas y sin congelaciones.
+7. **Cerrar**: documentar los números finales en este documento y en `docs/analysis/gate-g0-baseline.md`.
+
+## 7. Lo que NO se va a hacer
 
 - Copiar código de GOW3: se replica el **comportamiento** (atribución en `port/UPSTREAM.md`).
 - Bajar la resolución a ciegas: primero se mide (P6) y se informa del coste en detalle.
