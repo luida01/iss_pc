@@ -121,8 +121,10 @@ Barrido automático de los ajustes y de los toggles del port:
    Python (`python -m unittest discover -s port/tests -t port/tests`; 7 fallos ambientales
    preexistentes: WSL, PySide6, bloqueos de fichero en Windows, cp1252).
 4. **Primera medición (A/B)**: `tools\perf-ab.ps1 -DurationSec 120` con la matriz por defecto
-   (720p nativo, fsr3, fsr3+jitter, fsr411, fsr3+preset Quality, 480p, y la variante vieja del
-   fix de partículas). Salida: `evidence/perf-ab-<ts>/summary.csv` y `summary.md`.
+   (720p nativo, fsr3, fsr3+jitter, fsr411, fsr3+preset Quality, 480p, la variante vieja del
+   fix de partículas y `frames_queued=2`). Salida: `evidence/perf-ab-<ts>/summary.csv` y `summary.md`.
+   **Antes, una pasada de calentamiento** de 60 s: el fix del recompilador (`dc12e8d`) invalida la
+   caché de shaders una vez, y sin calentar la primera configuración mediría la compilación.
 5. **Elegir configuración**: la que de más FPS con el detalle intacto en las capturas; si hace
    falta, un A/B en caliente con `tools\toggle.ps1` sobre la opción ganadora.
 6. **Sesión manual larga** (Gate G0): 15-30 min con capturas cada 30 s, HUD visible, y el
