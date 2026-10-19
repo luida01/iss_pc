@@ -10,10 +10,17 @@ struct Size {
     uint32_t width = 1920, height = 1080;
     bool operator==(const Size&) const = default;
 };
+/// The resolution divisor of a preset: the scene is rendered at output / divisor and the
+/// game upsamples it. This is the one table of the preset scales (the copy in
+/// tlg_settings.cpp, PresetScale, has no callers and should go: the renderer must not have
+/// two of them).
+inline constexpr double PresetScale(int preset) {
+    constexpr double scales[5] = {1.0, 1.5, 1.7, 2.0, 3.0};
+    return scales[preset < 0 ? 0 : (preset > 4 ? 4 : preset)];
+}
 inline Size ForPreset(int preset, Size output = {}) {
     // Even dimensions for half-resolution effects; match the preset labels exactly.
-    constexpr std::array<double, 5> scales{1.0, 1.5, 1.7, 2.0, 3.0};
-    const double scale = scales[std::clamp(preset, 0, 4)];
+    const double scale = PresetScale(preset);
     return {uint32_t(std::max(1l, std::lround(output.width / scale / 2)) * 2),
             uint32_t(std::max(1l, std::lround(output.height / scale / 2)) * 2)};
 }

@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_object_motion.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
+#include "video_core/renderer_vulkan/vk_target_memo.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -482,6 +483,9 @@ private:
         VideoCore::TextureCache::ImageDesc desc;
     };
     std::array<TargetMemo, 64> target_memo{};
+    /// tlg: the key of the memo, built in place: it is reused between the lookups and only
+    /// its bytes in use are read (see vk_target_memo.h).
+    TargetKey target_key;
     // tlg: consecutive draws mostly keep their targets; the slot's description (cb_descs,
     // db_desc) is then still the right one and is neither looked up nor copied.
     struct LastTarget {

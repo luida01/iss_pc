@@ -35,6 +35,131 @@ namespace AmdGpu {
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
 
+// tlg: the PM4 decode profile (TLG_PM4_PROFILE=1). The counters live here, in the queue
+// that decodes; the report is printed by the draw statistics (Rasterizer::PrintPipeStats).
+namespace {
+Liverpool::Pm4Profile g_pm4_profile;
+bool g_pm4_profile_enabled = false;
+
+/// tlg: the time a PM4 packet costs the decode (TLG_PM4_PROFILE=1). The counter is read
+/// once per packet, so the profile itself costs almost nothing.
+class Pm4Timer {
+public:
+    explicit Pm4Timer(Liverpool::Pm4Profile::Class klass) : klass{klass} {
+        if (Liverpool::Pm4Profile::Enabled()) {
+            start = __rdtsc();
+        }
+    }
+    Pm4Timer(const Pm4Timer&) = delete;
+    Pm4Timer& operator=(const Pm4Timer&) = delete;
+    ~Pm4Timer() {
+        if (start) {
+            Liverpool::Pm4Profile::Add(klass, __rdtsc() - start);
+        }
+    }
+
+private:
+    Liverpool::Pm4Profile::Class klass;
+    u64 start{};
+};
+} // namespace
+
+bool Liverpool::Pm4Profile::Enabled() {
+    if (!g_pm4_profile_enabled) {
+        const char* value = std::getenv("TLG_PM4_PROFILE");
+        g_pm4_profile_enabled = value && value[0] == '1';
+    }
+    return g_pm4_profile_enabled;
+}
+
+Liverpool::Pm4Profile::Class Liverpool::Pm4Profile::Classify(PM4ItOpcode opcode) {
+    switch (opcode) {
+    case PM4ItOpcode::ClearState:
+    case PM4ItOpcode::SetConfigReg:
+    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::SetUconfigReg:
+    case PM4ItOpcode::SetQueueReg:
+    case PM4ItOpcode::SetPredication:
+    case PM4ItOpcode::IndexType:
+    case PM4ItOpcode::NumInstances:
+    case PM4ItOpcode::IndexBase:
+    case PM4ItOpcode::IndexBufferSize:
+    case PM4ItOpcode::SetBase:
+        return Class::Register;
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+        return Class::Draw;
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        return Class::Dispatch;
+    case PM4ItOpcode::WriteData:
+    case PM4ItOpcode::DmaData:
+    case PM4ItOpcode::CopyData:
+    case PM4ItOpcode::ReleaseMem:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::EventWrite:
+    case PM4ItOpcode::EventWriteEop:
+    case PM4ItOpcode::EventWriteEos:
+        return Class::Memory;
+    case PM4ItOpcode::WaitRegMem:
+    case PM4ItOpcode::MemSemaphore:
+    case PM4ItOpcode::Rewind:
+    case PM4ItOpcode::WaitOnCeCounter:
+        return Class::Wait;
+    default:
+        return Class::Other;
+    }
+}
+
+void Liverpool::Pm4Profile::Add(Class klass, u64 cycles) {
+    auto& counters = g_pm4_profile;
+    counters.cycles[static_cast<u32>(klass)] += cycles;
+    ++counters.packets[static_cast<u32>(klass)];
+}
+
+void Liverpool::Pm4Profile::AddWait(u64 cycles) {
+    g_pm4_profile.wait_cycles += cycles;
+}
+
+void Liverpool::Pm4Profile::Report(u64 window_cycles, double window_seconds) {
+    auto& counters = g_pm4_profile;
+    static constexpr const char* names[] = {"register", "draw",   "dispatch", "memory",
+                                            "wait",     "other"};
+    std::printf("PM4 decode: %.1f ms window", window_seconds * 1e3);
+    u64 total = 0;
+    for (u32 i = 0; i < u32(Class::Count); ++i) {
+        total += counters.cycles[i];
+    }
+    for (u32 i = 0; i < u32(Class::Count); ++i) {
+        const u64 cycles = counters.cycles[i];
+        const u64 packets = counters.packets[i];
+        counters.cycles[i] = 0;
+        counters.packets[i] = 0;
+        if (!packets) {
+            continue;
+        }
+        const double share = total ? 100.0 * double(cycles) / double(total) : 0.0;
+        std::printf("\n  %-9s %6.1f%% of the decode, %8.0f cycles/packet, %llu packets", names[i],
+                    share, double(cycles) / double(packets),
+                    static_cast<unsigned long long>(packets));
+    }
+    const u64 wait = counters.wait_cycles;
+    counters.wait_cycles = 0;
+    if (wait) {
+        std::printf("\n  %-9s %6.1f%% of the window (waiting for the draw recording thread)",
+                    "drains", window_cycles ? 100.0 * double(wait) / double(window_cycles) : 0.0);
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+}
+
 #define MAX_NAMES 56
 static_assert(Liverpool::NumComputeRings <= MAX_NAMES);
 
@@ -815,6 +940,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            // tlg: the time this packet costs the decode (TLG_PM4_PROFILE=1).
+            const Pm4Timer pm4_timer{Liverpool::Pm4Profile::Classify(opcode)};
             ApplyGraphicsRegisterPacket(regs, header, gfx_reg_checksum, &pipe_dirty);
             // DmaData to 0x3022C does nothing here (skipped below): no need to wait.
             if (rasterizer && !PipelinedOpcode(opcode) &&
@@ -1506,6 +1633,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        // tlg: the time this packet costs the decode (TLG_PM4_PROFILE=1).
+        const Pm4Timer pm4_timer{Liverpool::Pm4Profile::Classify(opcode)};
         // tlg: compute work uses the caches: without PipelinedCompute every packet first waits
         // for the draw recording thread to run dry.
         const bool pipelined = rasterizer && !TlgToggle::Disabled(TlgToggle::PipelinedCompute);

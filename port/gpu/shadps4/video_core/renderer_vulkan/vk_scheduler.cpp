@@ -17,6 +17,7 @@
 #include <optional>
 
 #include "tlg_copy.h"
+#include "video_core/renderer_vulkan/vk_draw_profile.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "tlg_toggles.h"
 #include "video_core/renderer_vulkan/vk_wait_diagnostics.h"
@@ -403,7 +404,13 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
             recorder_busy = true;
         }
         // current_cmdbuf only changes after SyncRecording(), which waits for this thread.
+        // tlg: the time the driver's command recording takes (TLG_DRAW_PROFILE=1): the other
+        // half of the draw's cost, the half that is not in the draw recording thread.
+        const u64 record_start = DrawProfile::Enabled() ? __rdtsc() : 0;
         chunk->Execute(current_cmdbuf);
+        if (record_start) {
+            DrawProfile::AddRecorder(__rdtsc() - record_start);
+        }
         {
             std::scoped_lock lk{recorder_mutex};
             free_chunks.push_back(std::move(chunk));

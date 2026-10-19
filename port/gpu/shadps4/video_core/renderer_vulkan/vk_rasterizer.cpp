@@ -33,6 +33,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_depth_stencil_state.h"
+#include "video_core/renderer_vulkan/vk_draw_profile.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -187,36 +188,26 @@ VideoCore::ImageId Rasterizer::FindTargetMemoized(VideoCore::TextureCache::Image
                                                   LastTarget& last, auto&& make_desc,
                                                   const Parts&... parts) {
     static_assert((sizeof(Parts) + ...) <= 256, "target memo key too large");
-    std::array<u8, 256> key{};
-    u32 key_size = 0;
-    const auto append = [&](const auto& part) {
-        std::memcpy(key.data() + key_size, &part, sizeof(part));
-        key_size += sizeof(part);
-    };
+    // tlg: the key is built in a buffer that is reused: only its bytes in use are read, so
+    // it is never cleared (the old code zeroed and copied 256 bytes per target and draw).
+    auto& key = target_key;
+    const auto append = [&](const auto& part) { key.Append(part); };
     (append(parts), ...);
     const u64 generation = texture_cache.RegistryGeneration();
     const bool memo_enabled = !TlgToggle::Disabled(TlgToggle::TextureBindingMemo);
-    if (memo_enabled && last.generation == generation && last.key_size == key_size &&
-        std::memcmp(last.key.data(), key.data(), key_size) == 0) {
+    if (memo_enabled && last.generation == generation && key.Equals(last.key.data(), last.key_size)) {
         texture_cache.MarkFound(last.image_id);
         return last.image_id;
     }
     const auto remember = [&](VideoCore::ImageId image_id) {
-        last.key = key;
-        last.key_size = key_size;
+        key.CopyTo(last.key.data());
+        last.key_size = key.size();
         last.generation = generation;
         last.image_id = image_id;
     };
-    u64 hash = 0xCBF29CE484222325ull;
-    for (u32 i = 0; i < key_size; i += 8) {
-        u64 word;
-        std::memcpy(&word, key.data() + i, 8);
-        hash = (hash ^ word) * 0x100000001B3ull;
-        hash ^= hash >> 29;
-    }
+    const u64 hash = key.Hash();
     auto& memo = target_memo[hash % target_memo.size()];
-    if (memo.generation == generation && memo.key_size == key_size &&
-        std::memcmp(memo.key.data(), key.data(), key_size) == 0 && memo_enabled) {
+    if (memo.generation == generation && key.Equals(memo.key.data(), memo.key_size) && memo_enabled) {
         desc = memo.desc;
         texture_cache.MarkFound(memo.image_id);
         remember(memo.image_id);
@@ -225,8 +216,8 @@ VideoCore::ImageId Rasterizer::FindTargetMemoized(VideoCore::TextureCache::Image
     make_desc();
     const VideoCore::ImageId image_id = texture_cache.FindImage(desc);
     if (generation == texture_cache.RegistryGeneration()) {
-        memo.key = key;
-        memo.key_size = key_size;
+        key.CopyTo(memo.key.data());
+        memo.key_size = key.size();
         memo.generation = generation;
         memo.image_id = image_id;
         memo.desc = desc;
@@ -491,6 +482,9 @@ void Rasterizer::DrainDrawPipe(u32 reason, u32 line, const char* function) {
     draw_pipe->Drain(reason);
     if (const u64 waited = draw_pipe->drain_cycles - before) {
         drain_sites[function][line] += waited;
+        // tlg: the PM4 decode profile counts the same wait (TLG_PM4_PROFILE=1): the drain
+        // sites say which line waited, this says how much of the frame the waits are.
+        AmdGpu::Liverpool::Pm4Profile::AddWait(waited);
     }
 }
 
@@ -939,13 +933,18 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
 
 void Rasterizer::PrintPipeStats() {
     static const bool stats = std::getenv("TLG_FRAME_STATS") != nullptr;
-    if (!stats || (draw_pipe->packets & 1023) != 0) {
+    // tlg: the per-phase profile of the draw (TLG_DRAW_PROFILE=1) is printed here too: this
+    // is the thread that hands the packets over, and its 5 s window is the one the counters
+    // of the phases are reported against.
+    static const bool profile = DrawProfile::Enabled();
+    if ((!stats && !profile) || (draw_pipe->packets & 1023) != 0) {
         return;
     }
     static auto window = std::chrono::steady_clock::now();
     static u64 last_packets = 0, last_drains = 0, last_drain_cycles = 0, last_busy = 0;
     static u64 last_ring_waits = 0, last_ring_cycles = 0, last_spin = 0, last_sleeps = 0;
     static u64 last_tsc = __rdtsc();
+    static u64 last_draws = 0;
     const auto now = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(now - window).count();
     if (seconds < 5.0) {
@@ -953,7 +952,15 @@ void Rasterizer::PrintPipeStats() {
     }
     const u64 tsc = __rdtsc();
     const double cycles = double(tsc - last_tsc);
-    const u64 busy = draw_pipe->busy_cycles.load(std::memory_order_relaxed);
+    if (!stats) {
+        // Only the profile: the pipe statistics are not wanted, but the window is.
+        const u64 draws = TlgStats::draws.load();
+        DrawProfile::Report(tsc - last_tsc, seconds, draws - last_draws);
+        last_draws = draws;
+        window = now;
+        last_tsc = tsc;
+        return;
+    }    const u64 busy = draw_pipe->busy_cycles.load(std::memory_order_relaxed);
     const u64 spin = draw_pipe->spin_cycles.load(std::memory_order_relaxed);
     const u64 sleeps = draw_pipe->sleeps.load(std::memory_order_relaxed);
     std::printf("Draw pipe: %.0f draws/s pipelined, %.0f drains/s that waited, stage A waited "
@@ -998,6 +1005,16 @@ void Rasterizer::PrintPipeStats() {
     std::printf("\n");
     drain_sites.clear();
     draw_pipe->drains_by_reason = {};
+    if (profile) {
+        const u64 draws = TlgStats::draws.load();
+        DrawProfile::Report(tsc - last_tsc, seconds, draws - last_draws);
+        last_draws = draws;
+    }
+    if (AmdGpu::Liverpool::Pm4Profile::Enabled()) {
+        // tlg: what the PM4 decode itself costs, per class of packet, apart from the
+        // waiting for the draw recording thread (TLG_PM4_PROFILE=1).
+        AmdGpu::Liverpool::Pm4Profile::Report(tsc - last_tsc, seconds);
+    }
     window = now;
     last_tsc = tsc;
     last_packets = draw_pipe->packets;
@@ -1115,26 +1132,37 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const auto& regs = Regs();
     // tlg: the pass copying a finished frame to a display buffer; the previous draw's
     // target is that frame.
-    if (camera_motion->Enabled() && regs.color_buffers[0] &&
-        FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
+    // The frame start (and with it the size of the reduced scene targets) does not depend
+    // on the camera motion: the temporal upscaler is off in most runs, and then the size of
+    // the scene was never set, so the resolution preset did nothing at all (the frame
+    // statistics showed "reduced-size draws 0/frame of 140 in the scene").
+    if (regs.color_buffers[0] && FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
         scene_started = false;
-        camera_motion->OnDisplayPass(cb_descs[0].first);
+        if (camera_motion->Enabled()) {
+            camera_motion->OnDisplayPass(cb_descs[0].first);
+        }
         if (upscaler->OnFrameStart()) {
             object_motion->InvalidateHistory();
             camera_motion->InvalidateHistory();
         }
-        camera_motion->SetJitter(upscaler->Jitter());
-        object_motion->OnFrameStart();
-        NoteFrameStart();
-        static const char* scene_debug = std::getenv("TLG_SCENE_DEBUG");
-        scene_debug_frame = scene_debug && std::remove(scene_debug) == 0;
-        scene_targets->debug = scene_debug_frame;
+        if (camera_motion->Enabled()) {
+            camera_motion->SetJitter(upscaler->Jitter());
+            object_motion->OnFrameStart();
+            NoteFrameStart();
+            static const char* scene_debug = std::getenv("TLG_SCENE_DEBUG");
+            scene_debug_frame = scene_debug && std::remove(scene_debug) == 0;
+            scene_targets->debug = scene_debug_frame;
+        }
     }
     bind_prepared = used_prepared;
     motion_draw = pipeline->GetGraphicsKey().motion_vectors;
     motion_geometry = 0;
 
-    PrepareRenderState(pipeline);
+    // tlg: the phases of the draw, for the per-phase profile (TLG_DRAW_PROFILE=1).
+    {
+        DrawProfile::Scope scope{DrawPhase::Targets};
+        PrepareRenderState(pipeline);
+    }
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
@@ -1145,29 +1173,41 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // tlg: vertex and index buffers are resolved while the helper binds textures (their
     // commands are recorded after BeginRendering, as before).
     draw_inputs = {pipeline, draw_prepared, index_offset, is_indexed, true, false};
-    const bool bound = BindResources(pipeline);
+    bool bound;
+    {
+        DrawProfile::Scope scope{DrawPhase::Bind};
+        bound = BindResources(pipeline);
+    }
     bind_prepared = nullptr; // indirect draws and dispatches bind without prepared sharps
     const bool inputs_resolved = draw_inputs.resolved;
     draw_inputs.pending = false;
     if (!bound) {
         return;
     }
-    const auto state = BeginRendering(pipeline);
+    const auto state = [&] {
+        DrawProfile::Scope scope{DrawPhase::State};
+        return BeginRendering(pipeline);
+    }();
     // tlg: before anything of the draw itself is recorded, which has to go with it.
-    SubmitIfWorkPiledUp(state);
+    {
+        DrawProfile::Scope scope{DrawPhase::Submit};
+        SubmitIfWorkPiledUp(state);
+    }
     scheduler.CountWork();
 
-    if (!inputs_resolved) {
-        ResolveVertexBuffers(pipeline, draw_prepared);
+    {
+        DrawProfile::Scope scope{DrawPhase::Inputs};
+        if (!inputs_resolved) {
+            ResolveVertexBuffers(pipeline, draw_prepared);
+            if (is_indexed) {
+                ResolveIndexBuffer(index_offset);
+            }
+        }
+        EmitVertexBuffers();
         if (is_indexed) {
-            ResolveIndexBuffer(index_offset);
+            EmitIndexBuffer();
         }
     }
-    EmitVertexBuffers();
-    if (is_indexed) {
-        EmitIndexBuffer();
-    }
-
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
@@ -1259,7 +1299,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             });
         }
     }
-    pipeline->BindResources(set_writes, set_write_index, push_data);
+    {
+        DrawProfile::Scope scope{DrawPhase::Descriptors};
+        pipeline->BindResources(set_writes, set_write_index, push_data);
+    }
     // tlg: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
     // full-screen quad leaves an edge column unwritten).
     draw_jitter = {};
@@ -1267,7 +1310,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
         draw_jitter = upscaler->Jitter();
     }
-    UpdateDynamicState(pipeline, is_indexed);
+    {
+        DrawProfile::Scope scope{DrawPhase::Dynamic};
+        UpdateDynamicState(pipeline, is_indexed);
+    }
     MarkPass(pipeline, state);
     if (FrameRecord::IsRecording()) [[unlikely]] {
         RecordFrameInputs(pipeline, draw_prepared, &state, is_indexed, index_offset, nullptr);
@@ -1284,22 +1330,25 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const u32 num_instances = regs.num_instances.NumInstances();
     const u32 first_vertex = vertex_offset;
     const u32 first_instance = instance_offset;
-    scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        const auto draw = [&] {
-            if (is_indexed) {
-                cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex),
-                                   first_instance);
-            } else {
-                cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
-            }
-        };
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
-        draw();
-        if (square) [[unlikely]] {
-            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, square);
+    {
+        DrawProfile::Scope scope{DrawPhase::Draw};
+        scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+            const auto draw = [&] {
+                if (is_indexed) {
+                    cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex),
+                                       first_instance);
+                } else {
+                    cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
+                }
+            };
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
             draw();
-        }
-    });
+            if (square) [[unlikely]] {
+                cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, square);
+                draw();
+            }
+        });
+    }
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances);
@@ -1315,8 +1364,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     DebugState.IncDrawCall();
 
-    ResetBindings(false);
-    scheduler.KickRecording();
+    {
+        DrawProfile::Scope scope{DrawPhase::Reset};
+        ResetBindings(false);
+        scheduler.KickRecording();
+    }
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -1593,7 +1645,12 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         return;
     }
 
-    if (!BindResources(pipeline)) {
+    bool bound;
+    {
+        DrawProfile::Scope scope{DrawPhase::Bind};
+        bound = BindResources(pipeline);
+    }
+    if (!bound) {
         return;
     }
 
@@ -1603,7 +1660,10 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
     scheduler.EndRendering();
     mark();
-    pipeline->BindResources(set_writes, set_write_index, push_data);
+    {
+        DrawProfile::Scope scope{DrawPhase::Descriptors};
+        pipeline->BindResources(set_writes, set_write_index, push_data);
+    }
 
     const auto bind = ComputeBind(pipeline);
     const u32 dim_x = cs_program.dim_x, dim_y = cs_program.dim_y, dim_z = cs_program.dim_z;

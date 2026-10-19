@@ -5,6 +5,7 @@
 
 #include <cstdlib>
 
+#include <array>
 #include <condition_variable>
 #include <deque>
 #include <coroutine>
@@ -22,6 +23,7 @@
 #include "common/types.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/pm4_opcodes.h"
 #include "video_core/amdgpu/regs.h"
 
 namespace Vulkan {
@@ -92,6 +94,38 @@ struct Liverpool {
     /// `dirty` (draw-preparation scanner) records the register blocks written.
     static void ApplyGraphicsRegisterPacket(Regs& regs, const PM4Header* header, u64& checksum,
                                             RegDirty* dirty = nullptr);
+
+public:
+    /// tlg: the CPU time of the PM4 decode, per class of packet (TLG_PM4_PROFILE=1).
+    ///
+    /// The frame statistics only say how long the GPU command thread *waited* for the draw
+    /// recording thread ("stage A waits over 0.5%: ProcessGraphics:1328 28.1%"). This says
+    /// what the decode itself costs, so the two can be told apart: a class that takes a lot
+    /// of time without waiting is the one to optimize, and a class that only waits is a
+    /// symptom of the recording thread being behind.
+    struct Pm4Profile {
+        enum class Class : u32 {
+            Register = 0, ///< the register writes (context, shader, config)
+            Draw,         ///< the draw commands
+            Dispatch,     ///< the compute dispatches
+            Memory,       ///< the guest memory writes and the events
+            Wait,         ///< the waits (labels, semaphores, rewind)
+            Other,
+            Count,
+        };
+        /// The cycles of the decode per class, and the packets of each class.
+        std::array<u64, u32(Class::Count)> cycles{};
+        std::array<u64, u32(Class::Count)> packets{};
+        /// The cycles the decode spent waiting for the draw recording thread.
+        u64 wait_cycles{};
+        /// The class a packet belongs to.
+        static Class Classify(PM4ItOpcode opcode);
+        static bool Enabled();
+        static void Add(Class klass, u64 cycles);
+        static void AddWait(u64 cycles);
+        /// Prints the profile of the window and clears the counters.
+        static void Report(u64 window_cycles, double window_seconds);
+    };
 
 public:
     explicit Liverpool();

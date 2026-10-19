@@ -317,8 +317,18 @@ bool TemporalUpscaler::OnFrameStart() {
     // Dynamic scene resolution scaling (live preset switching) works on all GPUs.
     // On GPUs without D32S8 blit support, UI depth is cleared instead of copied from scene.
     if (!scaled_session) {
-        scene_targets.SetSize(SceneResolution::ForPreset(active ? preset : 0,
-                                                        {target_width, target_height}));
+        // tlg: the preset is the resolution dial, and it works with the temporal upscaler
+        // off too: the scene is then rendered at the preset size and the game upsamples it
+        // in its own post pass. With the upscaler on, the base is the upscaler's output
+        // size (as before); without it, the base is the guest's own 1920x1080 frame.
+        // At Native AA nothing is reduced, so the reduced targets stay off (no proxy image
+        // and no copy of the scene): the size stays the default and Reduced() is false.
+        const SceneResolution::Size base =
+            active ? SceneResolution::Size{target_width, target_height}
+                   : SceneResolution::Size{1920, 1080};
+        const auto wanted = (active || preset > 0) ? SceneResolution::ForPreset(preset, base)
+                                                    : SceneResolution::Size{};
+        scene_targets.SetSize(wanted);
         render_width = scene_targets.Size().width;
         render_height = scene_targets.Size().height;
     }

@@ -511,6 +511,14 @@ target_compile_options(readback-queue-test PRIVATE -UNDEBUG -Wall -Wextra -Werro
 add_executable(wait-diagnostics-test EXCLUDE_FROM_ALL ../tests/test_wait_diagnostics.cpp)
 target_include_directories(wait-diagnostics-test PRIVATE shadps4)
 target_compile_options(wait-diagnostics-test PRIVATE -UNDEBUG)
+# tlg: the key of the render target memo and the per-phase profile of the draw path.
+add_executable(draw-profile-test EXCLUDE_FROM_ALL ../tests/test_draw_profile.cpp)
+target_include_directories(draw-profile-test PRIVATE shadps4)
+target_compile_options(draw-profile-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+# tlg: the resolution preset of the scene (the table of divisors and the sizes).
+add_executable(scene-preset-test EXCLUDE_FROM_ALL ../tests/test_scene_preset.cpp)
+target_include_directories(scene-preset-test PRIVATE shadps4)
+target_compile_options(scene-preset-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 add_executable(graphics-settings-test EXCLUDE_FROM_ALL ../tests/test_graphics_settings.cpp
     shim/tlg_settings.cpp)
 target_include_directories(graphics-settings-test PRIVATE shim)
