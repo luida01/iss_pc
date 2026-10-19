@@ -206,9 +206,92 @@ static void isa_context_regs(CONTEXT *c, IsaRegs *regs, int to_context) {
     for (int i=0;i<16;++i) { if (to_context) *g[i]=regs->gpr[i]; else regs->gpr[i]=*g[i]; }
     if (to_context) c->EFlags=(DWORD)regs->rflags; else regs->rflags=c->EFlags;
 }
+/* tlg: la PS4 no da trap al dividir por cero: el hardware GCN devuelve un valor indefinido y el
+ * juego sigue. En x86 el DIV por cero lanza #DE (0xC0000094) y mataba el proceso entero
+ * (evidence/20261019-165728: division por cero en el codigo del juego, a los 16 s del arranque).
+ * Se emula el resultado de la PS4 (cociente "todo unos" o el valor de desbordamiento con signo,
+ * resto = dividendo) y la ejecucion continua. */
+static DWORD64 *ctx_gpr(CONTEXT *c, int reg) {
+    switch (reg & 15) {
+        case 0: return &c->Rax; case 1: return &c->Rcx; case 2: return &c->Rdx; case 3: return &c->Rbx;
+        case 4: return &c->Rsp; case 5: return &c->Rbp; case 6: return &c->Rsi; case 7: return &c->Rdi;
+        case 8: return &c->R8;  case 9: return &c->R9;  case 10: return &c->R10; case 11: return &c->R11;
+        case 12: return &c->R12; case 13: return &c->R13; case 14: return &c->R14; default: return &c->R15;
+    }
+}
+static int emulate_divide_by_zero(CONTEXT *c) {
+    const uint8_t *start=(const uint8_t*)c->Rip, *p=start;
+    int op16=0, rex=0; unsigned rex_w=0, rex_b=0;
+    for (int i=0;i<8;++i) {
+        const unsigned b=*p;
+        if (b==0x66) { op16=1; ++p; continue; }
+        if (b==0xF2||b==0xF3||b==0x2E||b==0x36||b==0x3E||b==0x26||b==0x64||b==0x65) { ++p; continue; }
+        if (b>=0x40&&b<=0x4F) { rex=1; rex_w=(b>>3)&1; rex_b=b&1; ++p; continue; }
+        break;
+    }
+    const unsigned opcode=*p++;
+    if (opcode!=0xF6 && opcode!=0xF7) return 0;
+    const unsigned modrm=*p++;
+    const unsigned mod=modrm>>6, reg=(modrm>>3)&7, rm=modrm&7;
+    if (reg!=6 && reg!=7) return 0;              /* solo DIV (6) e IDIV (7) */
+    if (mod!=3) {
+        if (rm==4) ++p;                          /* SIB */
+        if (mod==1) p+=1;
+        else if (mod==2) p+=4;
+        else if (rm==5) p+=4;                    /* mod==0: RIP-relativo (rm==5) o SIB con base 5 */
+    }
+    const uint64_t length=(uint64_t)(p-start);
+    const int is64=rex&&rex_w, is16=!is64&&op16, is_signed=(reg==7);
+    if (mod!=3) {
+        /* El divisor esta en memoria: no se lee la memoria del invitado desde el manejador de
+         * excepciones, asi que solo se salta la instruccion (el cociente se queda con el
+         * dividendo). Es el caso raro: el codigo compilado divide por registros. */
+        c->Rip+=length;
+        return 1;
+    }
+    const uint64_t divisor=*ctx_gpr(c, rm | (rex_b?8:0));
+    (void)divisor;
+    if (opcode==0xF6) {                          /* 8 bits: AL cociente, AH resto */
+        const unsigned dividend=(unsigned)(uint8_t)c->Rax;
+        const unsigned q=is_signed? 0x80u : 0xFFu;
+        c->Rax=(c->Rax & ~0xFFFFull) | (uint64_t)q | ((uint64_t)dividend << 8);
+    } else if (is16) {                           /* 16 bits: AX cociente, DX resto */
+        const unsigned dividend=(unsigned)(uint16_t)c->Rax;
+        const unsigned q=is_signed? 0x8000u : 0xFFFFu;
+        c->Rax=(c->Rax & ~0xFFFFFFFFull) | (uint64_t)q | ((uint64_t)dividend << 16);
+    } else if (is64) {                           /* 64 bits: RAX cociente, RDX resto */
+        const uint64_t dividend=(uint32_t)c->Rax;
+        const uint64_t q=is_signed? 0x8000000000000000ull : 0xFFFFFFFFFFFFFFFFull;
+        c->Rax=q; c->Rdx=dividend;
+    } else {                                     /* 32 bits: EAX cociente, EDX resto */
+        const uint32_t dividend=(uint32_t)c->Rax;
+        const uint32_t q=is_signed? 0x80000000u : 0xFFFFFFFFu;
+        c->Rax=(uint32_t)q; c->Rdx=dividend;
+    }
+    c->Rip+=length;
+    return 1;
+}
 static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
+    if (code==EXCEPTION_INT_DIVIDE_BY_ZERO) {
+        /* La PS4 no da trap en esta division: se emula y se sigue (ver emulate_divide_by_zero).
+         * Solo en el codigo del invitado: una division por cero en el host (nuestro codigo o una
+         * biblioteca) es un bug real y tiene que seguir crashing con informe. */
+        static unsigned long long divided=0;
+        const uintptr_t rip=(uintptr_t)info->ContextRecord->Rip;
+        /* El invitado se mapea en direcciones bajas (la imagen desde 0) y el host (el ejecutable y
+         * sus DLL) en direcciones altas: por debajo de la base del propio ejecutable solo hay
+         * codigo del invitado. */
+        if (rip<(uintptr_t)GetModuleHandleA(NULL) && emulate_divide_by_zero(info->ContextRecord)) {
+            if (__atomic_fetch_add(&divided,1,__ATOMIC_RELAXED)<8) {
+                fprintf(stderr,"Runtime: guest divided by zero at %#" PRIxPTR " (the PS4 does not trap); emulated\n",
+                        rip);
+                fflush(stderr);
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
     if (code==EXCEPTION_BREAKPOINT && isa_table) {
         /* An int3 ISA site: emulated here; any other breakpoint goes on to the report below. */
         IsaRegs regs;
