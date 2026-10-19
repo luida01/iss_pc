@@ -110,6 +110,18 @@ struct Image {
         return backing->image.size_bytes;
     }
 
+    /// tlg: the bytes this image holds on the device: every backing image's allocation (an
+    /// image can have a second one when its sample count changes). The collector's accounting
+    /// needs the real size: the guest size is a different thing (a BC texture decoded on the CPU
+    /// takes eight times its guest size, and a tiled image is padded).
+    vk::DeviceSize DeviceBytes() const {
+        vk::DeviceSize total = 0;
+        for (const auto& backing_image : backing_images) {
+            total += backing_image.image.size_bytes;
+        }
+        return total;
+    }
+
     bool IsTracked() {
         return track_addr != 0 && track_addr_end != 0;
     }

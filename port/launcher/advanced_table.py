@@ -107,6 +107,23 @@ _ROWS = (
      ('How much temporary transfer memory is kept around. Lower it only if RAM is short.',
       'Quanta memória temporária de transferência fica guardada. Reduza só se faltar RAM.'),
      {'lo': 64, 'hi': 2048, 'unit': 'MB'}),
+    ('read', 'GC_POLICY', 'choice', '1', ('Texture cache budget rule', 'Regra do orçamento da cache de texturas'),
+     ('How the texture cache decides to free its textures. "Share of the budget" (default) compares the cache\'s own '
+      'bytes with the part of the VRAM budget the rest of the port left, and keeps the working set the game is using. '
+      '"Driver total" is the old rule (the driver\'s total against the budget): on a 4 GB card it evicted the textures '
+      'the game was drawing with, over and over.',
+      'Como a cache de texturas decide liberar suas texturas. "Parte do orçamento" (padrão) compara os bytes da própria '
+      'cache com a parte do orçamento de VRAM que o resto do port deixou, e mantém o conjunto de trabalho que o jogo usa. '
+      '"Total do driver" é a regra antiga (o total do driver contra o orçamento): numa placa de 4 GB ela evictava as '
+      'texturas que o jogo estava desenhando, sem parar.'),
+     {'choices': (('0', 'Driver total (old)', 'Total do driver (antigo)'),
+                  ('1', 'Share of the budget', 'Parte do orçamento'))}),
+    ('read', 'GC_FLOOR_SHARE', 'int', '25', ('Texture cache minimum share', 'Parte mínima da cache de texturas'),
+     ('The percent of the VRAM budget the texture cache always keeps, even when the rest of the port needs the room: '
+      'below it the collector does not free the textures the game is using. Lower frees more VRAM and costs detail.',
+      'A porcentagem do orçamento de VRAM que a cache de texturas sempre guarda, mesmo quando o resto do port precisa do '
+      'espaço: abaixo dela o coletor não libera as texturas que o jogo está usando. Menor libera mais VRAM e custa detalhe.'),
+     {'lo': 5, 'hi': 100, 'unit': '%'}),
     ('read', 'STREAM_MEMORY', 'choice', 'cached', ('Where small copies stage', 'Onde as cópias pequenas ficam'),
      ('Where 128 MB of scratch memory for small copies lives: cached RAM, uncached RAM or video memory.',
       'Onde ficam 128 MB de memória temporária para cópias pequenas: RAM com cache, sem cache ou memória de vídeo.'),

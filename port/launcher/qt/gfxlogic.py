@@ -16,6 +16,7 @@ from presets_amd import AMD
 from presets_rx580 import RX580
 from presets_view import REC1, SECO
 from presets_apolar import APOLAR_PRESETS
+from presets_vram import BALANCED_4GB, DETAIL
 
 # ------------------------------------------------------------------------------------- presets
 # Keys a preset sets (anything a preset does not list goes back to the default of the table).
@@ -25,10 +26,12 @@ PRESET_ITEMS = ('menu:fps_limit', 'menu:frames_queued', 'menu:fsr1', 'menu:rcas'
                 'TLG_ASYNC_SHADERS', 'TLG_STALE_READBACK', 'TLG_DEFERRED_READBACK', 'TLG_BACKGROUND_WARMUP')
 # Full presets (presets_current.py) also set keys the plain ones never touch (GPU accuracy, read-ahead,
 # write merge, draw distance...): those keys are applied, and compared, only for the preset that lists them.
-FULL_PRESETS = {p['id']: p for p in (REC1, CURRENT, AMD, RX580, SECO, *APOLAR_PRESETS)}
+FULL_PRESETS = {p['id']: p for p in (REC1, CURRENT, AMD, RX580, SECO, BALANCED_4GB, DETAIL,
+                                     *APOLAR_PRESETS)}
 # Defaults of the launcher settings a full preset may set (infamous_run.DEFAULT_SETTINGS; a test keeps them equal).
+# The VRAM budget is here because the 4 GB presets own it (the other presets leave it to the player).
 SETTING_DEFAULTS = {'vsync': True, 'gpu_readbacks': '2', 'eager_readback': False, 'write_merge': True,
-                    'show_fps': True, 'precompile_shaders': True}
+                    'show_fps': True, 'precompile_shaders': True, 'vram_budget_mb': 3500}
 # id, settings overrides, item overrides (values as strings; unlisted = default)
 PRESETS = (
     (REC1['id'], REC1['settings'], REC1['items']),
@@ -36,6 +39,8 @@ PRESETS = (
     (AMD['id'], AMD['settings'], AMD['items']),
     (RX580['id'], RX580['settings'], RX580['items']),
     (SECO['id'], SECO['settings'], SECO['items']),
+    (BALANCED_4GB['id'], BALANCED_4GB['settings'], BALANCED_4GB['items']),
+    (DETAIL['id'], DETAIL['settings'], DETAIL['items']),
     *((p['id'], p['settings'], p['items']) for p in APOLAR_PRESETS),
     ('performance', {'vsync': False}, {'menu:frames_queued': '2', 'menu:fsr1': '1', 'TLG_STALE_READBACK': '1'}),
     ('balanced', {}, {}),
@@ -107,7 +112,10 @@ def matching_preset(settings, states):
 # --------------------------------------------------------------------------------- VRAM budget
 # The Tk launcher's rule ("6 GB card: 3500 · 8 GB: 5000 · 12 GB: 8500 · 16 GB: 12000 · 24 GB: 19000"),
 # in MB of VRAM to give the texture cache; in between the budget follows the line joining the points.
-BUDGET_POINTS = ((6, 3500), (8, 5000), (12, 8500), (16, 12000), (24, 19000))
+# A 4 GB card gets 3500 too: the card gives 4096 MB and the rest (the desktop, the driver and the
+# buffer cache's resident guest memory, ~600 MB measured) has to fit in what is left. Measured on a
+# 4 GB card with this budget: 3848 MB of VRAM in use (nvidia-smi), the cache holding ~3078 MiB.
+BUDGET_POINTS = ((4, 3500), (6, 3500), (8, 5000), (12, 8500), (16, 12000), (24, 19000))
 BUDGET_MIN, BUDGET_MAX = 2000, 24000      # the Tk spin box range
 
 
@@ -125,7 +133,7 @@ def suggested_budget_mb(vram_gb):
             if g0 <= gb <= g1:
                 value = b0 + (b1 - b0) * (gb - g0) / (g1 - g0)
                 break
-    value = min(value, gb * 1024 * 0.85)   # never close to the whole card
+    value = min(value, gb * 1024 * 0.9)   # never close to the whole card
     return int(min(max(round(value / 100) * 100, BUDGET_MIN), BUDGET_MAX))
 
 

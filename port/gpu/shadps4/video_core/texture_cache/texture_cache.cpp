@@ -33,6 +33,44 @@ namespace VideoCore {
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
 
+namespace {
+
+/// tlg: the budget the launcher gives the cache (TLG_GC_BUDGET_MB), read once.
+u64 ForcedBudget() {
+    static const u64 budget = [] {
+        const char* env = std::getenv("TLG_GC_BUDGET_MB");
+        return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
+    }();
+    return budget;
+}
+
+/// tlg: a percentage from the environment (0 or a bad value: the default).
+u64 PercentFromEnv(const char* name, u64 fallback) {
+    const char* env = std::getenv(name);
+    if (!env || !env[0]) {
+        return fallback;
+    }
+    const u64 value = std::strtoull(env, nullptr, 10);
+    if (value == 0 || value > 100) {
+        return fallback;
+    }
+    return value;
+}
+
+/// tlg: the card's own device local memory (0: the driver does not say).
+u64 DeviceLocalMemory(const Vulkan::Instance& instance) {
+    u64 total = 0;
+    const auto& properties = instance.GetMemoryProperties();
+    for (u32 i = 0; i < properties.memoryHeapCount; i++) {
+        if (properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+            total += properties.memoryHeaps[i].size;
+        }
+    }
+    return total;
+}
+
+} // namespace
+
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                            BufferCache& buffer_cache_, PageManager& tracker_)
@@ -90,6 +128,36 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
                  "({} MB left for buffers)",
                  device_local_memory >> 20, headroom_gc_memory >> 20, RESIDENCY_HEADROOM >> 20);
     }
+
+    // tlg: the collector's own share of the VRAM budget (GcBudget). The card's memory and the
+    // plan's marks are what the collector compares with the cache's own bytes: the driver's
+    // total also holds the buffer cache's arenas, which the collector cannot free.
+    physical_memory = DeviceLocalMemory(instance);
+    gc_new_policy = [] {
+        const char* value = std::getenv("TLG_GC_POLICY");
+        return !(value && value[0] == '0');
+    }();
+    gc_floor_share = PercentFromEnv("TLG_GC_FLOOR_SHARE", GcBudget::DefaultFloorShare);
+    gc_hard_share = PercentFromEnv("TLG_GC_HARD_SHARE", GcBudget::DefaultHardShare);
+    gc_budget_bytes = EffectiveBudget();
+    std::printf("Texture cache: %s collector policy, budget %llu MiB, card memory %llu MiB "
+                "(hard mark %llu MiB, floor %llu%% of the budget)\n",
+                gc_new_policy ? "share" : "legacy", gc_budget_bytes >> 20, physical_memory >> 20,
+                GcBudget::Percent(physical_memory, gc_hard_share) >> 20, gc_floor_share);
+}
+
+u64 TextureCache::EffectiveBudget() const {
+    u64 budget = ForcedBudget();
+    if (instance.IsIntegrated()) {
+        // An integrated GPU follows the driver's current budget: the launcher always forces
+        // 3500 MB, more than most integrated GPUs are given.
+        const u64 now = instance.GetDeviceMemoryBudgetNow();
+        budget = budget && now ? std::min(budget, now) : (budget ? budget : now);
+    }
+    if (budget == 0) {
+        budget = instance.GetTotalMemoryBudget();
+    }
+    return budget;
 }
 
 void TextureCache::ApplyResidencyHeadroom() {
@@ -1235,6 +1303,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     if (!image_id) {
         image_id = slot_images.insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
+        if (WasEvicted(info.guest_address)) {
+            // tlg: the collector had to free this one and the game asks for it again: the
+            // texture is uploaded again from the guest memory, which may hold another texture
+            // now (the detail the player sees missing).
+            ++gc_recreated;
+        }
         if (diag) {
             ++images_created;
             const auto same = [&](const CreateStat& s) {
@@ -1528,6 +1602,9 @@ void TextureCache::UploadDecodedImage(Image& image) {
     // tlg: TLG_BC_TINY (video_core/amdgpu/tlg_bc_tiny.h). The blocks are read from guest memory
     // with the layout the GPU detiler and the BC upload copies use (mips_layout pitch and height
     // in texels; micro tiling as host_shaders/tiling.comp), decoded and uploaded as texels.
+    // tlg: the decode is CPU work inside the frame. The counters say how much: a re-created
+    // image decodes again, so the eviction cycle multiplies this cost.
+    const auto decode_start = std::chrono::steady_clock::now();
     const ImageInfo& info = image.info;
     const auto kind = BcTinyDecodeKind(info.bc_format);
     ASSERT_MSG(kind.has_value(), "TLG_BC_TINY image without a decodable BC format");
@@ -1602,6 +1679,13 @@ void TextureCache::UploadDecodedImage(Image& image) {
 
     scheduler.EndRendering();
     runtime.UploadImage(&image, staging.buffer, copies);
+
+    // tlg: what the decode cost (the report shows it next to the evictions).
+    const auto decode_end = std::chrono::steady_clock::now();
+    ++bc_decodes;
+    bc_decode_bytes += total;
+    bc_decode_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(decode_end - decode_start)
+                        .count();
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
@@ -1651,6 +1735,8 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.flags |= ImageFlagBits::Registered;
     ++registry_generation;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
+    // tlg: the cache's own bytes (the real device sizes, not the guest ones).
+    AddCacheBytes(image, true);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     image.lru_touched_tick = gc_tick;
 
@@ -1694,6 +1780,7 @@ void TextureCache::UnregisterImage(ImageId image_id,unsigned perf_reason) {
     ++registry_generation;
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
+    AddCacheBytes(image, false);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         const auto page_it = page_table.find(page);
         if (page_it == nullptr) {
@@ -1828,10 +1915,7 @@ void TextureCache::GarbageCollectImages() {
         // collector evicted images used two or three frames ago on every submission and wrote
         // GPU-written ones back. Compare with the driver's current budget instead.
         // TLG_GC_BUDGET_MB=N: this rule with a fixed budget on any GPU (tests on a desktop).
-        static const u64 forced_budget = [] {
-            const char* env = std::getenv("TLG_GC_BUDGET_MB");
-            return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
-        }();
+        const u64 forced_budget = ForcedBudget();
         if (instance.IsIntegrated() || forced_budget) {
             // An integrated GPU keeps following the driver's current budget under a forced one:
             // the launcher always forces 3500 MB, more than most integrated GPUs are given, and
@@ -1851,14 +1935,80 @@ void TextureCache::GarbageCollectImages() {
             }
         }
     }
-    if (total_used_memory < trigger_gc_memory) {
-        return;
+    // tlg: the collector's own accounting. The driver counts the buffer cache's arenas, the
+    // staging pool and its own allocations too, and the collector cannot free those: the usage
+    // stayed above the critical mark for the whole session and the collector evicted the
+    // textures the game was drawing with (the detail the player sees missing). The plan works
+    // on the cache's own bytes and on the share of the budget the rest of the port left.
+    // The driver's total is only usable when it fits in the card: on this driver it is above
+    // the card's size (it counts the host memory of the arenas), and then the pressure is
+    // decided with the cache's own bytes and the budget alone.
+    const bool driver_reliable = physical_memory == 0 || total_used_memory <= physical_memory;
+    other_bytes = driver_reliable && total_used_memory > cache_bytes
+                       ? total_used_memory - cache_bytes
+                       : 0;
+    const u64 touched = touched_bytes.exchange(0, std::memory_order_relaxed);
+    working_set_bytes = GcBudget::UpdateWorkingSet(working_set_bytes, touched);
+    // The legacy rule (TLG_GC_POLICY=0) compares the driver's total with the budget; the new one
+    // compares the cache's own bytes with its share of the budget.
+    const bool legacy = !gc_new_policy;
+    if (legacy) {
+        if (total_used_memory < trigger_gc_memory) {
+            return;
+        }
+    } else {
+        gc_budget_bytes = EffectiveBudget();
+        gc_plan = GcBudget::MakePlan({
+            .budget = gc_budget_bytes,
+            .cache_bytes = cache_bytes,
+            .other_bytes = other_bytes,
+            .driver_bytes = total_used_memory,
+            .physical = physical_memory,
+            .working_set = working_set_bytes,
+            .floor_share = gc_floor_share,
+            .hard_share = gc_hard_share,
+        });
+        if (cache_bytes <= gc_plan.target) {
+            // The cache is within its share of the budget: nothing to free.
+            return;
+        }
     }
     std::scoped_lock lock{mutex};
     bool pressured = false;
     bool aggresive = false;
     u64 ticks_to_destroy = 0;
     size_t num_deletions = 0;
+    if (gc_new_policy) {
+        if ((gc_tick & 0xFF) == 0) {
+            // tlg: an image can gain a backing after it was registered (a sample count change):
+            // the exact total of the cache now and then (the LRU holds every registered image).
+            u64 total = 0;
+            lru_cache.ForEachItemBelow(gc_tick, [&](ImageId image_id) {
+                total += slot_images[image_id].DeviceBytes();
+                return false;
+            });
+            cache_bytes = total;
+        }
+        // The plan again, with the exact bytes of the cache.
+        other_bytes = driver_reliable && total_used_memory > cache_bytes
+                           ? total_used_memory - cache_bytes
+                           : 0;
+        gc_plan = GcBudget::MakePlan({
+            .budget = gc_budget_bytes,
+            .cache_bytes = cache_bytes,
+            .other_bytes = other_bytes,
+            .driver_bytes = total_used_memory,
+            .physical = physical_memory,
+            .working_set = working_set_bytes,
+            .floor_share = gc_floor_share,
+            .hard_share = gc_hard_share,
+        });
+    }
+    // What the collector watches: the driver's total (the legacy rule) or the cache's own bytes.
+    u64 pressure_mark = legacy ? pressure_gc_memory : gc_plan.target;
+    u64 critical_mark = legacy ? critical_gc_memory : gc_plan.critical;
+    // A pass frees at most this many bytes (a mass eviction in one frame is a hitch).
+    const u64 free_per_pass = legacy ? ~0ULL : gc_plan.free_per_pass;
 
     // tlg: TLG_GC_BATCH_DOWNLOAD=1: selected images are only recorded (their copies too) and
     // freed by evict(): one GPU wait, then per image, in selection order, the write-back while it
@@ -1872,7 +2022,12 @@ void TextureCache::GarbageCollectImages() {
     boost::container::small_vector<Eviction, 64> evictions;
     u64 evicting_bytes = 0;
     u64 evicting_downloads = 0;
-    const auto used_memory = [&] { return total_used_memory - evicting_bytes; };
+    // tlg: a write-back waits for the GPU. A few per pass at most, or the frame stalls.
+    size_t evicting_download_count = 0;
+    constexpr size_t MaxDownloadsPerPass = 2;
+    // The legacy rule counted the bytes it was about to free as freed; the new one watches the
+    // cache's own counter, which the frees below already lower.
+    const auto used_memory = [&] { return legacy ? total_used_memory - evicting_bytes : cache_bytes; };
     const auto evict = [&] {
         if (evicting_downloads != 0) {
             scheduler.Finish();
@@ -1892,8 +2047,8 @@ void TextureCache::GarbageCollectImages() {
     };
 
     const auto configure = [&](bool allow_aggressive) {
-        pressured = used_memory() >= pressure_gc_memory;
-        aggresive = allow_aggressive && used_memory() >= critical_gc_memory;
+        pressured = used_memory() >= pressure_mark;
+        aggresive = allow_aggressive && used_memory() >= critical_mark;
         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
@@ -1905,6 +2060,11 @@ void TextureCache::GarbageCollectImages() {
     u32 visited = 0;
     const auto clean_up = [&](ImageId image_id) {
         if (num_deletions == 0) {
+            return true;
+        }
+        if (evicting_bytes >= free_per_pass) {
+            // The pass's byte budget is spent: the rest goes in the next pass (a smooth trim
+            // instead of a mass eviction, and no stall from a long queue of write-backs).
             return true;
         }
         if (std::ranges::find(evictions, image_id, &Eviction::image_id) != evictions.end()) {
@@ -1919,9 +2079,10 @@ void TextureCache::GarbageCollectImages() {
                          ReadbackSource::CacheCleanup);
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
-        if ((tiled && download) || (download && !pressured)) {
+        if ((tiled && download) || (download && !pressured) ||
+            (download && evicting_download_count >= MaxDownloadsPerPass)) {
             // Tiled: we can't handle non-linear image downloads yet. Otherwise a download
-            // waits for memory pressure.
+            // waits for memory pressure, and only a few per pass (each one waits for the GPU).
             lru_cache.Touch(image.lru_id, gc_tick);
             return false;
         }
@@ -1935,9 +2096,12 @@ void TextureCache::GarbageCollectImages() {
                     evicting_downloads += evictions.back().download->size;
                 }
                 ++gc_downloads;
+                ++evicting_download_count;
             }
             ++gc_evictions;
-            evicting_bytes += Common::AlignUp(image.info.guest_size, 1024);
+            evicting_bytes += image.DeviceBytes();
+            gc_evicted_bytes += image.DeviceBytes();
+            NoteEvicted(image.info.guest_address);
             // Bounds the staging memory held at once.
             if (evicting_downloads >= 256_MB) {
                 evict();
@@ -1949,17 +2113,21 @@ void TextureCache::GarbageCollectImages() {
                 // had meanwhile stored there (e.g. its heap after unloading an area).
                 DownloadImageMemory(image_id, true);
                 ++gc_downloads;
+                ++evicting_download_count;
             }
             ++gc_evictions;
+            evicting_bytes += image.DeviceBytes();
+            gc_evicted_bytes += image.DeviceBytes();
+            NoteEvicted(image.info.guest_address);
             FreeImage(image_id, pressured ? 1U : 2U);
         }
-        if (used_memory() < critical_gc_memory) {
+        if (used_memory() < critical_mark) {
             if (aggresive) {
                 num_deletions >>= 2;
                 aggresive = false;
                 return false;
             }
-            if (pressured && used_memory() < pressure_gc_memory) {
+            if (pressured && used_memory() < pressure_mark) {
                 num_deletions >>= 1;
                 pressured = false;
             }
@@ -1971,7 +2139,7 @@ void TextureCache::GarbageCollectImages() {
     configure(false);
     lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
 
-    if (used_memory() >= critical_gc_memory) {
+    if (used_memory() >= critical_mark) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
         visited = 0;
@@ -1979,22 +2147,53 @@ void TextureCache::GarbageCollectImages() {
     }
     evict();
     // tlg: evictions under memory pressure, at most every 5 s (TLG_FRAME_STATS or not).
-    if (pressured || gc_downloads != 0) {
+    if (pressured || gc_downloads != 0 || (gc_new_policy && (gc_plan.hard || gc_plan.over_budget))) {
         const auto now = std::chrono::steady_clock::now();
         if (now - gc_report_time >= std::chrono::seconds(5)) {
             if (TlgPerf::Enabled()) {
                 TlgPerf::Event e; e.kind = TlgPerf::Kind::MemoryPressure;
-                e.a = total_used_memory; e.b = pressure_gc_memory; e.generation = critical_gc_memory;
+                e.a = total_used_memory; e.b = pressure_mark; e.generation = critical_mark;
                 TlgPerf::Emit(e);
             }
-            std::printf("Texture cache: memory pressure, %llu of %llu MiB (critical %llu): "
-                        "%llu images evicted, %llu written back since the last report\n",
-                        (unsigned long long)(total_used_memory >> 20),
-                        (unsigned long long)(pressure_gc_memory >> 20),
-                        (unsigned long long)(critical_gc_memory >> 20),
-                        (unsigned long long)gc_evictions, (unsigned long long)gc_downloads);
+            if (gc_new_policy) {
+                // The three numbers without ambiguity: the cache's own bytes, the budget it may
+                // not pass, and what the driver declares. When the declared total is above the
+                // card it is not comparable with a VRAM budget (this driver counts the host
+                // memory of the buffer cache's arenas), and the log says so.
+                const char* note = gc_plan.driver_reliable ? ""
+                                    : ", the driver's total is above the card: the accounting "
+                                      "includes host memory, the pressure uses the cache's bytes";
+                std::printf("Texture cache: %llu MiB in the cache (budget %llu MiB, target %llu, "
+                            "working set %llu); driver total %llu MiB of the card's %llu MiB%s: "
+                            "%llu images evicted (%llu MiB), %llu written back, %llu images "
+                            "created again, %llu BC decodes (%llu MiB, %llu ms) since the last "
+                            "report\n",
+                            (unsigned long long)(cache_bytes >> 20),
+                            (unsigned long long)(gc_budget_bytes >> 20),
+                            (unsigned long long)(gc_plan.target >> 20),
+                            (unsigned long long)(working_set_bytes >> 20),
+                            (unsigned long long)(total_used_memory >> 20),
+                            (unsigned long long)(physical_memory >> 20), note,
+                            (unsigned long long)gc_evictions,
+                            (unsigned long long)(gc_evicted_bytes >> 20),
+                            (unsigned long long)gc_downloads, (unsigned long long)gc_recreated,
+                            (unsigned long long)bc_decodes, (unsigned long long)(bc_decode_bytes >> 20),
+                            (unsigned long long)(bc_decode_ns / 1000000));
+            } else {
+                std::printf("Texture cache: memory pressure, %llu of %llu MiB (critical %llu): "
+                            "%llu images evicted, %llu written back since the last report\n",
+                            (unsigned long long)(total_used_memory >> 20),
+                            (unsigned long long)(pressure_gc_memory >> 20),
+                            (unsigned long long)(critical_gc_memory >> 20),
+                            (unsigned long long)gc_evictions, (unsigned long long)gc_downloads);
+            }
             gc_report_time = now;
             gc_evictions = gc_downloads = 0;
+            gc_evicted_bytes = 0;
+            gc_recreated = 0;
+            bc_decodes = 0;
+            bc_decode_bytes = 0;
+            bc_decode_ns = 0;
         }
     }
 }
@@ -2091,6 +2290,18 @@ void TextureCache::TouchImage(const Image& image) {
     }
     image.lru_touched_tick = gc_tick;
     lru_cache.Touch(image.lru_id, gc_tick);
+    // tlg: the working set (GcBudget): the bytes the game is using right now. One addition per
+    // image and tick, not per draw.
+    touched_bytes.fetch_add(image.DeviceBytes(), std::memory_order_relaxed);
+}
+
+void TextureCache::AddCacheBytes(const Image& image, bool add) {
+    const u64 bytes = image.DeviceBytes();
+    if (add) {
+        cache_bytes += bytes;
+    } else {
+        cache_bytes = bytes > cache_bytes ? 0 : cache_bytes - bytes;
+    }
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {

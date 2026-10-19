@@ -3,10 +3,12 @@
 // addressing in video_core/texture_cache/tlg_bc_decode.h, against hand-built blocks with known
 // texels. No game or Vulkan device required.
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <set>
+#include <vector>
 
 #include "video_core/texture_cache/tlg_bc_decode.h"
 
@@ -198,11 +200,34 @@ static void TestMicroTiling() {
     assert(MicroTiledOffset(0, 0, 3, 128, 8, MicroThin, 1, 64) == 3ull * 128 * 8 * 8);
 }
 
+// tlg: how much CPU the CPU decode of the tiny BC textures costs. It happens inside the frame
+// (the driver refuses 1D BC images), so the rate says whether it is a first-order problem: a
+// million BC1 blocks are 8 MiB of blocks and 16 MiB of decoded texels.
+static void BenchmarkDecode() {
+    constexpr uint32_t blocks = 1 << 20;
+    std::vector<uint8_t> data(blocks * 8, 0x5a);
+    uint8_t texels[16 * 4];
+    uint32_t checksum = 0;
+    const auto start = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; i < blocks; ++i) {
+        DecodeBlock(Kind::Bc1, data.data() + (i % (blocks - 1)) * 8, texels);
+        checksum += texels[0];
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    const double ms = double(elapsed) / 1e6;
+    const double mib = double(blocks) * 8.0 / (1024.0 * 1024.0);
+    std::printf("bc-decode: %.1f ms for %.0f MiB of blocks (%.0f MiB/s, %.0f ns per block, "
+                "checksum %u)\n",
+                ms, mib, mib / (ms / 1000.0), double(elapsed) / double(blocks), checksum);
+}
+
 int main() {
     TestBc1();
     TestBc2AndBc3();
     TestBc4AndBc5();
     TestMicroTiling();
+    BenchmarkDecode();
     std::puts("bc-decode-test: ok");
     return 0;
 }

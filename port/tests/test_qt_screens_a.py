@@ -254,7 +254,8 @@ VkPhysicalDeviceMemoryProperties:
             for item_id, value in items.items():       # a value the table accepts (not silently dropped)
                 item = gfxlogic.item_by_id(item_id)
                 self.assertIn(value, [item.default] + [c[0] for c in item.choices] + ['0', '1'], item_id)
-        self.assertEqual(('rec1', 'current', 'amd', 'rx580', 'seco', 'apolar_amd', 'apolar_rtx', 'apolar_gtx',
+        self.assertEqual(('rec1', 'current', 'amd', 'rx580', 'seco', 'balanced_4gb', 'detail',
+                          'apolar_amd', 'apolar_rtx', 'apolar_gtx',
                           'performance', 'balanced', 'quality', 'ps4'),
                          tuple(p[0] for p in gfxlogic.PRESETS))
 

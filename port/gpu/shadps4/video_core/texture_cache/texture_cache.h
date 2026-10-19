@@ -27,6 +27,7 @@
 #include "shader_recompiler/resource.h"
 #include "video_core/multi_level_page_table.h"
 #include "video_core/texture_cache/blit_helper.h"
+#include "video_core/texture_cache/gc_budget.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/sampler.h"
@@ -514,6 +515,62 @@ private:
     /// tlg: the most critical_gc_memory may be on small cards (0: no cap), see SMALL_CARD_MEMORY.
     u64 headroom_gc_memory = 0;
     void ApplyResidencyHeadroom();
+
+    // tlg: the collector's own accounting (GcBudget). The driver counts the buffer cache's
+    // arenas, the staging pool and its own allocations too, and the collector cannot free those:
+    // comparing that total with the budget kept it in its aggressive mode for the whole session
+    // (the textures the game was drawing with were evicted over and over).
+    /// The bytes the cache's images hold on the device.
+    u64 cache_bytes = 0;
+    /// The bytes the rest of the port holds (driver total minus the cache's own).
+    u64 other_bytes = 0;
+    /// The bytes the game is using right now (an estimate, see GcBudget::UpdateWorkingSet).
+    u64 working_set_bytes = 0;
+    /// The bytes the game touched since the last collection (summed by TouchImage).
+    std::atomic<u64> touched_bytes{0};
+    /// The card's device local memory (0: the driver does not say).
+    u64 physical_memory = 0;
+    /// The budget the cache may not pass (the launcher's VRAM budget).
+    u64 gc_budget_bytes = 0;
+    /// The plan of the last collection (for the report).
+    GcBudget::Plan gc_plan{};
+    /// TLG_GC_POLICY=0: the old rule (the driver's total against the budget). 1 (default): the
+    /// cache's own share of the budget.
+    bool gc_new_policy = true;
+    /// The share of the budget the cache keeps at least (percent).
+    u64 gc_floor_share = GcBudget::DefaultFloorShare;
+    /// The share of the card's memory above which the driver is in trouble (percent).
+    u64 gc_hard_share = GcBudget::DefaultHardShare;
+    /// The bytes the evictions freed (since the last report).
+    u64 gc_evicted_bytes = 0;
+    /// The images the collector had to create again after evicting them (since the last report):
+    /// the detail the player loses when the cache churns.
+    u64 gc_recreated = 0;
+    /// tlg: the CPU decode of the tiny block-compressed textures (TLG_BC_TINY): how many, how
+    /// many bytes and how long. It is work inside the frame, and a re-created image decodes
+    /// again, so the eviction cycle multiplies it.
+    u64 bc_decodes = 0, bc_decode_bytes = 0, bc_decode_ns = 0;
+    /// The guest addresses the collector evicted last (a ring): a new image at one of them is a
+    /// re-creation.
+    static constexpr size_t EvictedRingSize = 256;
+    std::array<VAddr, EvictedRingSize> evicted_addresses{};
+    size_t evicted_ring_index = 0;
+    void NoteEvicted(VAddr address) {
+        evicted_addresses[evicted_ring_index] = address;
+        evicted_ring_index = (evicted_ring_index + 1) % EvictedRingSize;
+    }
+    [[nodiscard]] bool WasEvicted(VAddr address) const {
+        for (const VAddr evicted : evicted_addresses) {
+            if (evicted == address) {
+                return true;
+            }
+        }
+        return false;
+    }
+    /// The budget the cache may use: the launcher's (TLG_GC_BUDGET_MB) or the card's own.
+    [[nodiscard]] u64 EffectiveBudget() const;
+    /// Adds the image's real size to the cache's total.
+    void AddCacheBytes(const Image& image, bool add);
     u64 total_used_samplers = 0;
     u64 trigger_gc_samplers = 0;
     u64 pressure_gc_samplers = 0;

@@ -225,6 +225,32 @@ DEFAULT_ENV = {
     'ISS_FRAME_STATS': '1',        # FPS in the log every 5 s (scripts/watch_session.sh heartbeat)
 }
 
+# The texture cache's VRAM budget, in MB, per card size: the curve the Qt launcher shows
+# (qt/gfxlogic.py). A 4 GB card gets 3500 MB, the same a 6 GB card gets: the card gives 4096 MB
+# and the rest (the desktop, the driver and the buffer cache's resident guest memory, ~600 MB
+# measured) has to fit in what is left. Measured on a 4 GB card with this budget: 3848 MB of
+# VRAM in use (nvidia-smi) and the cache holding ~3078 MiB; evidence 20261019-130735.
+BUDGET_POINTS = ((4, 3500), (6, 3500), (8, 5000), (12, 8500), (16, 12000), (24, 19000))
+BUDGET_CARD_MB = 6 * 1024   # the card the default budget (3500 MB) was measured for
+
+
+def suggested_budget_mb(vram_mb):
+    """MB of texture-cache budget for a card with this much VRAM (the launcher's curve)."""
+    gb = float(vram_mb) / 1024.0
+    points = BUDGET_POINTS
+    if gb <= points[0][0]:
+        value = points[0][1] * gb / points[0][0]
+    elif gb >= points[-1][0]:
+        value = points[-1][1] + (gb - points[-1][0]) * 800
+    else:
+        value = points[-1][1]
+        for (g0, b0), (g1, b1) in zip(points, points[1:]):
+            if g0 <= gb <= g1:
+                value = b0 + (b1 - b0) * (gb - g0) / (g1 - g0)
+                break
+    value = min(value, gb * 1024 * 0.9)    # never close to the whole card
+    return int(min(max(round(value / 100) * 100, 2000), 24000))
+
 # The game's own modules from sce_module/, linked into the image.
 MODULES = ['libc.prx', 'libSceFios2.prx']
 
