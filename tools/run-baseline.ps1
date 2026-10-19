@@ -81,6 +81,10 @@ param(
 
     [hashtable]$ExtraEnv = @{},
 
+    # Claves extra de tlg.ini para esta pasada (preset, live_resolution, rcas...). Se escriben
+    # en la copia de configuracion de la evidencia, nunca en la del usuario.
+    [hashtable]$IniExtra = @{},
+
     [ValidateNotNullOrEmpty()][string]$Tag = 'baseline',
 
     [string]$Python = 'python',
@@ -92,6 +96,13 @@ param(
     [ValidateRange(0, 3600)][int]$ScreenshotIntervalSec = 0,
 
     [switch]$BringToFront,
+
+    # Con -KeepOpen el harness NO cierra la ventana del juego al acabarse la duracion: se
+    # queda hasta que el jugador la cierre (o hasta KeepOpenMaxSec). Sin esto, el cierre
+    # automatico al final de la sesion se confundia con un crash del port.
+    [switch]$KeepOpen,
+
+    [ValidateRange(60, 28800)][int]$KeepOpenMaxSec = 14400,
 
     [ValidateRange(0, 1000)][int]$CodexFeedback = 0
 )
@@ -419,7 +430,9 @@ function Find-GameProcess {
         } catch { return $null }
 
         try {
-            $candidates = @(Get-Process -Name 'tlg-probe' -ErrorAction SilentlyContinue)
+            # The probe's own file name (TLG_PROBE can point at a build with another name).
+            $probeName = [IO.Path]::GetFileNameWithoutExtension($ProbePath)
+            $candidates = @(Get-Process -Name $probeName -ErrorAction SilentlyContinue)
             foreach ($candidate in $candidates) {
                 try {
                     if ($candidate.StartTime.ToUniversalTime() -lt $NotBeforeUtc.AddSeconds(-2)) {
@@ -1180,15 +1193,23 @@ function Invoke-Baseline {
     }
     $launchConfig = $null
 
-    if ($Resolution) {
+    if ($Resolution -or $IniExtra.Count -gt 0) {
         $launchConfig = Join-Path $configDir 'tlg.ini'
         if (Test-Path -LiteralPath $baseConfig -PathType Leaf) {
             Copy-Item -LiteralPath $baseConfig -Destination $launchConfig -Force
         }
-        Update-IniValue -Path $launchConfig -Key 'render_resolution' -Value $Resolution
+        if ($Resolution) {
+            Update-IniValue -Path $launchConfig -Key 'render_resolution' -Value $Resolution
+            $result.resolution.effective = $Resolution
+            $result.resolution.source = 'override en evidencia (copia de tlg.ini)'
+        }
         Update-IniValue -Path $launchConfig -Key 'restart_unconfirmed' -Value '0'
-        $result.resolution.effective = $Resolution
-        $result.resolution.source = 'override en evidencia (copia de tlg.ini)'
+        foreach ($key in $IniExtra.Keys) {
+            Update-IniValue -Path $launchConfig -Key $key -Value ([string]$IniExtra[$key])
+        }
+        if ($IniExtra.Count -gt 0) {
+            $result.notes += ("tlg.ini de la evidencia: " + (($IniExtra.Keys | ForEach-Object { "$_=$($IniExtra[$_])" }) -join ' '))
+        }
         $result.paths.config = $launchConfig
     } else {
         if (Test-Path -LiteralPath $baseConfig -PathType Leaf) {
@@ -1436,6 +1457,7 @@ function Invoke-Baseline {
             }
 
             $deadline = $gameStartUtc.AddSeconds($DurationSec)
+            if ($KeepOpen) { $deadline = $gameStartUtc.AddSeconds($KeepOpenMaxSec) }
             $automationDirty = $false
             while ([DateTime]::UtcNow -lt $deadline) {
                 try {
@@ -1467,10 +1489,17 @@ function Invoke-Baseline {
             try { $game.Refresh() } catch { }
             if ($game.HasExited) {
                 $result.status = 'early_exit'
-                $result.stop_reason = 'game_exit'
+                $result.stop_reason = if ($KeepOpen) { 'user_closed' } else { 'game_exit' }
+                if ($KeepOpen) { $result.notes += 'La ventana la cerro el jugador; el harness no toco el juego.' }
                 $gameEndUtc = [DateTime]::UtcNow
             } else {
                 $gameEndUtc = [DateTime]::UtcNow
+                if ($KeepOpen) {
+                    Write-Host 'Harness: se agota KeepOpenMaxSec; se cierra la ventana del juego.'
+                    $result.notes += "El harness cerro la ventana al agotarse KeepOpenMaxSec ($KeepOpenMaxSec s)."
+                } else {
+                    Write-Host 'Harness: fin de la duracion; se cierra la ventana del juego (no es un crash).'
+                }
                 $stop = Stop-GameProcess -Game $game -GraceSec 12
                 $result.forced_stop = [bool]$stop.forced
                 if ($result.forced_stop) {

@@ -53,7 +53,32 @@ midió para que no fuese un barrido imposible de imitar (los ~70 °/s de un juga
 mano, contra los 125 °/s del asistente, que va más rápido pero con trazo discontinuo: el spray
 está activo 0.3 s de cada 0.5 s).
 
-## 3. Test
+## 3. Modo «pintado asistido» (el que faltaba para el usuario)
+
+En la sesión manual del 2026-10-19 (218 s, 60 FPS, sin crash) el log **no tiene ni una línea
+`Runtime: sensor mode on`**: el jugador nunca entró en modo sensor, así que la escena del grafiti
+no recibía ni la pose de lado ni la sacudida y la pintura no avanzaba.
+
+Por eso el asistente tiene ahora un segundo disparador (`TLG_MOTION_ASSIST_TRIGGER`):
+
+| Valor | Qué hace |
+|---|---|
+| `sensor` (por defecto) | El asistente acts mientras el modo sensor está encendido (comportamiento anterior) |
+| `paint` | El asistente acts **mientras el jugador mantiene el spray** (`R` o botón derecho): el port pone la lata de lado, la sacude sin parar y barre la mira; el jugador pinta. No hace falta modo sensor y los sticks y el cross siguen con el juego, así que se puede seguir jugando |
+
+En modo `paint` el asistente **no pulsa los gatillos** (`TLG_MOTION_ASSIST_SPRAY` sin definir = 0):
+el spray lo pone el jugador. Con `TLG_MOTION_ASSIST_SPRAY=1` vuelve a pulsar L2 y R2 él mismo.
+`TLG_MOTION_ASSIST_AIM=0` deja la mira en manos del jugador (flechas o ratón).
+
+```
+TLG_MOTION_ASSIST=1 TLG_MOTION_ASSIST_TRIGGER=paint TLG_MOTION_ASSIST_LOG=1
+```
+
+El log del port escribe `Runtime: motion assist running (paint trigger: you paint, the port holds
+and shakes the can; 150 s budget)` y, con `TLG_MOTION_ASSIST_LOG=1`, una línea por 0.6 s con la
+mira y el estado de sacudida y spray.
+
+## 4. Test
 
 `port/tests/test_motion_assist.c` (target CMake `motion-assist-test`) incluye `runtime_pad.c` y
 comprueba, sin juego ni GPU:
@@ -68,7 +93,7 @@ ninja -C port/out/gpu motion-assist-test && port/out/gpu/motion-assist-test.exe
 motion-assist-test: ok (stencil covered 99.7% in 30 s, 100.0% in 60 s)
 ```
 
-## 4. Avisos y textos corregidos en el mismo pase
+## 5. Avisos y textos corregidos en el mismo pase
 
 - El aviso en pantalla decía «R2 paints / R2 pinta», pero el prompt del juego es **[L2]**; ahora
   dice «L2 sprays / L2 pinta» (y «cross shakes» / «A sacode»).
@@ -78,7 +103,7 @@ motion-assist-test: ok (stencil covered 99.7% in 30 s, 100.0% in 60 s)
   `tlggpu_graffiti_guide` y `tlggpu_sensor_aim_scale` que el asistente añadió al runtime: el
   target `pad-map-test` no enlazaba. Corregido.
 
-## 5. Qué falta (para la sesión manual)
+## 6. Qué falta (para la sesión manual)
 
 1. Jugar el tutorial del grafiti con el asistente armado (`Ctrl+H`): confirmar que la escena pide
    L2 y que el stencil se completa (si el juego pide el spray *continuo* y no por pulsos, hay que
@@ -86,7 +111,7 @@ motion-assist-test: ok (stencil covered 99.7% in 30 s, 100.0% in 60 s)
 2. Comprobar en el log las líneas `Runtime: motion assist ...` con `TLG_MOTION_ASSIST_LOG=1`.
 3. Verificar que al terminar el modo sensor se apaga solo y el juego vuelve a aceptar el mando.
 
-## 6. Nota de método
+## 7. Nota de método
 
 La medición original del agente quedó a medias: su script de simulación (JavaScript en la
 herramienta `execute`) se quedó girando en el servidor y la sesión se colgó 52 minutos; el agente

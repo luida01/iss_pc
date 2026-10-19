@@ -402,7 +402,14 @@ static MotionAssist motion_assist_at(float t) {
     const float cycle=fmodf(t,0.5f);
     return (MotionAssist){yaw,aim_pitch,cycle<0.2f,cycle>=0.2f};
 }
-static struct { int loaded, on, finished, running, turned, log; float used, seconds; uint64_t log_next; } assist={.seconds=150.f};
+/* When the assistant acts: in sensor mode (default) or while the player holds the spray
+ * (ASSIST_PAINT: the port holds the can sideways and shakes it, the player paints). */
+enum { ASSIST_SENSOR = 0, ASSIST_PAINT = 1 };
+static struct { int loaded, on, finished, running, turned, log; int trigger, spray, aim; float used, seconds; uint64_t log_next; } assist={.seconds=150.f};
+/* The spray the host asked for (keyboard R, right mouse, the pad's L2/R2) and whether the
+ * assistant pressed the triggers itself this frame. */
+static int host_spray, assist_sprayed;
+static float spray_hold; /* seconds the paint trigger stays on after the last spray */
 static void motion_assist_load(void) {
     if (assist.loaded) return;
     assist.loaded=1;
@@ -413,6 +420,14 @@ static void motion_assist_load(void) {
     if (assist.seconds<0) assist.seconds=0;
     e=getenv("TLG_MOTION_ASSIST_LOG");
     assist.log=e && *e=='1';
+    e=getenv("TLG_MOTION_ASSIST_TRIGGER");
+    assist.trigger=(e && *e && !strncmp(e,"paint",5)) ? ASSIST_PAINT : ASSIST_SENSOR;
+    e=getenv("TLG_MOTION_ASSIST_SPRAY");
+    /* Unset: the assistant sprays in sensor mode and leaves the spray to the player in paint
+     * mode. Set: 0 never presses the triggers, 1 always does. */
+    assist.spray=e && *e ? strcmp(e,"0")!=0 : assist.trigger!=ASSIST_PAINT;
+    e=getenv("TLG_MOTION_ASSIST_AIM");
+    assist.aim=!(e && *e && !strcmp(e,"0"));
 }
 /* Turns sensor mode on/off from any source (keyboard or pad), with the notice, the log line and
  * the graffiti guide the first time it turns on. */
@@ -433,7 +448,7 @@ static void motion_assist_toggle(void) {
     motion_assist_load();
     assist.on=!assist.on;
     assist.used=0; assist.finished=0; assist.running=0;
-    if (assist.on && !motion.mode) { assist.turned=1; motion_set_mode(1); }
+    if (assist.on && !motion.mode && assist.trigger!=ASSIST_PAINT) { assist.turned=1; motion_set_mode(1); }
     const int pt=ui_pt();
     tlggpu_overlay_notice(assist.on ? (pt ? "Assistente do grafite LIGADO: pinta sozinho no modo sensor (Ctrl+H desliga)"
                                            : "Graffiti assistant ON: it paints by itself in sensor mode (Ctrl+H stops)")
@@ -458,6 +473,12 @@ static void sample_motion(PadData *d, SDL_Gamepad *g, const bool *k) {
         real=SDL_GetGamepadSensorData(g,SDL_SENSOR_GYRO,gyro,3) && SDL_GetGamepadSensorData(g,SDL_SENSOR_ACCEL,accel,3);
     }
     motion_assist_load();
+    assist_sprayed=0; /* what the assistant pressed itself this frame */
+    /* The paint trigger follows the spray the host asked for, with a short hold: the mouse is
+     * only read while the game has it captured, so the button can flicker for a frame or two;
+     * the can keeps its pose and the shake a moment longer. */
+    if (host_spray) spray_hold=1.5f;
+    else if (spray_hold>0) spray_hold-=dt;
     /* Sensor mode from the keyboard: H, or Z+C together (the pad's L3+R3). Ctrl+H toggles the
      * graffiti assistant instead (the same key, modified). */
     if (k) {
@@ -491,6 +512,12 @@ static void sample_motion(PadData *d, SDL_Gamepad *g, const bool *k) {
         motion.toggle_held=toggle;
         if (sticks) d->buttons&=~(uint32_t)(BTN_L3|BTN_R3);
     }
+    /* The one-key assistant. In sensor mode it acts whenever that mode is on, so it never
+     * paints during normal gameplay. In paint mode (TLG_MOTION_ASSIST_TRIGGER=paint) it acts
+     * while the player holds the spray: the port holds the can sideways and shakes it, and the
+     * player paints. The seconds are a budget of that time. */
+    const int assist_run=assist.on && !assist.finished &&
+        (assist.trigger==ASSIST_PAINT ? (host_spray||spray_hold>0) : motion.mode);
     if (motion.mode) {
         /* On its side, like a spray can, with or without a gamepad. */
         roll=1.5708f;
@@ -515,15 +542,21 @@ static void sample_motion(PadData *d, SDL_Gamepad *g, const bool *k) {
         motion.aim_pitch=fminf(fmaxf(motion.aim_pitch,-1.2f),1.2f);
         d->buttons&=~(uint32_t)BTN_CROSS; /* cross jumps; not wanted while holding the can */
         simulated=1;
+    } else if (assist_run) {
+        /* Paint assist: the can is held sideways and shaken for the player, but the sticks and
+         * the cross stay with the game, so the player keeps playing. */
+        roll=1.5708f;
+        simulated=1;
     }
     /* The one-key assistant: it only acts in sensor mode, so it never paints during normal
      * gameplay. It can pause (mode off) and resume; the seconds are a budget of sensor-mode time.
      * The spray asks for both triggers (L2, the "[L2] Spray" prompt = R or the right mouse
      * button, and R2 = F or the left mouse button), so it paints whichever one the scene reads. */
-    const int assist_run=assist.on && motion.mode && !assist.finished;
     if (assist_run && !assist.running) {
         assist.running=1; assist.log_next=0;
-        printf("Runtime: motion assist running (Ctrl+H stops; %.0f s budget)\n",assist.seconds);
+        printf("Runtime: motion assist running (%s; %.0f s budget)\n",
+               assist.trigger==ASSIST_PAINT ? "paint trigger: you paint, the port holds and shakes the can"
+                                            : "sensor mode; Ctrl+H stops", assist.seconds);
     }
     if (!assist_run && assist.running) {
         assist.running=0;
@@ -540,13 +573,18 @@ static void sample_motion(PadData *d, SDL_Gamepad *g, const bool *k) {
             if (assist.turned) motion_set_mode(0); /* it turned the mode on to paint; walk again */
         } else {
             const MotionAssist a=motion_assist_at(assist.used);
-            motion.yaw=a.yaw; motion.aim_pitch=a.aim_pitch; /* the spiral overrides the sticks */
-            if (a.shake) shake=1;
-            if (a.spray) { d->buttons|=BTN_L2|BTN_R2; d->l2=d->r2=255; }
+            if (assist.aim) { motion.yaw=a.yaw; motion.aim_pitch=a.aim_pitch; } /* the figure overrides the sticks */
+            if (assist.spray) {
+                if (a.shake) shake=1;
+                if (a.spray) { d->buttons|=BTN_L2|BTN_R2; d->l2=d->r2=255; assist_sprayed=1; }
+            } else {
+                shake=1; /* the player paints: the can shakes the whole time */
+            }
             if (assist.log && now>=assist.log_next) {
                 assist.log_next=now+600000; /* 0.6 s: in step with neither the 0.5 s shake cycle nor spray */
-                printf("Runtime: motion assist t=%.1f yaw=%.3f pitch=%.3f shake=%d spray=%d\n",
-                       assist.used,a.yaw,a.aim_pitch,a.shake,a.spray);
+                printf("Runtime: motion assist t=%.1f yaw=%.3f pitch=%.3f hold=%d shake=%d spray=%d\n",
+                       assist.used,a.yaw,a.aim_pitch,host_spray||spray_hold>0,
+                       assist.spray?a.shake:1,assist.spray?a.spray:0);
             }
         }
     }
@@ -569,7 +607,7 @@ static void sample_motion(PadData *d, SDL_Gamepad *g, const bool *k) {
         const float rate=dt>0 ? 1.f-expf(-dt*12.f) : 1.f;
         const Quat old=motion.q;
         motion.roll+=(roll-motion.roll)*rate; motion.pitch+=(pitch-motion.pitch)*rate;
-        if (!motion.mode && !key_can) { motion.yaw-=motion.yaw*rate; motion.aim_pitch-=motion.aim_pitch*rate; } /* back to centre */
+        if (!motion.mode && !key_can && !(assist_run&&assist.aim)) { motion.yaw-=motion.yaw*rate; motion.aim_pitch-=motion.aim_pitch*rate; } /* back to centre */
         const float up=motion.pitch+motion.aim_pitch;
         Quat qr={cosf(motion.roll*0.5f),0,0,sinf(-motion.roll*0.5f)}; /* roll about z (toward player) */
         Quat qp={cosf(up*0.5f),sinf(up*0.5f),0,0};                   /* pitch about x */
@@ -845,6 +883,9 @@ static void sample_host(PadData *d) {
     }
     if (d->buttons & BTN_L2) d->l2=255;
     if (d->buttons & BTN_R2) d->r2=255;
+    /* What the host asked for (the assistant's own spray does not count): the paint trigger of
+     * the assistant follows it, one frame late (it is read in the next sample). */
+    host_spray=(d->buttons&(BTN_L2|BTN_R2))!=0 && !assist_sprayed;
     key_axis(&d->left_x,k[SDL_SCANCODE_A],k[SDL_SCANCODE_D]);
     key_axis(&d->left_y,k[SDL_SCANCODE_W],k[SDL_SCANCODE_S]);
     key_axis(&d->right_x,k[SDL_SCANCODE_LEFT],k[SDL_SCANCODE_RIGHT]);

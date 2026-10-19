@@ -82,6 +82,11 @@ Grafiti sin giroscopio (teclado):
   Vuelve a pulsar **Ctrl+H** para pararlo; si no, se para solo a los 150 s
   (`TLG_MOTION_ASSIST_SECS`). Solo actúa dentro del modo sensor. Detalle y medidas:
   `docs/analysis/motion-assist.md`.
+- **Modo pintado asistido** (`TLG_MOTION_ASSIST_TRIGGER=paint`): mientras tú mantienes el spray
+  (**R** o **botón derecho**), el port pone la lata de lado, la sacude y barre la mira por ti;
+  tú solo pintas y los sticks y el cross siguen siendo tuyos, así que puedes seguir jugando.
+  No hace falta entrar en modo sensor. Con `TLG_MOTION_ASSIST_SPRAY=0` el asistente nunca pulsa
+  los gatillos; con `TLG_MOTION_ASSIST_AIM=0` tampoco mueve la mira (apuntas tú).
 
 ## 3. Menú y HUD del port
 
