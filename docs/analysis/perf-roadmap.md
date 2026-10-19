@@ -73,7 +73,26 @@ memoria de texturas, (b) quitar el trabajo inútil por frame y (c) decidir con d
 | P9 | **Copias host→GPU y syncs del recorder** (2,8 % / 127-300 por frame) | agente renderer | pendiente | medido y, si procede, reducido |
 | P10 | **Presets del launcher** con las palancas anteriores, explicados al usuario | yo (Qt launcher) | pendiente | el usuario elige "Detalle / Equilibrado / 4 GB" y sabe qué gana y qué pierde |
 | P11 | **Decode BC fuera del camino crítico**: el driver 617.42 rechaza las imágenes BC 1D y las decodificamos en CPU durante la subida; con el ciclo de expulsión (P1) se repite | agente VRAM | pendiente | el decode no aparece en el frame que lo pide (hilo aparte) y las texturas decodificadas no se vuelven a decodificar al recrearlas |
-| P12 | **Emulación ISA de `EXTRQ`**: el juego la ejecuta ~67 millones de veces en 30 min (5 sitios) y la emulamos nosotros | yo | pendiente | coste medido por instrucción y, si es alto, una versión rápida en línea |
+| P12 | **Emulación ISA de `EXTRQ`**: el juego la ejecuta ~67 millones de veces en 30 min (5 sitios) y la emulamos nosotros | yo | medido | coste medido por instrucción y, si es alto, una versión rápida en línea |
+
+## 3.1 Auditoría de cableado (qué existe pero no hace nada)
+
+Barrido automático de los ajustes y de los toggles del port:
+
+| Hallazgo | Detalle | Acción |
+|---|---|---|
+| **El preset no escala la escena** | `SceneResolution::ForPreset` (scene_resolution.h:13) y `TlgSettings::PresetScale` (tlg_settings.cpp:407) están definidos y **nadie los llama**: elegir "Quality"/"Balanced"/"Performance" no reduce la resolución interna | cablear el preset al tamaño de escena (agente renderer) |
+| `live_resolution` sin uso | 0 usos en todo el port: es una capacidad del driver (exige ≥8 GB y GPU suitable); en nuestra 4 GB no aplica | documentarlo, no tocarlo |
+| `dlss_supported` / `dlss_problem` sin uso | Campos muertos del puente DLSS | limpiar cuando se toque ese puente |
+| 52 de 53 toggles conectados | Solo `RegionCache` no se usa en ningún sitio | dejar constancia; el resto está bien |
+| **A/B en caliente disponible** | `TLG_TOGGLE_FILE` se relee cada 250 ms: es la máscara de optimizaciones **desactivadas** | `tools/toggle.ps1` (listar / desactivar / reactivar por nombre) para medir en vivo sin reiniciar |
+
+## 3.2 Reglas para la medición final
+
+- **Una variable por pasada**: con `tools/perf-ab.ps1` (resolución + claves de `tlg.ini` + entorno) para
+  cambios de configuración, y con `tools/toggle.ps1` para A/B en caliente de una optimización.
+- Tres repeticiones por cambio; se comparan mediana, p95, frame time p99, VRAM máxima y las capturas.
+- Ningún cambio se acepta sin que el perfil muestre la mejora **y** las capturas no pierdan detalle.
 
 ## 4. Definición de "jugable" (la we'll medir en la sesión final)
 
