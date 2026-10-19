@@ -38,8 +38,8 @@ Tres cambios quedan implementados aquí (todos con test y build limpio):
    falso y **ningún draw se reducía**. Ahora el preset del menú reduce la escena también sin
    upscaler temporal.
 2. **La clave del memo de objetivos de render** se construía en un array local que se ponía a
-   cero y se copiaba entero (256 bytes) por target y por draw: 6,8 → 2,1 ns por lookup
-   (70 % menos, micro-benchmark reproducible).
+   cero y se copiaba entero (256 bytes) por target y por draw: 10,5 → 1,5 ns por lookup
+   (85 % menos, micro-benchmark reproducible).
 3. **Dos perfiles nuevos** para que la medición final pueda apuntar: el coste por fase del draw
    (`TLG_DRAW_PROFILE=1`) y el coste del decode PM4 por clase de paquete
    (`TLG_PM4_PROFILE=1`), que separan el *trabajo* de la *espera*.
@@ -80,7 +80,7 @@ Pendiente de la sesión final: los tres cambios de arriba se miden con
 | Cambio | Efecto esperado y por qué | Cómo se mide |
 |---|---|---|
 | Preset de resolución activo | Los ~140 draws de la escena pasan de 1 920×1 080 a 1 280×720 (Quality): **44 % de los píxeles**. El coste de GPU de la escena baja en la misma proporción; el de CPU (mismos draws) no cambia. | `TLG_FRAME_STATS=1` → la línea `reduced-size draws` pasa de `0/frame` a `~140/frame`, y el frame time baja con la GPU menos ocupada |
-| Clave del memo | −4,7 ns por lookup × 9 targets/draw × ~86 000 draws/s ≈ **−3,6 ms de CPU por segundo** (≈ 0,4 % de un núcleo) | micro-benchmark `draw-profile-test` (6,8 → 2,1 ns) |
+| Clave del memo | −9 ns por lookup × 9 targets/draw × ~86 000 draws/s ≈ **−7 ms de CPU por segundo** (≈ 0,8 % de un núcleo) | micro-benchmark `draw-profile-test` (10,5 → 1,5 ns) |
 | `TLG_DRAW_PROFILE=1` / `TLG_PM4_PROFILE=1` | No cambia el rendimiento: lo que falta es poder *atribuir* el 88 % de ocupación del hilo de grabación | una línea nueva en el log cada 5 s |
 
 ## 3. Causa raíz por punto
@@ -223,12 +223,41 @@ miden las fases "state" y "descriptors" del perfil nuevo.
 
 ## 4. Lo implementado
 
+### 4.0 Un crash introducido aquí y su arreglo (2026-10-19, 17 h)
+
+**Síntoma**: con el build de este agente, el juego moría a los ~16 s con
+`Fault: read access to ... ` en `Vulkan::Rasterizer::PrepareRenderState` (el puntero más
+cercano en el binario). La línea anterior del log era
+`page_manager.cpp:206 UpdatePageWatchers: Tracking memory region 0x2800000000 -
+0x2800000000 which is not fully GPU mapped` (una región de tamaño 0).
+
+**Causa**: la clave del memo de objetivos de render (`vk_target_memo.h`) se construye en un
+búfer **reutilizado** entre lookups, pero `TargetKey::size_` **no se ponía a cero**: la clave
+crecía 76 bytes por lookup (9 lookups por draw en una pasada G-buffer) y a partir del
+cuarto lookup **escribía fuera del búfer de 256 bytes**, encima de los miembros del
+`Rasterizer` (`cb_descs[cb].first`, el id de la imagen). El memo contestaba con el id de
+**otro** target y `PrepareRenderState` acababa en
+`texture_cache.GetImage(image_id)` con un id corrupto → lectura fuera de rango →
+puntero inválido.
+
+**Arreglo**: `TargetKey::Reset()` al empezar cada clave (en `FindTargetMemoized`), un
+`assert` de que la clave cabe en el búfer, y un test de regresión que recorre la secuencia
+de una pasada G-buffer (9 targets × 8 frames) comprobando que la clave es siempre la del
+target pedido, que el búfer no se sale (un canario detrás) y que el id que devuelve el memo
+es siempre el mismo y distinto del de los demás targets.
+
+Con el arreglo, el camino por defecto (Native AA, upscaler apagado) queda **idéntico** al
+anterior: `SceneTargets::SetSize` recibe el mismo tamaño que ya tenía, `Reduced()` sigue
+siendo falso y ningún draw se reduce (ni hay imagen proxy ni copia).
+
+### 4.1 El resto
+
 | Fichero | Cambio | Verificación |
 |---|---|---|
 | `renderer_vulkan/vk_temporal_upscaler.cpp` | El tamaño de la escena sigue al preset sin upscaler temporal; Native AA deja los objetivos reducidos apagados | `scene-preset-test` (tabla y tamaños) |
 | `renderer_vulkan/vk_rasterizer.cpp` | El inicio de frame no depende del movimiento de cámara | build |
 | `renderer_vulkan/scene_resolution.h` | Una sola tabla de divisores (`SceneResolution::PresetScale`); `ForPreset` la usa | `scene-preset-test` |
-| `renderer_vulkan/vk_target_memo.h` (nuevo) | La clave del memo se construye en un bucle reutilizado: sin `memset` de 256 bytes ni copia de 256 bytes por target y draw | `draw-profile-test`: 6,8 → 2,1 ns (70 %) |
+| `renderer_vulkan/vk_target_memo.h` (nuevo) | La clave del memo se construye en un bucle reutilizado: sin `memset` de 256 bytes ni copia de 256 bytes por target y draw | `draw-profile-test`: 10,5 → 1,5 ns (85 %) |
 | `renderer_vulkan/vk_draw_profile.h` (nuevo) | `TLG_DRAW_PROFILE=1`: coste por fase de un draw y del hilo de grabación de Vulkan | `draw-profile-test` (contadores) |
 | `amdgpu/liverpool.{h,cpp}` | `TLG_PM4_PROFILE=1`: coste del decode PM4 por clase de paquete, y las esperas summed | build |
 | `tests/test_draw_profile.cpp`, `tests/test_scene_preset.cpp` (nuevos) | Test del memo, del perfil y de los presets | en verde |

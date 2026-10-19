@@ -190,7 +190,10 @@ VideoCore::ImageId Rasterizer::FindTargetMemoized(VideoCore::TextureCache::Image
     static_assert((sizeof(Parts) + ...) <= 256, "target memo key too large");
     // tlg: the key is built in a buffer that is reused: only its bytes in use are read, so
     // it is never cleared (the old code zeroed and copied 256 bytes per target and draw).
+    // It must be reset: the buffer is shared by every lookup of the draw (nine in a
+    // G-buffer pass) and a key that kept growing would write past it.
     auto& key = target_key;
+    key.Reset();
     const auto append = [&](const auto& part) { key.Append(part); };
     (append(parts), ...);
     const u64 generation = texture_cache.RegistryGeneration();

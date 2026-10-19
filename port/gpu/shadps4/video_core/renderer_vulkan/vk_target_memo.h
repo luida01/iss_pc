@@ -9,10 +9,15 @@
 //
 // The hash is the same as the one of the zeroed buffer (the bytes past the key are zeros),
 // so the memo table keeps its distribution.
+//
+// tlg: the buffer is reused, so the key must be reset before it is built again: a key that
+// kept growing wrote past the buffer (into the rasterizer's members) and left a corrupted
+// image id behind, which crashed in PrepareRenderState.
 
 #pragma once
 
 #include <array>
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 
@@ -24,10 +29,18 @@ class TargetKey {
 public:
     static constexpr size_t Capacity = 256;
 
+    /// Starts a new key: the bytes of the previous one are forgotten.
+    void Reset() noexcept {
+        size_ = 0;
+    }
+
     /// Appends the bytes of `part` to the key.
     template <typename T>
     void Append(const T& part) {
         static_assert(sizeof(T) <= Capacity, "target key part too large");
+        // tlg: the key must fit: a caller that forgets Reset() would write past the buffer.
+        // (The renderer resets it, and the parts of a key are bounded by a static_assert.)
+        assert(size_ + sizeof(T) <= Capacity);
         std::memcpy(buffer_.data() + size_, &part, sizeof(part));
         size_ += sizeof(part);
     }

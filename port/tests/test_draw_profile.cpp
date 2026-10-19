@@ -63,7 +63,96 @@ struct OldKey {
     void CopyTo(std::array<u8, 256>& destination) const {
         destination = buffer; // the old code copied the whole array
     }
-};void TestHashMatchesTheOldOne() {
+};
+
+/// tlg: the key of the memo is built in a buffer that is reused for every lookup of the
+/// draw (nine in a G-buffer pass) and for every draw. A key that is not reset before it is
+/// built keeps the bytes of the previous one, grows past the buffer and writes over the
+/// members that follow it (the rasterizer's own members): the memo then answers with the
+/// image of another target and the renderer reads a pointer that is not valid.
+///
+/// This test walks the sequence of a frame (the targets of a G-buffer pass, draw after draw)
+/// and checks that the key is always the key of the target it was asked for.
+void TestKeyIsReusedSafely() {
+    struct {
+        TargetKey key;
+        std::array<u8, 64> canary;
+    } holder;
+    holder.canary.fill(0xCD);
+
+    // The targets of a G-buffer pass: eight color buffers and the depth.
+    std::vector<FakeTarget> targets(9);
+    for (u32 i = 0; i < targets.size(); ++i) {
+        targets[i].tag = i + 1;
+        for (u32 b = 0; b < targets[i].color_buffer.size(); ++b) {
+            targets[i].color_buffer[b] = static_cast<u8>(i * 31 + b);
+        }
+        targets[i].extent = {1920, 1080};
+    }
+
+    // The memo of the renderer, with the key handling of the renderer.
+    std::array<std::array<u8, 256>, 64> memo{};
+    std::array<u32, 64> memo_size{};
+    std::array<u64, 64> memo_hash{};
+    std::array<bool, 64> memo_used{};
+    std::array<u32, 64> memo_id{};
+    // The id the renderer gets for each target (it looks the image up on a miss).
+    std::array<u32, 9> ids{};
+
+    for (u32 frame = 0; frame < 8; ++frame) {
+        for (u32 t = 0; t < targets.size(); ++t) {
+            const auto& target = targets[t];
+            holder.key.Reset();
+            holder.key.Append(target.tag);
+            holder.key.Append(target.color_buffer);
+            holder.key.Append(target.extent);
+            // The key is the one of this target and nothing else.
+            assert(holder.key.size() == 4 + 64 + 8);
+            assert(std::memcmp(holder.key.data(), &target.tag, 4) == 0);
+            assert(std::memcmp(holder.key.data() + 4, target.color_buffer.data(), 64) == 0);
+            // The key did not write past its buffer.
+            for (const u8 byte : holder.canary) {
+                assert(byte == 0xCD);
+            }
+            // A fresh key of the same target hashes the same: the memo finds it again.
+            TargetKey fresh;
+            fresh.Reset();
+            fresh.Append(target.tag);
+            fresh.Append(target.color_buffer);
+            fresh.Append(target.extent);
+            assert(holder.key.Hash() == fresh.Hash());
+
+            const u64 hash = holder.key.Hash();
+            const auto slot = hash % memo.size();
+            u32 id = 0;
+            if (memo_used[slot] && memo_hash[slot] == hash && memo_size[slot] == holder.key.size() &&
+                std::memcmp(memo[slot].data(), holder.key.data(), holder.key.size()) == 0) {
+                id = memo_id[slot];
+            } else {
+                // A miss: the renderer looks the image up and the slot keeps its id.
+                id = 0x1000 + t;
+                holder.key.CopyTo(memo[slot].data());
+                memo_size[slot] = holder.key.size();
+                memo_hash[slot] = hash;
+                memo_id[slot] = id;
+                memo_used[slot] = true;
+            }
+            // The id of a target is always the same one: the renderer binds that image.
+            if (ids[t] == 0) {
+                ids[t] = id;
+            }
+            assert(ids[t] == id);
+        }
+        // Two different targets never share an id.
+        for (u32 a = 0; a < ids.size(); ++a) {
+            for (u32 b = a + 1; b < ids.size(); ++b) {
+                assert(ids[a] != ids[b]);
+            }
+        }
+    }
+}
+
+void TestHashMatchesTheOldOne() {
     FakeTarget target;
     for (u32 i = 0; i < target.color_buffer.size(); ++i) {
         target.color_buffer[i] = static_cast<u8>(i * 7 + 1);
@@ -73,6 +162,7 @@ struct OldKey {
     OldKey old;
     old.Build(target);
     TargetKey key;
+    key.Reset();
     key.Append(target.tag);
     key.Append(target.color_buffer);
     key.Append(target.extent);
@@ -91,6 +181,7 @@ void TestEqualsAndCopy() {
     b.extent = {1280, 720};
 
     TargetKey key;
+    key.Reset();
     key.Append(a.tag);
     key.Append(a.color_buffer);
     key.Append(a.extent);
@@ -100,6 +191,7 @@ void TestEqualsAndCopy() {
     assert(key.Equals(memo.data(), key.size()));
     // A different target with the same size is not equal.
     TargetKey other;
+    other.Reset();
     other.Append(b.tag);
     other.Append(b.color_buffer);
     other.Append(b.extent);
@@ -137,15 +229,20 @@ double Benchmark() {
     constexpr u32 Iterations = 500'000;
     constexpr u32 Turns = 4;
     FakeTarget target;
-    target.extent = {1920, 1080};
-    // The sinks keep the compiler from removing the work that is measured.
+    // The sinks keep the compiler from removing the work that is measured: the target
+    // changes every iteration (from a volatile seed), so nothing can be folded.
     volatile u64 sink = 0;
+    volatile u32 seed = 0;
 
     OldKey old;
     std::array<u8, 256> old_memo{};
     TargetKey key;
     std::array<u8, 256> memo{};
     old_memo.fill(0);
+    key.Reset();
+    key.Append(target.tag);
+    key.Append(target.color_buffer);
+    key.Append(target.extent);
     key.CopyTo(memo.data());
 
     double old_ns = 1e30;
@@ -154,9 +251,10 @@ double Benchmark() {
         {
             const auto start = std::chrono::steady_clock::now();
             for (u32 i = 0; i < Iterations; ++i) {
-                target.extent[0] = 1920 + (i & 1);
+                target.extent[0] = 1920 + (seed + i);
                 old.Build(target);
                 sink ^= (std::memcmp(old.buffer.data(), old_memo.data(), old.size) == 0);
+                sink ^= old.buffer[i & 255];
             }
             const auto end = std::chrono::steady_clock::now();
             const double ns =
@@ -166,11 +264,13 @@ double Benchmark() {
         {
             const auto start = std::chrono::steady_clock::now();
             for (u32 i = 0; i < Iterations; ++i) {
-                target.extent[0] = 1920 + (i & 1);
+                target.extent[0] = 1920 + (seed + i);
+                key.Reset(); // the renderer resets the key before every lookup
                 key.Append(target.tag);
                 key.Append(target.color_buffer);
                 key.Append(target.extent);
                 sink ^= key.Equals(memo.data(), memo.size());
+                sink ^= key.data()[i & 255];
             }
             const auto end = std::chrono::steady_clock::now();
             const double ns =
@@ -191,6 +291,7 @@ double Benchmark() {
 } // namespace
 
 int main() {
+    TestKeyIsReusedSafely();
     TestHashMatchesTheOldOne();
     TestEqualsAndCopy();
     TestProfileCounters();
