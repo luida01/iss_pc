@@ -328,7 +328,7 @@ lo tenga: con `SceneResolution::PresetScale` como única tabla, `PresetScale` so
 La pregunta era: *el hilo de grabación está ocupado el 85-89 % del tiempo, pero las fases de
 draw sólo cubren el 25 % del frame: ¿dónde se va el resto?*
 
-### 5.1 Lo que había (y ) era una cuenta falsa
+### 5.1 Lo que había (y no) era una cuenta falsa
 
 La línea `Draw pipe:` mezclaba tres cosas:
 
@@ -431,7 +431,35 @@ resuelto por `NotifyDrain`).
 giro: X debe bajar de ~2.500 ms por ventana de 5 s a menos de ~1.000 ms).
 
 
-### 5.4 La respuesta a la pregunta de GOW3
+### 5.6 Los binds redundantes: el estado del command buffer (2026-10-20)
+
+Vulkan mantiene los vertex buffers y el index buffer ligados hasta que se liga otra cosa:
+**ligar los mismos otra vez no cambia nada**, pero el driver registra la llamada igual (y el
+port registra una por draw). Con el desglose por tipo de comando (TLG_DRAW_PROFILE=1) se ve
+cuántas son.
+
+**El problema** (analizado antes): el estado de un command buffer sólo existe dentro de él, y
+**la vista al grabar y al ejecutar no coinciden**: el comando se graba en el hilo que
+graba y se ejecuta en el hilo de grabación de Vulkan.
+
+**La solución** (`vk_bind_state.h`): el estado se lleva **en el momento en que el comando se
+ejecuta**, que es el único momento en que se sabe en qué command buffer va a parar:
+
+* La comparación y la actualización del estado ocurren **dentro del comando** (el closure), no
+  al grabarlo: el closure corre en el hilo de grabación, en orden, y lo que hace es
+  exactamente lo que el driver haría.
+* Cada command buffer tiene una **generación**; un command buffer nuevo no tiene nada ligado
+  (la generación lo dice y el skip se rechaza).
+* Un comando grabado **fuera** del hilo de grabación (el modo directo: las copias y las
+  lecturas de vuelta) **invalida** el estado: no se sabe qué cambió → no se salta nada.
+
+**La prueba** (`tests/test_bind_state.cpp`, target `bind-state-test`): el mismo estado se
+puede saltar; un offset, un tamaño, un stride, otro buffer o otro número de buffers, no; un
+command buffer nuevo, no; un estado invalidado, no; y la ruta con vertex input dinámico (que
+no liga tamaños ni strides) no se confunde con la otra.
+
+
+### 5.7 La respuesta a la pregunta de GOW3
 
 Se compararon las dos ramas (gow3-lab `main` @ 41e9473 contra el nuestro) en el camino
 caliente:

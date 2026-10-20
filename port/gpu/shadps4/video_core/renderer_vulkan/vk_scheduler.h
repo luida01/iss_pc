@@ -23,6 +23,7 @@
 #include "common/interval_set.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
+#include "video_core/renderer_vulkan/vk_bind_state.h"
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
@@ -760,6 +761,10 @@ public:
     void Record(Func&& func) {
         CheckOwner(__builtin_return_address(0));
         if (!recording_threaded || direct_mode) {
+            // tlg: a command recorded here (not by the recording thread) may change the
+            // bindings of the command buffer, which the recording thread does not see: the
+            // state is not known any more.
+            bind_state.Invalidate();
             func(current_cmdbuf);
             return;
         }
@@ -832,6 +837,58 @@ public:
     /// Hands recorded commands to the recording thread. Called at points where no caller holds
     /// the raw command buffer (end of draws and dispatches); small batches are kept.
     void KickRecording(bool force = false);
+
+    /// tlg: the state of the command buffer being recorded (the vertex buffers and the index
+    /// buffer): a repeated bind changes nothing in Vulkan, so it can be left out (the driver
+    /// records it anyway). Only the commands of the recording thread touch it: they run there,
+    /// in order, so it always describes the command buffer they go into.
+    /// The generation tells the command buffers apart (a new one has nothing bound).
+    [[nodiscard]] u64 CommandBufferGeneration() const noexcept {
+        return command_buffer_generation.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] BindState& GetBindState() noexcept {
+        return bind_state;
+    }
+    /// The raw value of a Vulkan handle (the state compares the handles by value).
+    [[nodiscard]] static u64 RawHandle(vk::Buffer handle) {
+        return static_cast<u64>(reinterpret_cast<uintptr_t>(static_cast<VkBuffer>(handle)));
+    }
+    /// True when the command buffer already has these vertex buffers bound (the bind would
+    /// change nothing). Only the recording thread asks (it is the one that runs the commands
+    /// in order).
+    [[nodiscard]] bool CanSkipVertexBind(u32 count, const vk::Buffer* handles,
+                                         const vk::DeviceSize* offsets,
+                                         const vk::DeviceSize* sizes,
+                                         const vk::DeviceSize* strides, bool with_sizes) const {
+        std::array<u64, BindState::MaxBuffers> raw{};
+        for (u32 i = 0; i < count; ++i) {
+            raw[i] = RawHandle(handles[i]);
+        }
+        return bind_state.HasVertexBuffers(command_buffer_generation.load(std::memory_order_acquire),
+                                           count, raw.data(), offsets, sizes, strides,
+                                           with_sizes);
+    }
+    /// Records the vertex buffers the command buffer has bound.
+    void NoteVertexBind(u32 count, const vk::Buffer* handles, const vk::DeviceSize* offsets,
+                         const vk::DeviceSize* sizes, const vk::DeviceSize* strides,
+                         bool with_sizes) {
+        std::array<u64, BindState::MaxBuffers> raw{};
+        for (u32 i = 0; i < count; ++i) {
+            raw[i] = RawHandle(handles[i]);
+        }
+        bind_state.SetVertexBuffers(command_buffer_generation.load(std::memory_order_acquire),
+                                    count, raw.data(), offsets, sizes, strides, with_sizes);
+    }
+    /// True when the command buffer already has this index buffer bound.
+    [[nodiscard]] bool CanSkipIndexBind(u64 handle, u64 offset, u32 type) const {
+        return bind_state.HasIndexBuffer(command_buffer_generation.load(std::memory_order_acquire),
+                                         handle, offset, type);
+    }
+    /// Records the index buffer the command buffer has bound.
+    void NoteIndexBind(u64 handle, u64 offset, u32 type) {
+        bind_state.SetIndexBuffer(command_buffer_generation.load(std::memory_order_acquire), handle,
+                                  offset, type);
+    }
 
     /// Waits until every recorded command is in the command buffer.
     void SyncRecording();
@@ -1005,6 +1062,9 @@ private:
     bool recorder_busy = false;
     std::atomic<size_t> queued_chunks{0}; ///< recorder_queue.size() for lock-free polling
     bool recorder_sleeping = false; ///< waiting on recorder_cv (guarded by recorder_mutex)
+    /// tlg: the command buffer being recorded (the generation) and its binding state.
+    std::atomic<u64> command_buffer_generation{1};
+    BindState bind_state;
     std::atomic<u32> work_since_submit{0}; ///< tlg: CountWork(), reset by each submission
     bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
     u64 host_copies_issued = 0;

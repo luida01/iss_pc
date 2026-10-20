@@ -602,6 +602,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     work_semaphore.Refresh();
+    // tlg: a new command buffer has nothing bound: the binding state does not describe it.
+    // The generation goes up before the buffer is created, so a command that is recorded
+    // while the two happen believes the state is empty (it binds again): the safe way.
+    command_buffer_generation.fetch_add(1, std::memory_order_release);
     AllocateWorkerCommandBuffers();
     if (split) {
         // tlg: pending ops have their own lock, and one may submit again.

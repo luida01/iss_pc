@@ -539,6 +539,10 @@ if (WIN32)
 endif()
 target_compile_options(draw-pipe-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_link_libraries(draw-pipe-test PRIVATE tlggpu)
+# tlg: the binding state of the command buffer (when a repeated bind can be left out).
+add_executable(bind-state-test EXCLUDE_FROM_ALL ../tests/test_bind_state.cpp)
+target_include_directories(bind-state-test PRIVATE shadps4)
+target_compile_options(bind-state-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 add_executable(graphics-settings-test EXCLUDE_FROM_ALL ../tests/test_graphics_settings.cpp
     shim/tlg_settings.cpp)
 target_include_directories(graphics-settings-test PRIVATE shim)

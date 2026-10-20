@@ -2404,16 +2404,38 @@ void Rasterizer::EmitVertexBuffers() {
     const auto offsets = scheduler.RecordData(std::span<const vk::DeviceSize>{v.host_offsets.data(), num_buffers});
     DrawProfile::AddCommand(DrawProfile::VkCommand::VertexBuffers);
     if (dynamic_input) {
-        scheduler.Record([num_buffers, buffers, offsets](vk::CommandBuffer cmdbuf) {
+        // tlg: with the dynamic vertex input the sizes and the strides are part of the
+        // vertex input state, not of the bind: the state compares them as zero.
+        const std::array<vk::DeviceSize, 32> no_sizes{};
+        const std::array<vk::DeviceSize, 32> no_strides{};
+        scheduler.Record([num_buffers, buffers, offsets, no_sizes, no_strides,
+                          this](vk::CommandBuffer cmdbuf) {
+            if (scheduler.CanSkipVertexBind(num_buffers, buffers.data(), offsets.data(),
+                                            no_sizes.data(), no_strides.data(), false)) {
+                return;
+            }
             cmdbuf.bindVertexBuffers(0, num_buffers, buffers.data(), offsets.data());
+            scheduler.NoteVertexBind(num_buffers, buffers.data(), offsets.data(), no_sizes.data(),
+                                     no_strides.data(), false);
         });
         return;
     }
     const auto sizes = scheduler.RecordData(std::span<const vk::DeviceSize>{v.host_sizes.data(), num_buffers});
     const auto strides = scheduler.RecordData(std::span<const vk::DeviceSize>{v.host_strides.data(), num_buffers});
-    scheduler.Record([num_buffers, buffers, offsets, sizes, strides](vk::CommandBuffer cmdbuf) {
+    // tlg: the vertex buffers rarely change from one draw to the next, and binding the same
+    // ones again changes nothing in the command buffer: the call can be left out. The state
+    // is the one of the command buffer (vk_bind_state.h) and the test proves when the bind
+    // is redundant (tests/test_bind_state.cpp). The check is where the command runs: that is
+    // the only moment the state of the command buffer is known.
+    scheduler.Record([num_buffers, buffers, offsets, sizes, strides, this](vk::CommandBuffer cmdbuf) {
+        if (scheduler.CanSkipVertexBind(num_buffers, buffers.data(), offsets.data(), sizes.data(),
+                                        strides.data(), true)) {
+            return;
+        }
         cmdbuf.bindVertexBuffers2(0, num_buffers, buffers.data(), offsets.data(), sizes.data(),
                                   strides.data());
+        scheduler.NoteVertexBind(num_buffers, buffers.data(), offsets.data(), sizes.data(),
+                                 strides.data(), true);
     });
 }
 
@@ -2562,9 +2584,17 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 
 void Rasterizer::EmitIndexBuffer() {
     DrawProfile::AddCommand(DrawProfile::VkCommand::Index);
+    // tlg: the same index buffer in the next draw: the bind changes nothing (as with the
+    // vertex buffers, vk_bind_state.h). The check is where the command runs.
     scheduler.Record([handle = index_bind.handle, offset = index_bind.offset,
-                      type = index_bind.type](vk::CommandBuffer cmdbuf) {
+                      type = index_bind.type, this](vk::CommandBuffer cmdbuf) {
+        const u64 raw = Scheduler::RawHandle(handle);
+        const u32 index_type = static_cast<u32>(type);
+        if (scheduler.CanSkipIndexBind(raw, offset, index_type)) {
+            return;
+        }
         cmdbuf.bindIndexBuffer(handle, offset, type);
+        scheduler.NoteIndexBind(raw, offset, index_type);
     });
 }
 
