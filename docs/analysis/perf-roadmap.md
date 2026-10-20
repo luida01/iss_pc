@@ -1,5 +1,11 @@
 # Hoja de ruta de rendimiento — llegar a 60 FPS jugables en 4 GB
 
+> **Resumen de la jornada y estado actualizado:** `docs/analysis/summary-2026-10-19.md`.
+> **La RE con `gow3_pc` está hecha:** en el camino caliente no hay diferencia de comportamiento
+> (mismo código); la diferencia es su **configuración** (FSR 3.1 + preset Quality = 44 % de los
+> píxeles) y la escena. Nuestro port hace 10-13 FPS donde el runtime de referencia (upstream)
+> colapsa a 0,6-3,9 FPS.
+
 > **Fecha:** 2026-10-19 · **Objetivo:** que inFAMOUS Second Son sea jugable en la RTX 3050 Laptop de
 > 4 GB: 60 FPS estables en zonas normales, ≥30 FPS en las pesadas, sin congelaciones y sin perder detalle.
 > **Regla del proyecto:** un cambio cuenta como mejora solo con 3 repeticiones de la misma escena
