@@ -314,6 +314,8 @@ siendo falso y ningún draw se reduce (ni hay imagen proxy ni copia).
 | `renderer_vulkan/vk_target_memo.h` (nuevo) | La clave del memo se construye en un bucle reutilizado: sin `memset` de 256 bytes ni copia de 256 bytes por target y draw | `draw-profile-test`: 10,5 → 1,5 ns (85 %) |
 | `renderer_vulkan/vk_access_memo.h` (nuevo) + `vk_runtime.{h,cpp}` | El memo de las consultas al tracker de barreras: la misma pregunta en cada draw que liga el buffer, respondida sin recorrer el árbol | `access-memo-test`: 7,9 → 2,3 ns (71 %) |
 | `renderer_vulkan/vk_draw_profile.h` (nuevo) | `TLG_DRAW_PROFILE=1`: coste por fase de un draw, del hilo de grabación de Vulkan **y el número de comandos Vulkan por tipo** | `draw-profile-test` (contadores) |
+| `renderer_vulkan/vk_bind_state.h` (nuevo) + `vk_scheduler.{h,cpp}` + `vk_rasterizer.cpp` | Los binds redundantes (vertex buffers, index buffer) se omiten: el estado del command buffer se compara **cuando el comando se ejecuta** | `bind-state-test` (la prueba de cuándo un bind es redundante) |
+| `renderer_vulkan/vk_draw_pipe.h` | El hilo que graba duerme en vez de girar: el giro se adapta al productor (si la última espera fue corta, gira; si no, duerme) y el drain gira 512 pausas en vez de 4096 | `draw-pipe-test` (el equilibrio CPU/latencia) |
 | `amdgpu/liverpool.{h,cpp}` | `TLG_PM4_PROFILE=1`: coste del decode PM4 por clase de paquete, y las esperas summed | build |
 | `tests/test_draw_profile.cpp`, `tests/test_scene_preset.cpp`, `tests/test_access_memo.cpp` (nuevos) | Test del memo, del perfil, de los presets y del memo de barreras | en verde |
 
