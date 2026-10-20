@@ -20,6 +20,7 @@
 #include "shader_recompiler/params.h"
 #include "shader_recompiler/resource.h"
 #include "shader_recompiler/runtime_info.h"
+#include "shader_recompiler/srt_profile.h"
 
 namespace Serialization {
 struct Archive;
@@ -256,7 +257,22 @@ struct Info : InfoPersistent {
             }
         }
         if (srt_info.walker_func) {
+            // tlg: the walk is the copy of the resource table out of the guest's memory.
+            // It is the verification of the data the draw preparation workers prepared
+            // (the PM4 decode pays it for every stage of every draw), so the profile
+            // measures it (TLG_SRT_PROFILE=1).
+            const bool profile = SrtProfile::Enabled();
+            const u64 start = profile ? SrtProfile::Now() : 0;
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+            if (profile) {
+                const u32 entries = srt_info.flattened_bufsize_dw > NUM_USER_DATA_REGS
+                                        ? srt_info.flattened_bufsize_dw - NUM_USER_DATA_REGS
+                                        : 0;
+                SrtProfile::Add(entries, SrtProfile::Now() - start);
+                SrtProfile::Report();
+            }
+        } else if (SrtProfile::Enabled()) {
+            SrtProfile::AddSkipped();
         }
     }
 
