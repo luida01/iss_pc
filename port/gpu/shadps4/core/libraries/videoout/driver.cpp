@@ -48,6 +48,9 @@ extern std::atomic<u64> g_tlg_snapshot_ns, g_tlg_guest_wait_ns;
 extern std::atomic<u32> g_tlg_pending_draws;
 extern std::atomic<u64> g_tlg_frames_ahead_wait_ns, g_tlg_free_frame_wait_ns;
 extern std::atomic<u64> g_tlg_present_lock_wait_ns;
+extern std::atomic<u64> g_tlg_present_ns, g_tlg_acquire_wait_ns;
+extern std::atomic<u64> g_tlg_gpu_presents;
+extern std::atomic<u64> g_tlg_take_to_present_ns;
 extern std::atomic<int> g_tlg_recorder_cpu_clock;
 extern std::atomic<u32> g_tlg_recorder_cpu_tid;
 extern std::atomic<u64> g_tlg_recorder_spin_ns;
@@ -61,6 +64,13 @@ namespace {
 std::atomic<u64> flip_request_ns{0};
 std::atomic<u64> flip_queue_wait_ns{0};
 std::atomic<u64> flip_queue_samples{0};
+
+/// tlg: the present chain, from the guest's flip call to the present in the display engine:
+/// the hop to the GPU command thread, the preparation of the frame there (the FSR and the
+/// post process passes), the wait for the present thread and the swap queue.
+std::atomic<u64> chain_cmd_hop_ns{0};
+std::atomic<u64> chain_prepare_ns{0};
+std::atomic<u64> chain_swap_wait_ns{0};
 
 u64 NowNs() {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -166,7 +176,7 @@ void VideoOutDriver::RunPresenter(std::function<void()> work, bool if_idle) {
         if (if_idle && (swap_busy || !swap_queue.empty())) {
             return; // a redraw of the last frame is pointless while frames are queued
         }
-        swap_queue.push_back(std::move(work));
+        swap_queue.push_back({.work = std::move(work), .queued_ns = NowNs()});
     }
     swap_cv.notify_one();
 }
@@ -174,7 +184,7 @@ void VideoOutDriver::RunPresenter(std::function<void()> work, bool if_idle) {
 void VideoOutDriver::SwapThread(std::stop_token token) {
     Common::SetCurrentThreadName("tlg:Present");
     while (true) {
-        std::function<void()> work;
+        SwapWork work;
         {
             std::unique_lock lock{swap_mutex};
             swap_busy = false;
@@ -185,7 +195,12 @@ void VideoOutDriver::SwapThread(std::stop_token token) {
             swap_queue.pop_front();
             swap_busy = true;
         }
-        work();
+        // tlg: the present chain: how long the present waited in the swap queue (the frame
+        // was ready before the present thread handed it over).
+        if (work.queued_ns != 0) {
+            chain_swap_wait_ns.fetch_add(NowNs() - work.queued_ns, std::memory_order_relaxed);
+        }
+        work.work();
     }
 }
 
@@ -375,9 +390,12 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
     return 0;
 }
 
-void VideoOutDriver::Flip(const Request& req) {
+void VideoOutDriver::PresentFrame(const Request& req) {
     // Update HDR status before presenting, then present the frame (tlg: on the swap thread).
     TlgFreeze::flips_shown.fetch_add(1, std::memory_order_relaxed);
+    // tlg: the present chain: the moment the present thread took the flip. The presenter
+    // measures the rest of the chain (the swap queue, the acquire and the submit).
+    presenter->SetFrameFlipTakeNs(req.frame, NowNs());
     RunPresenter([this, frame = req.frame, hdr = req.port->is_hdr] {
         presenter->SetHDR(hdr);
         presenter->Present(frame);
@@ -651,6 +669,47 @@ void VideoOutDriver::Flip(const Request& req) {
                         Vulkan::g_tlg_recorder_spin_ns.exchange(0) / 1e6);
             last_drawrec_cpu = drawrec_cpu;
             last_vkrec_cpu = vkrec_cpu;
+            // tlg: the present chain, from the guest's flip call to the frame in the display
+            // engine (per flip). The vblank that shows it is not in here: the display's
+            // vblank is not the port's tick, and the frame waits for it in the display
+            // engine.
+            const double cmd_hop_ms = chain_cmd_hop_ns.exchange(0) / 1e6;
+            const double prepare_ms = chain_prepare_ns.exchange(0) / 1e6;
+            const double swap_wait_ms = chain_swap_wait_ns.exchange(0) / 1e6;
+            const double take_present_ms = Vulkan::g_tlg_take_to_present_ns.exchange(0) / 1e6;
+            const double present_ms = Vulkan::g_tlg_present_ns.exchange(0) / 1e6;
+            const double acquire_ms = Vulkan::g_tlg_acquire_wait_ns.exchange(0) / 1e6;
+            const u64 gpu_presents = Vulkan::g_tlg_gpu_presents.exchange(0);
+            static u64 last_flips_submitted = 0, last_flips_shown = 0, last_presents = 0;
+            const u64 flips_submitted = TlgFreeze::flips_submitted.load();
+            const u64 flips_shown = TlgFreeze::flips_shown.load();
+            const u64 presents = TlgFreeze::presents.load();
+            const u64 window_flips = flips_submitted - last_flips_submitted;
+            const u64 window_shown = flips_shown - last_flips_shown;
+            const u64 window_presents = presents - last_presents;
+            last_flips_submitted = flips_submitted;
+            last_flips_shown = flips_shown;
+            last_presents = presents;
+            const auto per_flip = [&](double total_ms) {
+                return window_flips ? total_ms / double(window_flips) : 0.0;
+            };
+            const double hop = per_flip(cmd_hop_ms);
+            const double prep = per_flip(prepare_ms);
+            const double swap = per_flip(swap_wait_ms);
+            const double take_present = per_flip(take_present_ms);
+            const double present_total = per_flip(present_ms);
+            const double acquire = per_flip(acquire_ms);
+            const double fence = per_flip(free_frame_ms);
+            std::printf("Present chain: guest->cmd %.2f ms, prepare %.2f ms, queue %.2f ms, "
+                        "take->present %.2f ms (swap %.2f ms, present %.2f ms, acquire %.2f ms, "
+                        "fence %.2f ms); total %.2f ms; %llu flips, %llu shown, %llu presented, "
+                        "%llu on the gpu\n",
+                        hop, prep, flip_queue_ms, take_present, swap, present_total, acquire,
+                        fence, hop + prep + flip_queue_ms + take_present,
+                        static_cast<unsigned long long>(window_flips),
+                        static_cast<unsigned long long>(window_shown),
+                        static_cast<unsigned long long>(window_presents),
+                        static_cast<unsigned long long>(gpu_presents));
             intervals.clear();
             window_start = now;
             frames = 0;
@@ -659,7 +718,9 @@ void VideoOutDriver::Flip(const Request& req) {
             std::fill(std::begin(last_wait) + 1, std::begin(last_wait) + 6, 0);
         }
     }
+}
 
+void VideoOutDriver::FireFlipEvent(const Request& req) {
     // Update flip status.
     auto* port = req.port;
     {
@@ -715,6 +776,8 @@ void VideoOutDriver::DrawLastFrame() {
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
+    // tlg: the present chain starts here: the guest's flip call.
+    const u64 flip_ns = NowNs();
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
@@ -732,15 +795,23 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+        liverpool->SendCommand(
+            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, flip_ns); });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop);
+        SubmitFlipInternal(port, index, flip_arg, is_eop, flip_ns);
     }
 
     return true;
 }
 
-void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
+                                         u64 flip_ns /*= 0*/) {
+    // tlg: the present chain: the moment the GPU command thread took the flip (the hop from
+    // the guest's thread through the command queue).
+    const u64 cmd_ns = NowNs();
+    if (flip_ns != 0) {
+        chain_cmd_hop_ns.fetch_add(cmd_ns - flip_ns, std::memory_order_relaxed);
+    }
     // tlg: frame boundaries of TLG_FRAME_RECORD_TRIGGER, in stream order on the GPU thread.
     Vulkan::FrameRecord::OnFlip(index >= 0 ? port->buffer_slots[index].address_left : 0,
                                 std::this_thread::get_id() ==
@@ -754,6 +825,12 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
+    // tlg: the present chain: the frame is ready (the FSR and the post process passes are
+    // recorded and sent to the GPU) and the request waits for the present thread.
+    const u64 queued_ns = NowNs();
+    if (flip_ns != 0) {
+        chain_prepare_ns.fetch_add(queued_ns - cmd_ns, std::memory_order_relaxed);
+    }
 
     {
         std::scoped_lock lock{mutex};
@@ -763,6 +840,9 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
             .flip_arg = flip_arg,
             .index = index,
             .eop = is_eop,
+            .flip_ns = flip_ns,
+            .cmd_ns = cmd_ns,
+            .queued_ns = queued_ns,
         });
         if (requests.size() == 1) {
             // tlg: flip latency starts here (frame stats).
@@ -798,21 +878,34 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     std::printf("VideoOut: vblank %u Hz, frame limit %u FPS\n",
                 EmulatorSettings.GetVblankFrequency(), frame_limit);
 
-    const auto receive_request = [this] -> Request {
-        std::scoped_lock lk{mutex};
-        if (!requests.empty()) {
-            const auto request = requests.front();
-            if (requests.size() == 1) {
-                // tlg: how long the flip waited for its presentation slot (frame stats).
-                const u64 queued = flip_request_ns.load(std::memory_order_relaxed);
-                flip_queue_wait_ns.fetch_add(NowNs() - queued, std::memory_order_relaxed);
-                flip_queue_samples.fetch_add(1, std::memory_order_relaxed);
-            }
-            requests.pop();
-            return request;
+    // tlg: takes the request at the head of the queue (the caller holds the mutex) and
+    // accounts how long the flip waited for its presentation slot.
+    const auto take_request = [this]() -> Request {
+        const auto request = requests.front();
+        if (requests.size() == 1) {
+            // tlg: how long the flip waited for its presentation slot (frame stats).
+            const u64 queued = flip_request_ns.load(std::memory_order_relaxed);
+            flip_queue_wait_ns.fetch_add(NowNs() - queued, std::memory_order_relaxed);
+            flip_queue_samples.fetch_add(1, std::memory_order_relaxed);
         }
-        return {};
+        requests.pop();
+        return request;
     };
+
+    const auto receive_request = [this, &take_request]() -> Request {
+        std::scoped_lock lk{mutex};
+        if (requests.empty()) {
+            return {};
+        }
+        return take_request();
+    };
+
+    // tlg: the frames whose present already went to the GPU and whose flip event is still
+    // pending: the event fires at the vblank tick, the way a display latches the frame at
+    // its vblank. The present itself goes to the GPU as soon as the frame is ready, so the
+    // frame reaches the display engine before the vblank that shows it (one vblank less of
+    // latency than taking the request at the tick).
+    std::deque<Request> pending_flips;
 
     // tlg: with a frame limit (uncapped presets) a queued flip is presented as soon as it
     // arrives and its slot allows, between vblanks, instead of on the next vblank tick.
@@ -839,22 +932,61 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         auto& vblank_status = main_port.vblank_status;
         const auto now = std::chrono::steady_clock::now();
         const bool flip_slot = !frame_limit || now >= next_flip;
+        // tlg: the early present: with no frame limit and no flip rate the guest is paced by
+        // the vblank, so the request is taken as soon as it arrives (the present goes to the
+        // display engine right away) and the flip event fires at the vblank tick, as before.
+        // With a frame limit or a flip rate the request is taken at the tick: the limit and
+        // the rate pace the guest through the flip event.
+        const bool early = !frame_limit && main_port.flip_rate == 0;
         if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
-            const auto request = receive_request();
-            if (request && frame_limit) {
-                next_flip = std::max(next_flip + frame_period, now - frame_period);
-            }
-            if (!request) {
-                if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
-                    if (!main_port.is_open) {
-                        DrawBlankFrame();
-                    } else if (ImGui::Core::MustKeepDrawing()) {
-                        DrawLastFrame();
+            if (early) {
+                if (!pending_flips.empty()) {
+                    // tlg: the flip event of the frame presented since the last tick.
+                    const auto request = pending_flips.front();
+                    pending_flips.pop_front();
+                    FireFlipEvent(request);
+                } else {
+                    // tlg: nothing pending: a request that is already waiting is taken and
+                    // presented now (its flip event fires with it, as before).
+                    Request request{};
+                    bool have_request = false;
+                    {
+                        std::unique_lock lk{mutex};
+                        if (!requests.empty()) {
+                            request = take_request();
+                            have_request = true;
+                        }
+                    }
+                    if (have_request) {
+                        PresentFrame(request);
+                        FireFlipEvent(request);
+                        FRAME_END;
+                    } else if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
+                        if (!main_port.is_open) {
+                            DrawBlankFrame();
+                        } else if (ImGui::Core::MustKeepDrawing()) {
+                            DrawLastFrame();
+                        }
                     }
                 }
             } else {
-                Flip(request);
-                FRAME_END;
+                const auto request = receive_request();
+                if (request && frame_limit) {
+                    next_flip = std::max(next_flip + frame_period, now - frame_period);
+                }
+                if (!request) {
+                    if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
+                        if (!main_port.is_open) {
+                            DrawBlankFrame();
+                        } else if (ImGui::Core::MustKeepDrawing()) {
+                            DrawLastFrame();
+                        }
+                    }
+                } else {
+                    PresentFrame(request);
+                    FireFlipEvent(request);
+                    FRAME_END;
+                }
             }
         }
 
@@ -883,6 +1015,31 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             main_port.vblank_cv.notify_all();
         }
 
+        if (early) {
+            // tlg: the early present: wait for the next request until the next vblank and
+            // take it the moment it arrives, so the frame is in the display engine before
+            // the vblank that shows it. The flip event still fires at the vblank tick.
+            while (!token.stop_requested()) {
+                Request request{};
+                {
+                    std::unique_lock lk{mutex};
+                    if (!request_cv.wait_until(lk, tick_deadline, [&] { return !requests.empty(); })) {
+                        break; // next vblank
+                    }
+                    if (requests.empty()) {
+                        continue;
+                    }
+                    request = take_request();
+                }
+                PresentFrame(request);
+                pending_flips.push_back(request);
+                FRAME_END;
+            }
+            std::this_thread::sleep_until(tick_deadline);
+            timer.End();
+            continue;
+        }
+
         if (!immediate_flips || main_port.flip_rate != 0) {
             timer.End();
             continue;
@@ -905,7 +1062,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             const auto request = receive_request();
             if (request) {
                 next_flip = std::max(next_flip + frame_period, now - frame_period);
-                Flip(request);
+                PresentFrame(request);
+                FireFlipEvent(request);
                 FRAME_END;
             }
         }

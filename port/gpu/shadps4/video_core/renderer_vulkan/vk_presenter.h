@@ -35,6 +35,11 @@ struct Frame {
     vk::Fence present_done;
     vk::Semaphore ready_semaphore;
     u64 ready_tick;
+    /// tlg: the present chain: when the present thread took the flip of this frame and when
+    /// the present went to the display engine (the device counts it when the frame comes
+    /// back, at the fence of the present).
+    u64 flip_take_ns{0};
+    u64 present_ns{0};
     bool is_hdr{false};
     u8 id{};
 
@@ -102,6 +107,13 @@ public:
     /// tlg: a black frame with the loading screen (TlgOverlay::SetLoading) only.
     void PresentLoadingFrame();
     Frame* PrepareLastFrame();
+
+    /// tlg: the present chain: the moment the present thread took the flip that produced
+    /// this frame. The presenter measures the rest of the chain (the acquire, the blit and
+    /// the submit to the display engine) from here.
+    void SetFrameFlipTakeNs(Frame* frame, u64 take_ns) {
+        frame->flip_take_ns = take_ns;
+    }
 
 private:
     Frame* GetRenderFrame();

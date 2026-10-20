@@ -102,16 +102,26 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        /// tlg: the present chain: the guest's flip call, the moment the GPU command thread
+        /// took it and the moment the request was queued for the present thread.
+        u64 flip_ns{0};
+        u64 cmd_ns{0};
+        u64 queued_ns{0};
 
         operator bool() const noexcept {
             return frame != nullptr;
         }
     };
 
-    void Flip(const Request& req);
+    /// tlg: hands the frame to the presenter (the present goes to the display engine now).
+    void PresentFrame(const Request& req);
+    /// tlg: the flip is over: the status of the port, the flip event for the guest and the
+    /// label of the buffer (the guest can reuse it).
+    void FireFlipEvent(const Request& req);
     void DrawBlankFrame(); // Video port out not open
     void DrawLastFrame();  // Used when there is no flip request
-    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
+    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false,
+                            u64 flip_ns = 0);
     void PresentThread(std::stop_token token);
     /// tlg: runs presenter work (acquire, blit, vkQueuePresent) off the vblank thread, in
     /// order. Acquire and present block while the GPU is the bottleneck (much longer on NVIDIA);
@@ -120,9 +130,16 @@ private:
     void SwapThread(std::stop_token token);
     void RunPresenter(std::function<void()> work, bool if_idle = false);
 
+    /// tlg: a present waiting for the swap thread: the work and when it was queued (the
+    /// present chain: the wait in the swap queue).
+    struct SwapWork {
+        std::function<void()> work;
+        u64 queued_ns{0};
+    };
+
     std::mutex swap_mutex;
     std::condition_variable_any swap_cv;
-    std::deque<std::function<void()>> swap_queue;
+    std::deque<SwapWork> swap_queue;
     bool swap_busy = false;
     bool separate_swap = true;
     std::jthread swap_thread; ///< before present_thread: destroyed after it

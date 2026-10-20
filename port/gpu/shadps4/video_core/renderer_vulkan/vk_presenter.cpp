@@ -54,6 +54,23 @@ std::atomic<u64> g_tlg_frames_ahead_wait_ns{0};
 std::atomic<u64> g_tlg_free_frame_wait_ns{0};
 /// tlg: the wait for the queue lock before presenting (other threads' submissions).
 std::atomic<u64> g_tlg_present_lock_wait_ns{0};
+/// tlg: the present path: the whole present (the swapchain acquire, the blit, the submit
+/// and the present to the display engine) and the part of it the acquire blocked for.
+std::atomic<u64> g_tlg_present_ns{0};
+std::atomic<u64> g_tlg_acquire_wait_ns{0};
+/// tlg: the device side of the present: the number of presents the device finished (the
+/// fence of the present signalled when the frame comes back).
+std::atomic<u64> g_tlg_gpu_presents{0};
+/// tlg: the present chain: the time from the present thread taking the flip to the present
+/// reaching the display engine (the swap queue, the acquire and the submit).
+std::atomic<u64> g_tlg_take_to_present_ns{0};
+
+/// tlg: the clock of the present chain (nanoseconds, same epoch everywhere).
+static u64 NowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
 
 /// tlg: takes the graphics queue lock for a present and counts the wait (TLG_FRAME_STATS).
 static std::unique_lock<std::mutex> LockQueueForPresent() {
@@ -741,6 +758,11 @@ void Presenter::PresentLoadingFrame() {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    // tlg: the present chain: the whole present is measured (the acquire, the blit, the
+    // submit and the present to the display engine) and the frame keeps the moment the
+    // present went to the display engine (the device counts it when the frame comes back).
+    const u64 present_start_ns = NowNs();
+
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -764,15 +786,20 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
+    // tlg: the acquire blocks until the display engine returns an image: it is the wait
+    // that says whether the display is the bottleneck (the chain, frame stats).
+    const auto acquire_start_ns = NowNs();
     if (!swapchain.AcquireNextImage()) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
             LOG_WARNING(Render_Vulkan, "Skipping frame!");
+            g_tlg_acquire_wait_ns.fetch_add(NowNs() - acquire_start_ns, std::memory_order_relaxed);
             free_frame();
             return;
         }
     }
+    g_tlg_acquire_wait_ns.fetch_add(NowNs() - acquire_start_ns, std::memory_order_relaxed);
 
     // Reset fence for queue submission. Do it here instead of GetRenderFrame() because we may
     // skip frame because of slow swapchain recreation. If a frame skip occurs, we skip signal
@@ -922,6 +949,17 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
+    // tlg: the present went to the display engine: the device counts it when the frame
+    // comes back (the fence of the present).
+    frame->present_ns = NowNs();
+    g_tlg_present_ns.fetch_add(frame->present_ns - present_start_ns, std::memory_order_relaxed);
+    if (frame->flip_take_ns != 0) {
+        // tlg: the chain from the present thread taking the flip to the display engine.
+        g_tlg_take_to_present_ns.fetch_add(frame->present_ns - frame->flip_take_ns,
+                                            std::memory_order_relaxed);
+        frame->flip_take_ns = 0;
+    }
+
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
@@ -974,6 +1012,14 @@ Frame* Presenter::GetRenderFrame() {
                              std::chrono::steady_clock::now() - fence_start)
                              .count()),
         std::memory_order_relaxed);
+
+    // tlg: the device side of the present: the frame comes back when the device finished
+    // the blit (the fence of the present). How long the fence took is in the free frame
+    // wait above; here the device is only counted (the chain, frame stats).
+    if (frame->present_ns != 0) {
+        g_tlg_gpu_presents.fetch_add(1, std::memory_order_relaxed);
+        frame->present_ns = 0;
+    }
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {
