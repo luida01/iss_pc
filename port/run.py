@@ -183,6 +183,13 @@ def main():
         # image readbacks fix its corrupted textures.
         env.setdefault('TLG_UPSCALER', 'none')
         env.setdefault('TLG_READBACK_LINEAR', '1')
+        # tlg: el upscaler pedido tiene que llegar al juego. El alias del probe copia
+        # ISS_* -> TLG_* solo si el nombre TLG_* no esta puesto, y aqui ya lo esta: sin esto,
+        # ISS_UPSCALER=fsr3 se quedaba en 'none' y el upscale temporal no se podia activar
+        # (el launcher y la matriz A/B lo piden). 'off' es 'none' en el shim.
+        requested = env.get('ISS_UPSCALER', '').strip().lower()
+        if requested and requested != 'off':
+            env['TLG_UPSCALER'] = requested
         if patched:
             # The patch notes give the direct memory and VBlank rate the selected patches need.
             names = selected_patches(profile[1], profile[2], env.get('TLG_PATCHES', ''), env.get('TLG_PATCHES_ONLY') == '1')
