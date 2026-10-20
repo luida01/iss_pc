@@ -1,4 +1,5 @@
 #include "tlg_perf_trace.h"
+#include "shader_recompiler/program_lookup.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -253,7 +254,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         info.hw.gs.mode = regs.vgt_gs_mode.mode;
         // tlg: RefreshGraphicsStages already skipped the draw when the copy shader has no
         // binary info yet; this only guards against it changing in between (no fatal stop).
-        const auto params_vc = AmdGpu::TryGetParams(regs.vs_program);
+        const auto params_vc = Shader::LookupParams(regs.vs_program);
         info.hw.gs.vs_copy = params_vc ? params_vc->code : std::span<const u32>{};
         info.hw.gs.vs_copy_hash = params_vc ? params_vc->hash : 0;
         DumpShader(info.hw.gs.vs_copy, info.hw.gs.vs_copy_hash, Shader::HwStage::Vertex, 0,
@@ -1323,7 +1324,7 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
         if (!pgm || !pgm->Address<u32*>()) {
             return nullptr;
         }
-        const auto found = AmdGpu::TryGetParams(*pgm);
+        const auto found = Shader::LookupParams(*pgm);
         if (!found || found->hash != stage.hash) {
             return nullptr;
         }
@@ -1936,11 +1937,11 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
             return false;
         }
 
-        const auto found = AmdGpu::TryGetParams(*pgm);
+        const auto found = Shader::LookupParams(*pgm);
         // tlg: a geometry stage also needs its VS copy shader (BuildRuntimeInfo reads it).
         const bool copy_missing = stage_in == HwStage::Geometry &&
                                   (!regs.vs_program.Address<u32*>() ||
-                                   !AmdGpu::TryGetParams(regs.vs_program));
+                                   !Shader::LookupParams(regs.vs_program));
         if (!found || copy_missing) {
             key.stage_hashes[stage_out_idx] = 0;
             sel.infos[stage_out_idx] = nullptr;
@@ -2074,7 +2075,7 @@ bool PipelineCache::RefreshComputeKey() {
 bool PipelineCache::RefreshComputeKey(PipelineSelection& selection, ComputePipelineKey& key) {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = selection.cs_regs ? *selection.cs_regs : liverpool->GetCsRegs();
-    const auto cs_found = AmdGpu::TryGetParams(cs_pgm);
+    const auto cs_found = Shader::LookupParams(cs_pgm);
     if (!cs_found) {
         selection.infos[0] = nullptr;
         return false;
