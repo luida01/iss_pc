@@ -40,6 +40,12 @@ enum class DrawPhase : u32 {
     Draw,            ///< the draw command itself
     Reset,           ///< the per-draw bookkeeping (the bindings are released)
     Submit,          ///< the submission of the work that piled up (a wait for the recorder)
+    Packet,          ///< the packet itself: the register blocks and the user data
+    Indirect,        ///< the indirect draws (they do not go through DrawRecord)
+    Special,         ///< the packets the filter handles (fast clears, resolves, copies)
+    Task,            ///< the in-order tasks (memory writes, fences, readbacks)
+    HostCopies,      ///< the wait for the host copies (the copy threads)
+    Signals,         ///< the wait for the deferred signals
     Count,
 };
 
@@ -124,10 +130,15 @@ public:
         }
         Scope(const Scope&) = delete;
         Scope& operator=(const Scope&) = delete;
-        ~Scope() {
+        /// Ends the phase here (the rest of the scope belongs to another phase).
+        void Stop() {
             if (enabled) {
                 Add(phase, __rdtsc() - start);
+                enabled = false;
             }
+        }
+        ~Scope() {
+            Stop();
         }
 
     private:
@@ -146,17 +157,25 @@ public:
         for (u32 i = 0; i < PhaseCount; ++i) {
             total += self.phases[i].cycles.load(std::memory_order_relaxed);
         }
+        // tlg: the phases of the draw recording thread are timed with its own clock, so
+        // their share among themselves is the exact one; the share of the window would mix
+        // the clock of this core with the wall clock of the window (they are not the same
+        // clock on a machine whose cores run at different frequencies).
         for (u32 i = 0; i < PhaseCount; ++i) {
             const u64 cycles = self.phases[i].cycles.exchange(0, std::memory_order_relaxed);
             const u64 calls = self.phases[i].calls.exchange(0, std::memory_order_relaxed);
             if (!cycles) {
                 continue;
             }
-            const double share = window_cycles ? 100.0 * double(cycles) / double(window_cycles) : 0.0;
-            std::printf("\n  %-12s %7.2f%% of the window, %8.0f cycles/call, %llu calls",
+            const double share = total ? 100.0 * double(cycles) / double(total) : 0.0;
+            std::printf("\n  %-12s %7.2f%% of the recording, %8.0f cycles/call, %llu calls",
                         PhaseName(static_cast<DrawPhase>(i)), share,
                         calls ? double(cycles) / double(calls) : 0.0,
                         static_cast<unsigned long long>(calls));
+        }
+        if (total) {
+            std::printf("\n  %-12s %7.2f%% of the recording, %8.0f cycles/draw", "draw total",
+                        100.0, draws ? double(total) / double(draws) : 0.0);
         }
         const u64 rec_cycles = self.recorder.cycles.exchange(0, std::memory_order_relaxed);
         const u64 rec_calls = self.recorder.calls.exchange(0, std::memory_order_relaxed);
@@ -194,11 +213,6 @@ public:
                 std::printf(" (per draw)");
             }
         }
-        if (total) {
-            std::printf("\n  %-12s %7.2f%% of the window, %8.0f cycles/draw", "draw total",
-                        window_cycles ? 100.0 * double(total) / double(window_cycles) : 0.0,
-                        draws ? double(total) / double(draws) : 0.0);
-        }
         std::printf("\n");
     }
 
@@ -222,6 +236,18 @@ public:
             return "reset";
         case DrawPhase::Submit:
             return "submit";
+        case DrawPhase::Packet:
+            return "packet";
+        case DrawPhase::Indirect:
+            return "indirect";
+        case DrawPhase::Special:
+            return "special";
+        case DrawPhase::Task:
+            return "task";
+        case DrawPhase::HostCopies:
+            return "host-copies";
+        case DrawPhase::Signals:
+            return "signals";
         default:
             return "other";
         }

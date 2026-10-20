@@ -524,6 +524,10 @@ add_executable(access-memo-test EXCLUDE_FROM_ALL ../tests/test_access_memo.cpp
     shadps4/video_core/renderer_vulkan/vk_barrier_tracker.cpp)
 target_include_directories(access-memo-test PRIVATE shadps4)
 target_compile_options(access-memo-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+# tlg: the rate of the clock the statistics use, on two cores at the same time.
+add_executable(tsc-rate-test EXCLUDE_FROM_ALL ../tests/test_tsc_rate.cpp)
+target_include_directories(tsc-rate-test PRIVATE shadps4)
+target_compile_options(tsc-rate-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 add_executable(graphics-settings-test EXCLUDE_FROM_ALL ../tests/test_graphics_settings.cpp
     shim/tlg_settings.cpp)
 target_include_directories(graphics-settings-test PRIVATE shim)

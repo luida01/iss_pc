@@ -212,7 +212,7 @@ void TestProfileCounters() {
     DrawProfile::Add(DrawPhase::Bind, 100);
     DrawProfile::Add(DrawPhase::Bind, 200);
     DrawProfile::Add(DrawPhase::State, 50);
-    DrawProfile::AddRecorder(400);
+    DrawProfile::AddRecorder(400, 8);
     // The report clears the counters (and prints them: the test output shows the numbers).
     DrawProfile::Report(1000, 0.001, 2);
     assert(DrawProfile::Phase(DrawPhase::Bind).cycles.load() == 0);

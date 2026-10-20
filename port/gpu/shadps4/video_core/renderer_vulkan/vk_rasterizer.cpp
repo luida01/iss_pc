@@ -481,9 +481,9 @@ void Rasterizer::DrainDrawPipe(u32 reason, u32 line, const char* function) {
         draw_pipe->Drain(reason);
         return;
     }
-    const u64 before = draw_pipe->drain_cycles;
+    const u64 before = draw_pipe->drain_ns;
     draw_pipe->Drain(reason);
-    if (const u64 waited = draw_pipe->drain_cycles - before) {
+    if (const u64 waited = draw_pipe->drain_ns - before) {
         drain_sites[function][line] += waited;
         // tlg: the PM4 decode profile counts the same wait (TLG_PM4_PROFILE=1): the drain
         // sites say which line waited, this says how much of the frame the waits are.
@@ -805,6 +805,9 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     auto& self = *static_cast<Rasterizer*>(context);
     if (*reinterpret_cast<const PacketKind*>(data) == PacketKind::Task) {
         const auto& task = *reinterpret_cast<const TaskPacket*>(data);
+        // tlg: the in-order tasks (the guest's memory writes, its fences, the readbacks)
+        // run here too: they were not in the profile and they are not the draws.
+        DrawProfile::Scope scope{DrawPhase::Task};
         task.task(self, data + sizeof(TaskPacket));
         return;
     }
@@ -813,6 +816,9 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     const auto* blocks = reinterpret_cast<const u16*>(in);
     in += AlignPacket(packet.num_blocks * sizeof(u16));
     auto& regs = self.pipe_regs;
+    // tlg: the packet itself: the register blocks it carries and the user data. It is not
+    // the draw, and it was not measured.
+    DrawProfile::Scope packet_scope{DrawPhase::Packet};
     if (packet.regs_reset) {
         regs.SetDefaults();
     }
@@ -903,11 +909,14 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         }
     }
     ASSERT(static_cast<u32>(in - data) == size);
+    // The packet is done: the draw (or the task) is what follows.
+    packet_scope.Stop();
     stage_regs = &regs;
     self.pipe_cb_extent = packet.cb_extent;
     self.pipe_db_extent = packet.db_extent;
     if (packet.kind == PacketKind::Special) {
         // A draw FilterDraw handles (fast clear elimination, resolve, depth copy, skip).
+        DrawProfile::Scope scope{DrawPhase::Special};
         FrameCapture::Poll();
         self.scheduler.PopPendingOperations();
         self.FilterDraw();
@@ -921,6 +930,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         }
         stage_cs = nullptr;
     } else if (indirect) {
+        DrawProfile::Scope scope{DrawPhase::Indirect};
         self.DrawIndirectRecord(static_cast<const GraphicsPipeline*>(packet.pipeline),
                                 packet.is_indexed, *indirect);
     } else {
@@ -944,8 +954,9 @@ void Rasterizer::PrintPipeStats() {
         return;
     }
     static auto window = std::chrono::steady_clock::now();
-    static u64 last_packets = 0, last_drains = 0, last_drain_cycles = 0, last_busy = 0;
-    static u64 last_ring_waits = 0, last_ring_cycles = 0, last_spin = 0, last_sleeps = 0;
+    static u64 last_packets = 0, last_drains = 0, last_drain_ns = 0, last_busy = 0;
+    static u64 last_ring_waits = 0, last_ring_ns = 0, last_spin = 0, last_sleeps = 0;
+    static u64 last_sleep = 0;
     static u64 last_tsc = __rdtsc();
     static u64 last_draws = 0;
     const auto now = std::chrono::steady_clock::now();
@@ -954,7 +965,10 @@ void Rasterizer::PrintPipeStats() {
         return;
     }
     const u64 tsc = __rdtsc();
-    const double cycles = double(tsc - last_tsc);
+    // tlg: the window in nanoseconds of the wall clock: the counters of the threads are
+    // wall times too, so the shares of the window are exact (the sleep of the recording
+    // thread was counted as spin before, and the shares did not add up).
+    const double cycles = seconds * 1e9;
     if (!stats) {
         // Only the profile: the pipe statistics are not wanted, but the window is.
         const u64 draws = TlgStats::draws.load();
@@ -964,23 +978,26 @@ void Rasterizer::PrintPipeStats() {
         last_tsc = tsc;
         return;
     }
-    const u64 busy = draw_pipe->busy_cycles.load(std::memory_order_relaxed);
-    const u64 spin = draw_pipe->spin_cycles.load(std::memory_order_relaxed);
+    const u64 busy = draw_pipe->busy_ns.load(std::memory_order_relaxed);
+    const u64 spin = draw_pipe->spin_ns.load(std::memory_order_relaxed);
+    const u64 sleep = draw_pipe->sleep_ns.load(std::memory_order_relaxed);
     const u64 sleeps = draw_pipe->sleeps.load(std::memory_order_relaxed);
     std::printf("Draw pipe: %.0f draws/s pipelined, %.0f drains/s that waited, stage A waited "
-                "%.1f%%, stage B busy %.1f%%, stage B idle-spin %.1f%% (%llu sleeps); %llu "
-                "ring-full waits, stage A waited %.1f%% for room\n",
+                "%.1f%%, stage B busy %.1f%%, stage B idle-spin %.1f%%, stage B asleep %.1f%% "
+                "(%llu sleeps); %llu ring-full waits, stage A waited %.1f%% for room\n",
                 (draw_pipe->packets - last_packets) / seconds,
                 (draw_pipe->drains - last_drains) / seconds,
-                100.0 * (draw_pipe->drain_cycles - last_drain_cycles) / cycles,
+                100.0 * (draw_pipe->drain_ns - last_drain_ns) / cycles,
                 100.0 * (busy - last_busy) / cycles,
                 100.0 * (spin - last_spin) / cycles,
+                100.0 * (sleep - last_sleep) / cycles,
                 static_cast<unsigned long long>(sleeps - last_sleeps),
                 static_cast<unsigned long long>(draw_pipe->ring_waits - last_ring_waits),
-                100.0 * (draw_pipe->ring_wait_cycles - last_ring_cycles) / cycles);
+                100.0 * (draw_pipe->ring_wait_ns - last_ring_ns) / cycles);
     last_ring_waits = draw_pipe->ring_waits;
-    last_ring_cycles = draw_pipe->ring_wait_cycles;
+    last_ring_ns = draw_pipe->ring_wait_ns;
     last_spin = spin;
+    last_sleep = sleep;
     last_sleeps = sleeps;
     std::printf("  drains by reason/s:");
     for (u32 r = 0; r < DrawPipe::NumReasons; ++r) {
@@ -1023,7 +1040,7 @@ void Rasterizer::PrintPipeStats() {
     last_tsc = tsc;
     last_packets = draw_pipe->packets;
     last_drains = draw_pipe->drains;
-    last_drain_cycles = draw_pipe->drain_cycles;
+    last_drain_ns = draw_pipe->drain_ns;
     last_busy = busy;
 }
 

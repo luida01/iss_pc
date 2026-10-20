@@ -112,7 +112,7 @@ public:
         ++drains;
         const u32 slot = reason < NumReasons ? reason : ReasonRasterizer;
         ++drains_by_reason[slot];
-        const u64 start = __rdtsc();
+        const auto start = std::chrono::steady_clock::now();
         for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head; ++spins) {
             if (spins < 4096) {
                 __builtin_ia32_pause();
@@ -123,8 +123,8 @@ public:
                 std::this_thread::yield();
             }
         }
-        const u64 waited = __rdtsc() - start;
-        drain_cycles += waited;
+        const u64 waited = NanosecondsSince(start);
+        drain_ns += waited;
         cycles_by_reason[slot] += waited;
     }
 
@@ -142,11 +142,15 @@ public:
 
     /// Statistics (stage A): packets, drains that had to wait, cycles waited, cycles stage B
     /// spent running packets, ring-full waits and their cycles.
-    u64 packets = 0, drains = 0, drain_cycles = 0, ring_waits = 0, ring_wait_cycles = 0;
-    std::atomic<u64> busy_cycles{0};
-    /// tlg: stage B spinning for a packet before it sleeps (counted on the recording thread,
-    /// read by the statistics; not part of busy_cycles, which is only the packet bodies).
-    std::atomic<u64> spin_cycles{0};
+    u64 packets = 0, drains = 0, drain_ns = 0, ring_waits = 0, ring_wait_ns = 0;
+    /// tlg: the time of the recording thread, in nanoseconds of the wall clock: the time it
+    /// spent running the packets (busy), spinning for the next one (spin) and sleeping
+    /// (sleep). The three add up to the time of the thread, so the shares are exact. (The
+    /// cycles of the processor clock were used before: the sleep was counted as spin and the
+    /// shares did not add up.)
+    std::atomic<u64> busy_ns{0};
+    std::atomic<u64> spin_ns{0};
+    std::atomic<u64> sleep_ns{0};
     std::atomic<u64> sleeps{0};
     /// tlg: the recording thread's CPU clock (Linux) / thread id (Windows), for the frame
     /// statistics (as TlgStats::gpu_thread_clock does for the command thread).
@@ -162,6 +166,13 @@ private:
 
     static constexpr u32 Align(u32 size) {
         return (size + 63) & ~63u;
+    }
+
+    /// The nanoseconds since a point of the wall clock.
+    static u64 NanosecondsSince(std::chrono::steady_clock::time_point start) {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - start)
+                                    .count());
     }
 
     /// tlg: a drain that outlived its spin sleeps on `consumed` instead of yielding. The yield
@@ -218,7 +229,7 @@ private:
                 std::this_thread::yield();
             }
         }
-        ring_wait_cycles += __rdtsc() - start;
+        ring_wait_ns += __rdtsc() - start;
     }
 
     /// tlg: TLG_PIPE_RING_SLEEP=1 sleeps on `consumed` (as an outlived drain does) instead of
@@ -271,7 +282,7 @@ private:
                     return TlgThreads::SizingCount() >= 12 ? 200 : 50;
                 }());
                 const auto spin_until = std::chrono::steady_clock::now() + spin_time;
-                const u64 spin_start = __rdtsc();
+                const auto spin_start = std::chrono::steady_clock::now();
                 for (u32 spins = 1; available == at; ++spins) {
                     if (stop.stop_requested()) {
                         return;
@@ -283,7 +294,12 @@ private:
                         if (published.load(std::memory_order_seq_cst) == at &&
                             !stop.stop_requested()) {
                             sleeps.fetch_add(1, std::memory_order_relaxed);
+                            const auto sleep_start = std::chrono::steady_clock::now();
                             wake.wait(seen, std::memory_order_seq_cst);
+                            // tlg: the sleep is its own time: it was counted as spin, and the
+                            // shares of the recording thread did not add up.
+                            sleep_ns.fetch_add(NanosecondsSince(sleep_start),
+                                               std::memory_order_relaxed);
                         }
                         sleeping.store(false, std::memory_order_relaxed);
                     }
@@ -291,7 +307,7 @@ private:
                 }
                 // tlg: how much of stage B is spent spinning for a packet (a core taken from
                 // the game's threads), reported as idle, not as work.
-                spin_cycles.fetch_add(__rdtsc() - spin_start, std::memory_order_relaxed);
+                spin_ns.fetch_add(NanosecondsSince(spin_start), std::memory_order_relaxed);
             }
             const auto* header = reinterpret_cast<const Header*>(ring.get() + at % Capacity);
             if (header->size == 0) {
@@ -300,9 +316,9 @@ private:
                 NotifyDrain();
                 continue;
             }
-            const u64 start = __rdtsc();
+            const auto start = std::chrono::steady_clock::now();
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
-            busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
+            busy_ns.fetch_add(NanosecondsSince(start), std::memory_order_relaxed);
             at += header->size;
             consumed.store(at, std::memory_order_seq_cst);
             NotifyDrain();

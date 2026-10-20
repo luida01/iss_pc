@@ -323,7 +323,95 @@ divisores y **no tiene ninguna llamada** en todo el árbol (comprobado con grep)
 fichero está prohibido para este agente, así que la eliminación queda pendiente para quien
 lo tenga: con `SceneResolution::PresetScale` como única tabla, `PresetScale` sobra.
 
-## 5. Lo que queda sin resolver
+## 5. El hilo que graba: qué es trabajo y qué es espera (2026-10-19, 19 h)
+
+La pregunta era: *el hilo de grabación está ocupado el 85-89 % del tiempo, pero las fases de
+draw sólo cubren el 25 % del frame: ¿dónde se va el resto?*
+
+### 5.1 Lo que había (y ) era una cuenta falsa
+
+La línea `Draw pipe:` mezclaba tres cosas:
+
+* `stage B busy` = los **ciclos del procesador** que el hilo de grabación pasó dentro del
+  manejador de paquetes (`draw_pipe->busy_cycles`).
+* `stage B idle-spin` = los ciclos que pasó **esperando un paquete** (`spin_cycles`), **que
+  incluían el tiempo dormido** (`wake.wait()`): el dormir se contaba como spin.
+* el denominador = los ciclos del **hilo de la GPU** en la ventana.
+
+Con eso, `busy 85-89 %` + `idle-spin 150,6 %` = 235 %: **imposible**. Dos cosas:
+
+1. **El reloj**: se medió si el TSC tickea igual en todos los núcleos (nuevo test
+   `tsc-rate-test`): **2,6111 GHz en los dos núcleos, 0,00 % de diferencia** → el TSC es
+   invariante aquí, el reloj no era el problema.
+2. **El contador**: el tiempo dormido estaba dentro del spin → las sumas no cuadtaban.
+
+**Arreglo** (`vk_draw_pipe.h`, `vk_rasterizer.cpp`): el hilo de grabación cuenta ahora
+**nanosegundos de reloj de pared** y el dormir va en su propio contador:
+
+```
+Draw pipe: ... stage B busy 85.1%, stage B idle-spin 12.3%, stage B asleep 1.9% (183 sleeps) ...
+```
+
+Las tres sumas son el tiempo del hilo → **ahora se pueden sumar y comparar con la ventana**
+(que es el reloj de pared). La línea `stage A waited` (el drain) también pasa a nanosegundos.
+
+### 5.2 El desglose que faltaba (TLG_DRAW_PROFILE=1)
+
+Las fases que había medían sólo el camino de `DrawRecord`. **Faltaban**:
+
+| Fase nueva | Qué mide |
+|---|---|
+| `packet` | el paquete en sí: los bloques de registro y los datos de usuario que copia |
+| `indirect` | los draws indirectos (no pasan por `DrawRecord`) |
+| `special` | los paquetes que atiende el filtro (fast clears, resolves, copias) |
+| `task` | **las tareas en orden** (escrituras del invitado, fences, readbacks) |
+| `host-copies` | **la espera a las copias del host** (los hilos de copia) |
+| `signals` | **la espera a las señales diferidas** |
+
+Y las fases se reparten ahora como **"% de la grabación"** (todas medidas en el mismo hilo y con
+el mismo reloj, así que la proporción es exacta) en vez de "% de la ventana" (que mezclaba
+relojes).
+
+### 5.3 Lo que dice el perfil de PM4
+
+`PM4 decode: register 1,6 %, draw 11,4 %, dispatch 4,1 %` (del tiempo del decode). La clase
+"draw" incluye **todo** lo que hace el hilo de la GPU al decodificar un paquete de draw: la
+selección de tubería (`GetGraphicsPipeline` → `TryPreparedPipeline`, que **reconstruye el
+user data aplanado** con el*SRT walker* sobre memoria del invitado para *verificar* el dato
+preparado) y el armado del paquete (`PostDraw`: los bloques de registro y los datos de
+usuario). El walker es la verificación (detecta que la memoria del invitado cambió) → no es
+trabajo redundante, pero es el item más caro y **vive en `shader_recompiler/` (otro agente)**.
+
+### 5.4 La respuesta a la pregunta de GOW3
+
+Se compararon las dos ramas (gow3-lab `main` @ 41e9473 contra el nuestro) en el camino
+caliente:
+
+| Fichero | Resultado |
+|---|---|
+| `renderer_vulkan/vk_draw_pipe.h` | La misma estructura de dos etapas. Nosotros añadimos el dormir en el drain, el split del spin y el **split del dormir** (el bug de la cuenta) |
+| `renderer_vulkan/vk_scheduler.cpp/.h` | Idénttico (`Record`, `KickRecording`, `SyncRecording`: sólo cambian los nombres de los toggles y nuestras diagnósticas) |
+| `renderer_vulkan/vk_rasterizer.cpp` → `PostDraw` | **Idénttico** (126 líneas, una diferencia: el nombre del toggle) |
+| `renderer_vulkan/vk_rasterizer.cpp` → `RunDrawPacket` | Idénttico (nosotros añadimos la instrumentación) |
+| `renderer_vulkan/vk_rasterizer.cpp` → `BindResources` | El mismo trabajo; nosotros además conservamos el almacenamiento de las escrituras de descriptores (`SetWritePool`) y el memo del sampler |
+| `video_core/amdgpu/liverpool.cpp` → `ProcessGraphics` | El mismo bucle; nosotros añadimos la sonda de oclusión, el enganche del grabador de frames y el perfil PM4 |
+| `shim/gow3_toggles.h` vs `tlg_toggles.h` | Los mismos conmutadores (salvo un bit desplazado). **Nosotros tenemos más**: `SamplerSetMemo`, `PipelinedCompute`, `PipelinedCommands`, `DeferredReadback`, `VariantReuse`… |
+| `DrawPipeWanted` / `BindHelperWanted` | Idénticos (el pipe de dos etapas si hay ≥8 hilos; el helper de texturas es opt-in en los dos) |
+| El overlay (el HUD) | Los dos lo traen **encendido por defecto** (`show_fps=1` en los dos launchers) |
+
+**Conclusión: gow3_pc no hace nada distinto en este camino.** El cuello es el mismo código
+en los dos forks; la diferencia de resultados viene de la **configuración** (gow3 arranca con
+el upscaler FSR 3.1 y `preset=1`, y su launcher usa `live_resolution=auto`) y de la **escena**
+(el runtime de referencia pasa a 0,6-3,9 FPS en la zona pesada; nuestro port hace 12-13 FPS
+ahí, o sea 10-30 veces más rápido que el upstream, con la GPU al 22-45 %).
+
+Y el punto de fondo: **la GPU al 22-45 % con la VRAM llena no es un problema de la GPU**: el
+hilo que graba no le entrega trabajo porque está esperando o grabando más de lo que la GPU
+puede absorber. Con el desglose nuevo se verá si lo que falta es trabajo (fases) o espera
+(`host-copies`, `signals`, `task`).
+
+
+## 6. Lo que queda sin resolver
 
 | Punto | Fichero | Por qué no se toca aquí |
 |---|---|---|
@@ -337,7 +425,7 @@ lo tenga: con `SceneResolution::PresetScale` como única tabla, `PresetScale` so
 | Latencia de memoria de la fase "bind" | `video_core/texture_cache/**` (los arrays de imágenes) | **Fuera del alcance**: es el agente de VRAM. Aquí sólo se puede reducir el *número* de accesos desde el renderer |
 | Coste del driver al grabar comandos | `renderer_vulkan/**` (los comandos que se emiten) | Los contadores por tipo ya están; falta ver cuántos se emiten por draw |
 
-## 6. Cómo se mide en la sesión final
+## 7. Cómo se mide en la sesión final
 
 Con `tools/perf-ab.ps1` (el banco A/B). El preset se puede pasar por entorno
 (`TLG_UPSCALE_PRESET`, que pisa la clave `preset` de `tlg.ini`) o por la clave del ini; los
@@ -376,7 +464,7 @@ Lo que hay que mirar en cada `summary.csv` y en el log:
    espera (`drains`).
 6. Las capturas: la imagen debe ser igual salvo el reesampleo (más suave a menor resolución).
 
-## 7. Qué preset/escalado da qué
+## 8. Qué preset/escalado da qué
 
 Lo que está **medido** hoy:
 

@@ -273,6 +273,9 @@ void Scheduler::WaitDeferredSignals() {
         TlgToggle::Disabled(TlgToggle::OrderedGuestWrites)) {
         return;
     }
+    // tlg: the wait for the signals the recording thread has to run: it is a wait, not
+    // work, and the profile tells it apart from the work (TLG_DRAW_PROFILE=1).
+    DrawProfile::Scope scope{DrawPhase::Signals};
     TlgStats::WaitTimer timer{TlgStats::host_copies_wait_ns};
     TlgPerf::Span perf_wait{TlgPerf::Kind::WaitBegin, TlgPerf::Kind::WaitEnd, TlgPerf::Label("host_copies")};
     KickRecording(true);
@@ -285,6 +288,8 @@ void Scheduler::WaitDeferredSignals() {
 
 void Scheduler::WaitHostCopies() {
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
+        // tlg: the wait for the host copies: a wait, not work (TLG_DRAW_PROFILE=1).
+        DrawProfile::Scope scope{DrawPhase::HostCopies};
         TlgStats::WaitTimer timer{TlgStats::host_copies_wait_ns};
         TlgPerf::Span perf_wait{TlgPerf::Kind::WaitBegin, TlgPerf::Kind::WaitEnd, TlgPerf::Label("host_copies")};
         TlgStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
