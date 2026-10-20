@@ -141,6 +141,24 @@ typedef struct RuntimeWaitLevel {
     uint64_t since_ms;          /* runtime_wait_now_ms() when the wait started */
     char name[48];              /* object name (tail of long ones) */
 } RuntimeWaitLevel;
+/* Kinds of wait the runtime marks. The wait texts come from the runtime files and from the
+ * GPU library; runtime_thread.c maps a text to a kind (runtime_wait_kind) and the report
+ * prints the kind with the object name. The index is what the accounting uses. */
+enum {
+    RUNTIME_WAIT_COND = 0,      /* condition variable */
+    RUNTIME_WAIT_MUTEX,         /* mutex */
+    RUNTIME_WAIT_SEMAPHORE,     /* kernel semaphore */
+    RUNTIME_WAIT_RWLOCK,        /* reader/writer lock */
+    RUNTIME_WAIT_JOIN,          /* scePthreadJoin */
+    RUNTIME_WAIT_SLEEP,         /* sceKernelSleepus */
+    RUNTIME_WAIT_EVENT,         /* event flag / event queue */
+    RUNTIME_WAIT_FILE,          /* file read/write */
+    RUNTIME_WAIT_GPU,           /* the GPU library's own waits (readback, recorder, fence) */
+    RUNTIME_WAIT_OTHER,         /* anything else */
+    RUNTIME_WAIT_KINDS
+};
+/* Wake latency histogram: log2 buckets (1 ns .. 2 s). */
+#define RUNTIME_WAKE_BUCKETS 16
 typedef struct RuntimeWait {
     unsigned depth;             /* nesting; levels past RUNTIME_WAIT_LEVELS are only counted */
     uint32_t generation;        /* changes on every begin/end: readers detect a torn copy */
@@ -154,6 +172,28 @@ typedef struct RuntimeWait {
     uint32_t wait_count;        /* marked waits counted */
     const char *wait_max_kind;  /* static text of the longest wait (NULL: none yet) */
     char wait_max_name[48];     /* its object name, if any */
+    /* Per kind: how many waits and how long they blocked. The kind of the wait in progress is
+     * kept in wait_kind (the outermost one, the only one that is counted). */
+    uint32_t kind_count[RUNTIME_WAIT_KINDS];
+    uint64_t kind_ns[RUNTIME_WAIT_KINDS];
+    uint64_t kind_max_ns[RUNTIME_WAIT_KINDS];
+    unsigned wait_kind;
+    /* Wake latency: from the post (signal/broadcast) to the moment the woken thread runs
+     * again. This is the cost the guest pays per wake-up, and the mission's "100 us of
+     * more" is measured here. spurious counts the waits that returned with no signal. */
+    uint64_t wake_ns;           /* summed latency */
+    uint64_t wake_max_ns;       /* the longest one */
+    uint32_t wake_count;        /* wakes measured */
+    uint32_t wake_hist[RUNTIME_WAKE_BUCKETS];
+    uint32_t spurious;          /* waits that returned with no signal */
+    /* scePthreadYield: the guest asking to yield (a spin, not a wait). */
+    uint64_t yield_count, yield_ns;
+    /* CPU time of the thread (user+kernel), sampled by the monitor every window. */
+    uint64_t cpu_ns;
+    /* The longest wait of the current window; the monitor resets it after each report. */
+    uint64_t window_max_ns;
+    const char *window_max_kind;
+    char window_max_name[48];
     RuntimeWaitLevel level[RUNTIME_WAIT_LEVELS];
 } RuntimeWait;
 /* Frame of the calling (guest-called) function, for runtime_wait_begin. Use it in the ABI
@@ -170,6 +210,15 @@ void runtime_wait_begin(const char *kind, const void *object, const char *name,
 void runtime_wait_end(void);
 /* Consistent copy of a slot another thread may be changing (0: it kept changing). */
 int runtime_wait_copy(const RuntimeWait *from, RuntimeWait *to);
+/* Monotonic nanoseconds: the clock the wake stamps use. */
+uint64_t runtime_wait_now_ns(void);
+/* Kind of a wait text (RUNTIME_WAIT_*): the accounting and the report use it. */
+int runtime_wait_kind(const char *kind);
+/* The calling thread records the delay from the post that woke it to the moment it ran
+ * again (runtime_wait_now_ns units). */
+void runtime_wait_note_wake(uint64_t latency_ns);
+/* The calling thread's wait returned with no signal (a spurious wake-up). */
+void runtime_wait_note_spurious(void);
 /* Thread record of the calling guest (or attached host) thread, NULL on other threads. */
 void *runtime_thread_self(void);
 typedef struct RuntimeThreadInfo {

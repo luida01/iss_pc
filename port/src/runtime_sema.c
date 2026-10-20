@@ -22,6 +22,10 @@ typedef struct Sema {
     int deleted;
     char name[32];
     Waiter *first;
+    /* The stamp of the last post (signal_ns) and its counter (signal_seq): the waiter
+     * measures from it how long it took to run again after the signal. */
+    uint64_t signal_ns;
+    uint32_t signal_seq;
     struct Sema *next;
 } Sema;
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
@@ -94,6 +98,7 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block,u
         *tail=&w; ++s->active;
         uint64_t deadline=timeout ? now_ns()+(uint64_t)*timeout*1000 : 0;
         struct timespec end={.tv_sec=(time_t)(deadline/1000000000),.tv_nsec=(long)(deadline%1000000000)};
+        const uint32_t seq=__atomic_load_n(&s->signal_seq,__ATOMIC_ACQUIRE);
         runtime_wait_begin(timeout ? "semaphore (timed)" : "semaphore",(const void *)(uintptr_t)id,s->name,NULL,frame);
         while (!w.done) {
             int e=timeout ? pthread_cond_timedwait(&w.event,&lock,&end) : pthread_cond_wait(&w.event,&lock);
@@ -105,6 +110,14 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block,u
             } else if (e!=ETIMEDOUT) host_check(e);
         }
         runtime_wait_end();
+        /* The delay from the post that woke it to the moment it runs again. */
+        if (__atomic_load_n(&s->signal_seq,__ATOMIC_ACQUIRE)!=seq) {
+            const uint64_t stamp=__atomic_load_n(&s->signal_ns,__ATOMIC_ACQUIRE);
+            const uint64_t now=runtime_wait_now_ns();
+            if (now>=stamp) runtime_wait_note_wake(now-stamp);
+        } else if (!timeout) {
+            runtime_wait_note_spurious();
+        }
         result=w.result;
         if (!result) ++acquired;
         if (timeout) {
@@ -127,6 +140,9 @@ static ABI int32_t sem_signal(uint32_t id,int32_t count) {
     else if (count<=0 || count>s->maximum-s->count) result=ERR(22);
     else {
         s->count+=count; ++signaled;
+        /* The stamp of the post: the waiters measure from it how long they took to run. */
+        s->signal_ns=runtime_wait_now_ns();
+        __atomic_add_fetch(&s->signal_seq,1,__ATOMIC_ACQ_REL);
         Waiter **p=&s->first;
         while (*p) {
             Waiter *w=*p;

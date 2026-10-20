@@ -8,8 +8,10 @@
 #include <errno.h>
 #include <time.h>
 typedef struct { int type; } GuestAttr;
-/* owner/depth: who holds it, for the freeze report (written only while holding the mutex). */
-typedef struct { pthread_mutex_t native; void *owner; unsigned depth; char name[32]; } GuestMutex;
+/* owner/depth: who holds it, for the freeze report (written only while holding the mutex).
+ * release_ns: when the mutex was released last, the hint the adaptive spin uses (the spin
+ * only happens when the critical section has been short lately). */
+typedef struct { pthread_mutex_t native; void *owner; unsigned depth; char name[32]; uint64_t release_ns; } GuestMutex;
 static size_t created, locks, unlocks;
 static int32_t orbis_error(int e) {
     if (!e) return 0;
@@ -88,6 +90,62 @@ static void took(GuestMutex *m) {
 static void releasing(GuestMutex *m) {
     if (m->depth && m->owner == holder() && !--m->depth) m->owner = NULL;
 }
+
+/* ---- Adaptive spin (TLG_MUTEX_SPIN) ----
+ * A contended acquire of a guest mutex blocks in the host: the thread leaves the CPU and
+ * comes back when the scheduler puts it back, and with the ~77 threads the game runs on 12
+ * logical CPUs that round trip is tens of microseconds. When the mutex was released
+ * recently its critical section is short (the guest's job queue pops one item), and
+ * waiting for it in user space is much cheaper than the round trip.
+ *
+ * The spin is bounded (TLG_MUTEX_SPIN=iterations, default 40 pauses, about 2 us) and it
+ * only happens when the last release was recent (TLG_MUTEX_SPIN_WINDOW_US, default 50 us),
+ * so a long critical section never burns CPU. Off unless the variable is set: the default
+ * path is the plain trylock/lock, exactly as before. */
+#if defined(__x86_64__) || defined(__i386__)
+#define cpu_pause() __asm__ __volatile__("pause" ::: "memory")
+#else
+#define cpu_pause() ((void)0)
+#endif
+#define MUTEX_SPIN_DEFAULT 40
+#define MUTEX_SPIN_WINDOW_US 50
+static int mutex_spin_iterations(void) {
+    static int value=-1;
+    if (value<0) {
+        const char *e=getenv("TLG_MUTEX_SPIN");
+        value=MUTEX_SPIN_DEFAULT;
+        if (e && e[0]) {
+            long parsed=strtol(e,NULL,10);
+            if (parsed>=0 && parsed<=100000) value=(int)parsed;
+        }
+    }
+    return value;
+}
+static int mutex_spin_window_ns(void) {
+    static long value=-1;
+    if (value<0) {
+        const char *e=getenv("TLG_MUTEX_SPIN_WINDOW_US");
+        value=MUTEX_SPIN_WINDOW_US*1000;
+        if (e && e[0]) {
+            long parsed=strtol(e,NULL,10);
+            if (parsed>=0) value=parsed*1000;
+        }
+    }
+    return (int)value;
+}
+/* Tries to take the mutex without leaving the CPU. 1 when it got it. */
+static int mutex_spin_take(GuestMutex *m) {
+    const int iterations=mutex_spin_iterations();
+    if (!iterations) return 0;
+    const uint64_t now=runtime_wait_now_ns();
+    if (!m->release_ns || now<m->release_ns || now-m->release_ns>(uint64_t)mutex_spin_window_ns())
+        return 0; /* the last release is old: the critical section is not short, do not spin */
+    for (int i=0;i<iterations;++i) {
+        cpu_pause();
+        if (!pthread_mutex_trylock(&m->native)) return 1;
+    }
+    return 0;
+}
 /* A contended lock marks the wait (the uncontended path only adds the trylock). An error-check
  * mutex the caller holds fails the trylock with EBUSY and the lock with EDEADLK, as before. */
 static int32_t lock_mutex(GuestMutex **mutex, uintptr_t frame) {
@@ -96,9 +154,12 @@ static int32_t lock_mutex(GuestMutex **mutex, uintptr_t frame) {
     GuestMutex *m = *mutex;
     int r = pthread_mutex_trylock(&m->native);
     if (r == EBUSY) {
-        runtime_wait_begin("mutex", m, m->name, (const void *const *)&m->owner, frame);
-        r = pthread_mutex_lock(&m->native);
-        runtime_wait_end();
+        if (mutex_spin_take(m)) r = 0; /* the spin got it: no round trip, no marked wait */
+        else {
+            runtime_wait_begin("mutex", m, m->name, (const void *const *)&m->owner, frame);
+            r = pthread_mutex_lock(&m->native);
+            runtime_wait_end();
+        }
     }
     e = orbis_error(r);
     if (!e) { ++locks; took(m); }
@@ -120,7 +181,11 @@ static ABI int32_t mutex_unlock(GuestMutex **mutex) {
     unsigned depth = m->depth;
     releasing(m);
     int32_t e = orbis_error(pthread_mutex_unlock(&m->native));
-    if (!e) ++unlocks;
+    if (!e) {
+        ++unlocks;
+        /* The stamp the adaptive spin reads; the clock is only read when the spin is on. */
+        if (mutex_spin_iterations()) m->release_ns = runtime_wait_now_ns();
+    }
     else { m->owner = owner; m->depth = depth; } /* not unlocked: still held as before */
     return e;
 }
@@ -153,8 +218,10 @@ static ABI int32_t mutex_timedlock(GuestMutex **mutex, uint32_t usec) {
     return e;
 }
 /* Condition variables: opaque handles over host pthread_cond (CLOCK_REALTIME,
- * like FreeBSD's default), sharing the host mutex behind GuestMutex. */
-typedef struct { pthread_cond_t native; char name[32]; } GuestCond;
+ * like FreeBSD's default), sharing the host mutex behind GuestMutex. The stamp of the post
+ * (signal_ns) and its counter (signal_seq) let the waiter measure how long it took to run
+ * again after the signal: that delay is the cost the guest pays per wake-up. */
+typedef struct { pthread_cond_t native; char name[32]; uint64_t signal_ns; uint32_t signal_seq; } GuestCond;
 static size_t conds, waits, wakeups;
 static ABI int32_t cond_init(GuestCond **out, void **attr, const char *name) {
     (void)attr;
@@ -191,10 +258,20 @@ static int wait_cond(GuestCond *c, GuestMutex *m, const struct timespec *end, ui
     void *owner = m->owner;
     unsigned depth = m->depth;
     m->owner = NULL; m->depth = 0;
+    const uint32_t seq = __atomic_load_n(&c->signal_seq, __ATOMIC_ACQUIRE);
     runtime_wait_begin(end ? "condition variable (timed)" : "condition variable", c, c->name, NULL, frame);
     int r = end ? pthread_cond_timedwait(&c->native, &m->native, end) : pthread_cond_wait(&c->native, &m->native);
     runtime_wait_end();
     m->owner = owner; m->depth = depth;
+    /* The delay from the post that woke it to the moment it runs again. A wait that returns
+     * with no post is a spurious wake-up: the guest's loop has to check the predicate again. */
+    if (__atomic_load_n(&c->signal_seq, __ATOMIC_ACQUIRE) != seq) {
+        const uint64_t stamp = __atomic_load_n(&c->signal_ns, __ATOMIC_ACQUIRE);
+        const uint64_t now = runtime_wait_now_ns();
+        if (now >= stamp) runtime_wait_note_wake(now - stamp);
+    } else if (!end) {
+        runtime_wait_note_spurious();
+    }
     return r;
 }
 static int32_t cond_wait_at(GuestCond **cond, GuestMutex **mutex, uintptr_t frame) {
@@ -221,12 +298,19 @@ static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t
 static ABI int32_t cond_signal(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
-    ++wakeups; return orbis_error(pthread_cond_signal(&(*cond)->native));
+    GuestCond *c = *cond;
+    /* The stamp of the post: the waiter measures the delay from here to the moment it runs. */
+    c->signal_ns = runtime_wait_now_ns();
+    __atomic_add_fetch(&c->signal_seq, 1, __ATOMIC_ACQ_REL);
+    ++wakeups; return orbis_error(pthread_cond_signal(&c->native));
 }
 static ABI int32_t cond_broadcast(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
-    ++wakeups; return orbis_error(pthread_cond_broadcast(&(*cond)->native));
+    GuestCond *c = *cond;
+    c->signal_ns = runtime_wait_now_ns();
+    __atomic_add_fetch(&c->signal_seq, 1, __ATOMIC_ACQ_REL);
+    ++wakeups; return orbis_error(pthread_cond_broadcast(&c->native));
 }
 /* PS4 struct timespec is {int64 sec, int64 nsec}, identical to Linux x86-64. */
 typedef struct { int64_t sec, nsec; } GuestTimespec;
