@@ -382,6 +382,55 @@ preparado) y el armado del paquete (`PostDraw`: los bloques de registro y los da
 usuario). El walker es la verificación (detecta que la memoria del invitado cambió) → no es
 trabajo redundante, pero es el item más caro y **vive en `shader_recompiler/` (otro agente)**.
 
+### 5.5 El hilo que graba giraba en vacío: ahora duerme (2026-10-19, 21 h)
+
+Con la cuenta corregida, la sesión de SAFETY TRUST dio: **`stage B busy 32,2 %`, `stage B
+idle-spin 67,2 %`, `stage B asleep 5,0 %`**. Es decir: el hilo que graba **pasaba dos
+tercios del tiempo girando sin hacer nada** (el bucle de `pause` de `vk_draw_pipe.h`), y
+quemaba ~0,7 de un núcleo que el invitado (77 hilos) podría usar. El proceso gastaba 4,6 de
+16 núcleos lógicos para producir 10 frames/s.
+
+**Por qué giraba**: el hilo espera los paquetes que el hilo de la GPU decodifica. El código
+giraba siempre el presupuesto entero (200 µs con ≥12 hilos) antes de dormir. Como entre
+paquete y paquete pasan ~25 µs (el hilo de la GPU decodifica un paquete cada ~25 µs), el
+hilo que graba **giroaba los 25 µs enteros de cada hueco**.
+
+**La corrección**: el giro se **adapta al productor**.
+
+* El hilo mide cuánto duró la última espera.
+* Si fue **corta** (el productor está cerca: el siguiente paquete está a punto de llegar,
+  ≤ ¼ del presupuesto), gira ese presupuesto: recoge el paquete sin pagar un despertar.
+* Si fue **larga** (el productor está lejos: decodifica, espera una lectura de vuelta, el
+  juego trabaja), **se duerme de inmediato**: el núcleo vuelve al juego y el despertar es
+  el precio de devolverlo.
+
+**El equilibrio, medido** (nuevo test `draw-pipe-test`: un productor que manda ráfagas de
+paquetes como el hilo de la GPU, y la CPU y la latencia del hilo que graba):
+
+| Productor | Presupuesto de giro | giro/paquete | CPU/paquete | latencia media | latencia máx |
+|---|---|---|---|---|---|
+| cerca (ráfaga de 20) | 200 µs | 0,03 µs | 0,00 µs | 40,3 µs | 159 µs |
+| cerca (ráfaga de 20) | 50 µs | 0,11 µs | 0,00 µs | 19,5 µs | 101 µs |
+| cerca (ráfaga de 20) | 0 (dormir) | 0,05 µs | 0,00 µs | 35,0 µs | 327 µs |
+| lejos (1 paquete) | 200 µs | 0,51 µs | 0,00 µs | 32,5 µs | 136 µs |
+| lejos (1 paquete) | 50 µs | 1,04 µs | 0,00 µs | 90,4 µs | 340 µs |
+| lejos (1 paquete) | 0 (dormir) | 1,04 µs | 0,00 µs | 84,2 µs | 632 µs |
+
+El giro por paquete cae a **0,03 – 1,04 µs** (con el código anterior serían los ~25 µs del
+hueco entero). La latencia sube ~50 µs de media y la cola ~600 µs en el peor caso: con
+40.000 paquetes/s y frames de 100 ms, 50 µs es el 0,05 % del frame.
+
+Además, **el drain** (que espera a que el hilo de grabación consuma) giraba 4096 `pause`
+(~220 µs) antes de dormir: ahora gira 512 (~30 µs) y se duerme (el despertar ya está
+resuelto por `NotifyDrain`).
+
+**Cómo se mide en la sesión final**: la línea `Draw pipe:` lleva ahora las tres partes
+(`stage B busy`, `idle-spin`, `asleep`) y **el hueco es lo que se ha eliminado**: el
+"idle-spin" debe caer del 67 % a menos del 10 %, y con él el consumo de CPU del proceso
+(la línea `helper CPU: draw recording X ms` de las estadísticas del frame, que incluye el
+giro: X debe bajar de ~2.500 ms por ventana de 5 s a menos de ~1.000 ms).
+
+
 ### 5.4 La respuesta a la pregunta de GOW3
 
 Se compararon las dos ramas (gow3-lab `main` @ 41e9473 contra el nuestro) en el camino

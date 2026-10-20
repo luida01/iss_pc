@@ -528,6 +528,17 @@ target_compile_options(access-memo-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 add_executable(tsc-rate-test EXCLUDE_FROM_ALL ../tests/test_tsc_rate.cpp)
 target_include_directories(tsc-rate-test PRIVATE shadps4)
 target_compile_options(tsc-rate-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+# tlg: the wait of the draw recording thread: the CPU it burns spinning and the latency of
+# the sleep.
+add_executable(draw-pipe-test EXCLUDE_FROM_ALL ../tests/test_draw_pipe.cpp)
+target_include_directories(draw-pipe-test PRIVATE shim shadps4)
+# tlg: the pipe uses gettid() (the TEB), which the GPU library gets from this header.
+if (WIN32)
+    target_compile_options(draw-pipe-test PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/tlg_win_compat.h)
+endif()
+target_compile_options(draw-pipe-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_link_libraries(draw-pipe-test PRIVATE tlggpu)
 add_executable(graphics-settings-test EXCLUDE_FROM_ALL ../tests/test_graphics_settings.cpp
     shim/tlg_settings.cpp)
 target_include_directories(graphics-settings-test PRIVATE shim)

@@ -54,6 +54,27 @@ public:
         return on_stage_b;
     }
 
+    /// The spin budget of the recording thread, in microseconds: how long it waits for a
+    /// packet before it sleeps. 0: it sleeps at once (the cheapest for the machine, the
+    /// most expensive in latency). TLG_PIPE_SPIN_US sets it at start; the measurement
+    /// (tests/test_draw_pipe.cpp) changes it.
+    void SetSpinBudget(int microseconds) {
+        spin_budget_us.store(microseconds, std::memory_order_relaxed);
+    }
+    [[nodiscard]] int SpinBudgetUs() const {
+        const int value = spin_budget_us.load(std::memory_order_relaxed);
+        if (value >= 0) {
+            return value;
+        }
+        static const int default_budget = [] {
+            if (const char* env = std::getenv("TLG_PIPE_SPIN_US")) {
+                return std::max(0, std::atoi(env));
+            }
+            return TlgThreads::SizingCount() >= 12 ? 200 : 50;
+        }();
+        return default_budget;
+    }
+
     [[nodiscard]] u32 StageBThreadId() const noexcept {
         return stage_b_tid.load(std::memory_order_acquire);
     }
@@ -114,7 +135,10 @@ public:
         ++drains_by_reason[slot];
         const auto start = std::chrono::steady_clock::now();
         for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head; ++spins) {
-            if (spins < 4096) {
+            if (spins < 512) {
+                // tlg: a short spin (the pause is long: 512 of them are ~30 us) and then the
+                // wait sleeps: the drain woke the recording thread up (NotifyDrain), so the
+                // CPU of the GPU thread is not burned for nothing.
                 __builtin_ia32_pause();
             } else if (SleepInDrain()) {
                 SleepUntilDrained();
@@ -152,6 +176,8 @@ public:
     std::atomic<u64> spin_ns{0};
     std::atomic<u64> sleep_ns{0};
     std::atomic<u64> sleeps{0};
+    /// The times the recording thread had nothing to do (the waits).
+    std::atomic<u64> waits{0};
     /// tlg: the recording thread's CPU clock (Linux) / thread id (Windows), for the frame
     /// statistics (as TlgStats::gpu_thread_clock does for the command thread).
     std::atomic<int> cpu_clock{-1};
@@ -167,6 +193,13 @@ private:
     static constexpr u32 Align(u32 size) {
         return (size + 63) & ~63u;
     }
+
+    /// The spin budget in microseconds (-1: the default).
+    std::atomic<int> spin_budget_us{-1};
+    /// The nanoseconds of the sleep of the wait in progress (the spin is the rest).
+    u64 sleep_ns_during_wait = 0;
+    /// Whether the last wait ended quickly (the producer is close: spin again).
+    bool last_wait_was_short = true;
 
     /// The nanoseconds since a point of the wall clock.
     static u64 NanosecondsSince(std::chrono::steady_clock::time_point start) {
@@ -275,39 +308,58 @@ private:
                 // With few cores (Steam Deck: 8 threads) a long spin takes time from the
                 // game's own threads; TLG_PHYS_CORES=1 counts physical cores instead of SMT
                 // threads here. TLG_PIPE_SPIN_US overrides.
-                static const auto spin_time = std::chrono::microseconds([] {
-                    if (const char* env = std::getenv("TLG_PIPE_SPIN_US")) {
-                        return std::max(0, std::atoi(env));
-                    }
-                    return TlgThreads::SizingCount() >= 12 ? 200 : 50;
-                }());
-                const auto spin_until = std::chrono::steady_clock::now() + spin_time;
-                const auto spin_start = std::chrono::steady_clock::now();
+                const auto spin_budget = std::chrono::microseconds(SpinBudgetUs());
+                // tlg: the spin adapts to the producer. The packets arrive in bursts while
+                // the GPU thread decodes a batch, and then there is a pause (the decode of
+                // the next batch, a readback, the game's own work). Spinning during the pause
+                // burns a core the game could use: measured on SAFETY TRUST, the recording
+                // thread spent two thirds of the time spinning with nothing to do. So the
+                // thread only spins when the last wait ended quickly (the producer is close
+                // and the next packet is about to arrive); after a long wait it sleeps at
+                // once, and the wake-up is the price of giving the core back.
+                const auto spin_time = last_wait_was_short ? spin_budget
+                                                           : std::chrono::microseconds(0);
+                const auto wait_start = std::chrono::steady_clock::now();
+                sleep_ns_during_wait = 0;
+                waits.fetch_add(1, std::memory_order_relaxed);
                 for (u32 spins = 1; available == at; ++spins) {
                     if (stop.stop_requested()) {
                         return;
                     }
-                    __builtin_ia32_pause();
-                    if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
-                        const u32 seen = wake.load(std::memory_order_seq_cst);
-                        sleeping.store(true, std::memory_order_seq_cst);
-                        if (published.load(std::memory_order_seq_cst) == at &&
-                            !stop.stop_requested()) {
-                            sleeps.fetch_add(1, std::memory_order_relaxed);
-                            const auto sleep_start = std::chrono::steady_clock::now();
-                            wake.wait(seen, std::memory_order_seq_cst);
-                            // tlg: the sleep is its own time: it was counted as spin, and the
-                            // shares of the recording thread did not add up.
-                            sleep_ns.fetch_add(NanosecondsSince(sleep_start),
-                                               std::memory_order_relaxed);
+                    // The clock is read every 256 spins (the pause is long enough for that):
+                    // with no spin at all it is read on the first turn and the thread sleeps.
+                    if (!(spins & 255) || spin_time.count() == 0) {
+                        const auto now = std::chrono::steady_clock::now();
+                        if (spin_time.count() == 0 || now - wait_start >= spin_time) {
+                            const u32 seen = wake.load(std::memory_order_seq_cst);
+                            sleeping.store(true, std::memory_order_seq_cst);
+                            if (published.load(std::memory_order_seq_cst) == at &&
+                                !stop.stop_requested()) {
+                                sleeps.fetch_add(1, std::memory_order_relaxed);
+                                const auto sleep_start = std::chrono::steady_clock::now();
+                                wake.wait(seen, std::memory_order_seq_cst);
+                                // tlg: the sleep is its own time: it was counted as spin, and
+                                // the shares of the recording thread did not add up.
+                                const u64 slept = NanosecondsSince(sleep_start);
+                                sleep_ns.fetch_add(slept, std::memory_order_relaxed);
+                                sleep_ns_during_wait += slept;
+                            }
+                            sleeping.store(false, std::memory_order_relaxed);
                         }
-                        sleeping.store(false, std::memory_order_relaxed);
                     }
+                    __builtin_ia32_pause();
                     available = published.load(std::memory_order_acquire);
                 }
-                // tlg: how much of stage B is spent spinning for a packet (a core taken from
-                // the game's threads), reported as idle, not as work.
-                spin_ns.fetch_add(NanosecondsSince(spin_start), std::memory_order_relaxed);
+                const u64 waited_ns = NanosecondsSince(wait_start);
+                // tlg: the spin is the wait without the sleep (the sleep is counted apart).
+                const u64 spun = waited_ns > sleep_ns_during_wait ? waited_ns - sleep_ns_during_wait
+                                                                 : 0;
+                spin_ns.fetch_add(spun, std::memory_order_relaxed);
+                // The next wait spins only if this one was short: the producer was close
+                // and the next packet is about to arrive. A wait that took most of the
+                // budget means the producer is far: spinning then would burn a core of the
+                // game for nothing.
+                last_wait_was_short = waited_ns < static_cast<u64>(spin_budget.count()) * 250;
             }
             const auto* header = reinterpret_cast<const Header*>(ring.get() + at % Capacity);
             if (header->size == 0) {
