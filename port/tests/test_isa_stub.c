@@ -371,7 +371,8 @@ static void test_report_top_sites(void) {
     size_t n = fread(text, 1, sizeof text - 1, f);
     text[n] = 0;
     fclose(f);
-    assert(strcmp(text, "ISA: most executed sites:\n  0x30 lzcnt 7\n  0x10 blsr 5\n  0x40 bextr 1\n") == 0);
+    assert(strcmp(text, "ISA: most executed sites:\n  0x30 lzcnt 7\n  0x10 blsr 5\n  0x40 bextr 1\n"
+                        "ISA: 13 rewrites executed over 4 sites\n") == 0);
 }
 
 /* The instruction after a JMP_RELOCATE site changed (a patch or hook): the site falls back to int3,

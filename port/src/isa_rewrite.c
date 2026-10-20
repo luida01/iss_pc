@@ -224,6 +224,33 @@ static void emit_bytes(unsigned char **p, const uint8_t *bytes, size_t n) {
     *p += n;
 }
 
+/* TLG_ISA_STATS=0 leaves the hit counters out of the stubs (the report is then empty): the
+ * increment is a memory read-modify-write on every emulation, on a line the neighbouring sites
+ * share, and the sites that matter are hot. A value that is not 0 or 1 names the file where the
+ * counters are dumped with the report. */
+static int isa_hits_counted(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *value = getenv("TLG_ISA_STATS");
+        on = !(value && !strcmp(value, "0"));
+    }
+    return on;
+}
+
+static const char *isa_stats_path(void) {
+    const char *value = getenv("TLG_ISA_STATS");
+    if (!value || !*value || !strcmp(value, "0") || !strcmp(value, "1")) return NULL;
+    return value;
+}
+
+/* mov rax, &hits[i] ; inc qword [rax] */
+static void emit_hit_counter(unsigned char **p, uint64_t *hit) {
+    if (!hit || !isa_hits_counted()) return;
+    emit_bytes(p, (const uint8_t[]){0x48, 0xb8}, 2);
+    emit_u64(p, (uint64_t)(uintptr_t)hit);
+    emit_bytes(p, (const uint8_t[]){0x48, 0xff, 0x00}, 3);
+}
+
 /* mov [rsp+disp8], reg (opcode 89) or mov reg, [rsp+disp8] (opcode 8B): REX.W(.R) modrm(01 reg 100) SIB 24. */
 static void emit_rsp_mov(unsigned char **p, uint8_t opcode, int reg, uint8_t disp) {
     emit_u8(p, reg >= 8 ? 0x4c : 0x48);
@@ -292,9 +319,7 @@ static size_t emit_sse4a_stub(unsigned char *code, const unsigned char *at, cons
     emit_bytes(&p, (const uint8_t[]){0x48, 0x8d, 0x64, 0x24, 0xe0}, 5);   /* lea rsp,[rsp-0x20] */
     emit_movdqu_rsp(&p, 1, s->dst, 0);
     if (s->src1 != ISA_NO_REG) emit_movdqu_rsp(&p, 1, s->src1, 16);
-    emit_bytes(&p, (const uint8_t[]){0x48, 0xb8}, 2);                      /* mov rax, &hits[i] */
-    emit_u64(&p, (uint64_t)(uintptr_t)hit);
-    emit_bytes(&p, (const uint8_t[]){0x48, 0xff, 0x00}, 3);                /* inc qword [rax] */
+    emit_hit_counter(&p, hit);
     emit_bytes(&p, (const uint8_t[]){0x48, 0x89, 0xe5}, 3);                /* mov rbp, rsp */
     emit_bytes(&p, (const uint8_t[]){0x48, 0x83, 0xe4, 0xf0}, 4);          /* and rsp, -16 */
     emit_bytes(&p, (const uint8_t[]){0x48, 0xbf}, 2);                      /* mov rdi, site */
@@ -343,9 +368,7 @@ static size_t emit_f16c_stub(unsigned char *code, const unsigned char *at, const
     emit_u8(&p, 0xfc);                                                     /* cld */
     emit_bytes(&p, (const uint8_t[]){0x48, 0x8d, 0x64, 0x24, 0xc0}, 5);   /* lea rsp,[rsp-0x40]: the buffer */
     if (s->src1 != ISA_NO_REG) emit_vmovdqu_rsp(&p, 1, s->src1, 0x20);
-    emit_bytes(&p, (const uint8_t[]){0x48, 0xb8}, 2);                      /* mov rax, &hits[i] */
-    emit_u64(&p, (uint64_t)(uintptr_t)hit);
-    emit_bytes(&p, (const uint8_t[]){0x48, 0xff, 0x00}, 3);                /* inc qword [rax] */
+    emit_hit_counter(&p, hit);
     emit_bytes(&p, (const uint8_t[]){0x48, 0x89, 0xe5}, 3);                /* mov rbp, rsp */
     emit_bytes(&p, (const uint8_t[]){0x48, 0x83, 0xe4, 0xf0}, 4);          /* and rsp, -16 */
     emit_bytes(&p, (const uint8_t[]){0x48, 0xbf}, 2);                      /* mov rdi, site */
@@ -382,9 +405,7 @@ static size_t emit_stub(unsigned char *code, const unsigned char *at, const IsaS
     emit_bytes(&p, lea_rax_rsp_up, sizeof lea_rax_rsp_up);
     emit_mov_store(&p, 0, 8 * 4);                                   /* gpr[4] = guest rsp */
     emit_u8(&p, 0x9c);                                              /* pushfq: rsp = IsaRegs* */
-    emit_bytes(&p, (const uint8_t[]){0x48, 0xb8}, 2);               /* mov rax, &hits[i] */
-    emit_u64(&p, (uint64_t)(uintptr_t)hit);
-    emit_bytes(&p, (const uint8_t[]){0x48, 0xff, 0x00}, 3);         /* inc qword [rax] */
+    emit_hit_counter(&p, hit);
     emit_bytes(&p, (const uint8_t[]){0x48, 0x89, 0xe5}, 3);         /* mov rbp, rsp */
     emit_bytes(&p, (const uint8_t[]){0x48, 0x83, 0xe4, 0xf0}, 4);   /* and rsp, -16 */
     emit_bytes(&p, (const uint8_t[]){0x48, 0xbf}, 2);               /* mov rdi, site */
@@ -470,7 +491,81 @@ IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *st
 
 /* ---- red-zone protection ---- */
 
-size_t isa_red_zone_code_size(const IsaTable *t) { return t && t->rz ? t->rz_code_bytes : 0; }
+/* TLG_REDZONE_STATS counts how many times each protected instruction runs: 1 counts, a path counts
+ * and dumps the counters to that file with the report, 0 (the default) leaves the stubs alone (no
+ * trampoline, no counter, no cost). The counters live in the red-zone area, after the stub code,
+ * and the trampoline that counts reaches them with a rip-relative increment: no register is
+ * touched, the guest's registers must come out of the stub exactly as they went in. */
+enum { RZ_TRAMP_BYTES = 12 };   /* inc qword [rip+disp32] ; jmp rel32 */
+
+static int rz_stats_kind(void) {   /* 0 off, 1 count, 2 count and dump */
+    static int kind = -1;
+    if (kind < 0) {
+        const char *value = getenv("TLG_REDZONE_STATS");
+        kind = (!value || !*value || !strcmp(value, "0")) ? 0 : !strcmp(value, "1") ? 1 : 2;
+    }
+    return kind;
+}
+
+static const char *rz_stats_path(void) {
+    const char *value = getenv("TLG_REDZONE_STATS");
+    return (value && *value && strcmp(value, "0") && strcmp(value, "1")) ? value : NULL;
+}
+
+int isa_red_zone_counters(void) { return rz_stats_kind(); }
+
+size_t isa_red_zone_code_size(const IsaTable *t) {
+    if (!t || !t->rz) return 0;
+    size_t size = t->rz_code_bytes;
+    if (rz_stats_kind()) size += (size_t)t->rz_groups * (8 + RZ_TRAMP_BYTES);
+    return size;
+}
+
+/* The jmp of a group's patches that reaches the stub running the protected instruction: its offset
+ * in the image and its target (an image offset). The patched span starts with a jmp to the stub
+ * (the span may begin before the site, when the site is shorter than five bytes and the previous
+ * instructions go with it), or with a 2-byte jmp to a relay whose jmp near is inside another
+ * patch of the same group (a "short relay"). */
+static int rz_stub_jump(const unsigned char *first, const unsigned char *q, uint64_t site, uint64_t *at,
+                        int64_t *target) {
+    const unsigned char *patch = NULL;
+    uint32_t length = 0;
+    uint64_t offset = 0;
+    for (const unsigned char *r = first; r < q;) {
+        uint16_t len = read_u16(r + 8);
+        uint64_t off = read_u64(r);
+        if (site >= off && site < off + len) {
+            patch = r;
+            length = len;
+            offset = off;
+        }
+        r += RZ_PATCH_BYTES + 2 * len;
+    }
+    if (!patch || length < 2) return 0;
+    const unsigned char *new_bytes = patch + RZ_PATCH_BYTES + length;
+    if (new_bytes[0] == 0xe9) {   /* jmp rel32 to the stub */
+        *at = offset;
+        *target = (int64_t)offset + 5 + (int32_t)read_u32(new_bytes + 1);
+        return 1;
+    }
+    if (new_bytes[0] != 0xeb) return 0;   /* jmp short to a relay */
+    int64_t relay = (int64_t)site + 2 + (int8_t)new_bytes[1];
+    for (const unsigned char *r = first; r < q;) {
+        uint16_t len = read_u16(r + 8);
+        uint64_t off = read_u64(r);
+        if (relay >= (int64_t)off && relay < (int64_t)off + len) {
+            const unsigned char *other = r + RZ_PATCH_BYTES + len;
+            size_t index = (size_t)(relay - (int64_t)off);
+            if (index + 5 <= len && other[index] == 0xe9) {
+                *at = (uint64_t)relay;
+                *target = relay + 5 + (int32_t)read_u32(other + index + 1);
+                return 1;
+            }
+        }
+        r += RZ_PATCH_BYTES + 2 * len;
+    }
+    return 0;
+}
 
 IsaRedZoneReport isa_red_zone_apply(IsaTable *t, unsigned char *image, unsigned char *area) {
     IsaRedZoneReport report = {0};
@@ -483,6 +578,8 @@ IsaRedZoneReport isa_red_zone_apply(IsaTable *t, unsigned char *image, unsigned 
     free(t->rz_applied);
     t->rz_applied = calloc(t->rz_groups ? t->rz_groups : 1, sizeof *t->rz_applied);
     t->rz_applied_count = 0;
+    t->rz_hits = NULL;
+    t->rz_hits_count = 0;
     if (!t->rz_applied) {
         report.skipped = t->rz_groups;
         return report;
@@ -490,6 +587,11 @@ IsaRedZoneReport isa_red_zone_apply(IsaTable *t, unsigned char *image, unsigned 
     const unsigned char *code = t->rz + RZ_SECTION_BYTES + RZ_STATS_BYTES, *g = code + t->rz_code_bytes;
     memcpy(area, code, t->rz_code_bytes);
     t->rz_area = area;
+    /* The counters and their trampolines follow the stub code in the same area. */
+    const int stats = rz_stats_kind();
+    unsigned char *counters = stats ? area + t->rz_code_bytes : NULL;
+    unsigned char *tramps = stats ? counters + (size_t)t->rz_groups * 8 : NULL;
+    if (stats) memset(counters, 0, (size_t)t->rz_groups * 8);
     for (uint32_t i = 0; i < t->rz_groups; i++) {
         uint64_t site = read_u64(g);
         uint32_t stub = read_u32(g + 8), bytes = read_u32(g + 12), protected_count = read_u16(g + 16),
@@ -505,9 +607,40 @@ IsaRedZoneReport isa_red_zone_apply(IsaTable *t, unsigned char *image, unsigned 
             fprintf(stderr, "Red zone: site 0x%llx skipped: bytes changed\n", (unsigned long long)site);
             report.skipped++;
         } else {
+            const uint32_t index = t->rz_applied_count;
+            uint64_t jump_at = 0;
+            int64_t jump_target = 0;
+            unsigned char *tramp = NULL;
+            if (stats && rz_stub_jump(first, q, site, &jump_at, &jump_target)) {
+                /* The trampoline counts and jumps to the stub: inc qword [rip+disp32] ; jmp rel32. */
+                tramp = tramps + (size_t)index * RZ_TRAMP_BYTES;
+                uint64_t counter = (uint64_t)(uintptr_t)(counters + (size_t)index * 8);
+                uint64_t here = (uint64_t)(uintptr_t)tramp;
+                int32_t disp = (int32_t)(int64_t)(counter - (here + 7));
+                uint64_t target = (uint64_t)(uintptr_t)area + (uint64_t)(jump_target - (int64_t)t->rz_code_offset);
+                int32_t rel = (int32_t)(int64_t)(target - (here + RZ_TRAMP_BYTES));
+                tramp[0] = 0x48;
+                tramp[1] = 0xff;
+                tramp[2] = 0x05;
+                memcpy(tramp + 3, &disp, 4);
+                tramp[7] = 0xe9;
+                memcpy(tramp + 8, &rel, 4);
+            }
             for (const unsigned char *r = first; r < q;) {
                 uint16_t length = read_u16(r + 8);
-                memcpy(image + read_u64(r), r + RZ_PATCH_BYTES + length, length);
+                unsigned char buffer[RZ_MAX_PATCH];
+                const unsigned char *new_bytes = r + RZ_PATCH_BYTES + length;
+                memcpy(buffer, new_bytes, length);
+                if (tramp) {   /* the jmp to the stub goes through the trampoline */
+                    uint64_t offset = read_u64(r);
+                    size_t at = (size_t)(jump_at - offset);
+                    if (jump_at >= offset && at + 5 <= length && buffer[at] == 0xe9) {
+                        int32_t rel = (int32_t)(int64_t)((uint64_t)(uintptr_t)tramp -
+                                                           ((uint64_t)(uintptr_t)image + offset + at + 5));
+                        memcpy(buffer + at + 1, &rel, 4);
+                    }
+                }
+                memcpy(image + read_u64(r), buffer, length);
                 r += RZ_PATCH_BYTES + 2 * length;
             }
             t->rz_applied[t->rz_applied_count++] = (IsaRedZoneStub){site, stub, bytes};
@@ -516,6 +649,10 @@ IsaRedZoneReport isa_red_zone_apply(IsaTable *t, unsigned char *image, unsigned 
             report.short_relays += patches > 1;
         }
         g = q;
+    }
+    if (stats) {
+        t->rz_hits = (uint64_t *)(void *)counters;
+        t->rz_hits_count = t->rz_applied_count;
     }
     return report;
 }
@@ -582,6 +719,42 @@ static int ranks_before(const IsaTable *t, uint32_t a, uint32_t b) {
     return t->hits[a] > t->hits[b] || (t->hits[a] == t->hits[b] && t->sites[a].offset < t->sites[b].offset);
 }
 
+/* The counters of the protected instructions, one line per group: "0x<site> <hits>". */
+int isa_red_zone_dump_hits(const IsaTable *t, const char *path) {
+    if (!t || !t->rz_hits || !path) return -1;
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    for (uint32_t i = 0; i < t->rz_hits_count; i++)
+        fprintf(f, "0x%llx %llu\n", (unsigned long long)t->rz_applied[i].site,
+                (unsigned long long)t->rz_hits[i]);
+    return fclose(f) == 0 ? 0 : -1;
+}
+
+/* The protected instructions with the most executions: the same order as the ISA sites. */
+static void red_zone_report(const IsaTable *t, FILE *out) {
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < t->rz_hits_count; i++) total += t->rz_hits[i];
+    fprintf(out, "Red zone: %u groups with a protected instruction, %llu executions counted; most executed:\n",
+            t->rz_hits_count, (unsigned long long)total);
+    int64_t prev = -1;
+    for (int line = 0; line < 10; line++) {
+        int64_t best = -1;
+        for (uint32_t i = 0; i < t->rz_hits_count; i++) {
+            if (t->rz_hits[i] == 0) continue;
+            if (prev >= 0 && !(t->rz_hits[i] > t->rz_hits[prev] ||
+                               (t->rz_hits[i] == t->rz_hits[prev] && t->rz_applied[i].site < t->rz_applied[prev].site)))
+                continue;
+            if (best < 0 || t->rz_hits[i] > t->rz_hits[best] ||
+                (t->rz_hits[i] == t->rz_hits[best] && t->rz_applied[i].site < t->rz_applied[best].site))
+                best = i;
+        }
+        if (best < 0) return;
+        fprintf(out, "  0x%llx %llu\n", (unsigned long long)t->rz_applied[best].site,
+                (unsigned long long)t->rz_hits[best]);
+        prev = best;
+    }
+}
+
 void isa_rewrite_report(const IsaTable *t, FILE *out) {
     fprintf(out, "ISA: most executed sites:\n");
     int64_t prev = -1;   /* last printed site; each pass takes the best one ranked after it */
@@ -591,9 +764,29 @@ void isa_rewrite_report(const IsaTable *t, FILE *out) {
             if (t->hits[i] == 0 || (prev >= 0 && !ranks_before(t, (uint32_t)prev, i))) continue;
             if (best < 0 || ranks_before(t, i, (uint32_t)best)) best = i;
         }
-        if (best < 0) return;
+        if (best < 0) break;
         fprintf(out, "  0x%llx %s %llu\n", (unsigned long long)t->sites[best].offset,
                 isa_kind_name(t->sites[best].kind), (unsigned long long)t->hits[best]);
         prev = best;
+    }
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < t->count; i++) total += t->hits[i];
+    fprintf(out, "ISA: %llu rewrites executed over %u sites\n", (unsigned long long)total, t->count);
+    const char *isa_path = isa_stats_path();
+    if (isa_path && t->sites && t->hits) {
+        FILE *f = fopen(isa_path, "w");
+        if (!f) fprintf(stderr, "ISA: cannot write the counters to %s\n", isa_path);
+        else {
+            for (uint32_t i = 0; i < t->count; i++)
+                fprintf(f, "0x%llx %llu\n", (unsigned long long)t->sites[i].offset,
+                        (unsigned long long)t->hits[i]);
+            fclose(f);
+        }
+    }
+    if (t->rz_hits && t->rz_hits_count) {
+        red_zone_report(t, out);
+        const char *path = rz_stats_path();
+        if (path && isa_red_zone_dump_hits(t, path) != 0)
+            fprintf(stderr, "Red zone: cannot write the counters to %s\n", path);
     }
 }

@@ -24,6 +24,10 @@ typedef struct {
     uint32_t rz_code_bytes, rz_groups, rz_group_bytes, rz_stats[ISA_RZ_STATS];
     IsaRedZoneStub *rz_applied; uint32_t rz_applied_count;
     unsigned char *rz_area;              /* set by isa_red_zone_apply */
+    /* Counters of the protected instructions (TLG_REDZONE_STATS): rz_hits[i] belongs to
+     * rz_applied[i]. They live in the red-zone area, after the stub code, so the trampoline that
+     * counts can reach them with a rip-relative increment (no register is touched). */
+    uint64_t *rz_hits; uint32_t rz_hits_count;
     /* Set before isa_rewrite_apply: a JMP_RELOCATE stub runs its relocated instruction 128 bytes
      * below the guest rsp when that instruction can fault (IsaSite.mem_flags & ISA_MEM_RELOCATED_FAULTABLE). */
     int protect_red_zone;
@@ -52,8 +56,13 @@ IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *st
 int isa_rewrite_trap(IsaTable *t, uintptr_t address, IsaRegs *regs, void *xmm, uintptr_t *next_rip);
 /* Site index whose stub holds rip, or -1. */
 int isa_rewrite_site_of_stub(const IsaTable *t, uintptr_t rip);
-/* Bytes of the red-zone stub code (0 without a section); the loader maps them at image + rz_code_offset. */
+/* Bytes of the red-zone stub code (0 without a section); the loader maps them at image + rz_code_offset.
+ * With TLG_REDZONE_STATS the counters and their trampolines follow the code in the same area. */
 size_t isa_red_zone_code_size(const IsaTable *t);
+/* 1 when TLG_REDZONE_STATS asks for the counters (1: count, a path: count and dump), 0 otherwise. */
+int isa_red_zone_counters(void);
+/* "0x<site> <hits>" per applied group into `path` (the counters of TLG_REDZONE_STATS); 0 on success. */
+int isa_red_zone_dump_hits(const IsaTable *t, const char *path);
 /* Copies the red-zone stub code to `area` (which must be image + rz_code_offset, RW) and writes each
  * patch group whose original bytes all still match the image; a changed group (game patch, hook) is
  * skipped whole, with one stderr line. Returns {0} with skipped = groups when area is misplaced. */
