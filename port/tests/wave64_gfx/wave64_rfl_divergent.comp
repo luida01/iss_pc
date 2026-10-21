@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// The divergent exchange on the real GPU, with the barrier INSIDE the divergent region:
+// the exchange the port emits for a v_readfirstlane in divergent flow
+// (shader_recompiler/ir/passes/lower_wave64_pass.cpp).
+//
+// Each lane has a value of its own; the even lanes are active (the exec mask of the
+// region). The exchange has to give every lane of the wave64 the value of the wave's first
+// active lane (the lane 0, so 100), and not the value of the first active lane of the lane's
+// own host half (the upper half would read the lane 32, so 132).
+//
+// The barrier is inside the divergent region: only the lanes with the exec mask set reach
+// it, like the ones the port emits. Vulkan leaves that undefined ("OpControlBarrier must
+// not be placed in non-uniform control flow"), but the driver syncs the active lanes of the
+// workgroup, which is what the wave64 does at its reconvergence points. The probe says
+// whether the device hangs and whether the two halves agree.
+#version 450
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Out {
+    uint data[];
+} out_buf;
+layout(constant_id = 0) const uint BASE = 100;
+shared uint slot_value[2];
+shared uint slot_mask[2];
+void main() {
+    uint lane = gl_LocalInvocationIndex;
+    uint value = BASE + lane;
+    bool in_mask = (lane % 2u) == 0u;
+    uint which = lane / 32u;
+    uint answer = 0u;
+    if (in_mask) {
+        // The candidates of this half: the lanes with the exec mask set.
+        uvec4 ballot = subgroupBallot(in_mask);
+        uint mask = ballot.x;
+        bool has_candidate = mask != 0u;
+        uint first = has_candidate ? subgroupBallotFindLSB(ballot) : 0u;
+        uint local_value = subgroupShuffle(value, first);
+        // The exchange: the value and the mask of each half. The barrier is HERE, in the
+        // divergent region: only the lanes with the exec mask set reach it.
+        slot_value[which] = local_value;
+        slot_mask[which] = mask;
+        barrier();
+        answer = slot_mask[0] != 0u ? slot_value[0] : slot_value[1];
+        barrier();
+    }
+    out_buf.data[lane] = answer;
+}

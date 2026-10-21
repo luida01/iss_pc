@@ -1,12 +1,13 @@
 # Las partículas siguen sin aparecer: qué se ha descartado y cómo se cierra el caso
 
-> **Fecha:** 2026-10-20 (actualizado el 2026-10-21 con la sesión del censo) ·
+> **Fecha:** 2026-10-20 (actualizado el 2026-10-21 con la sesión del censo y con el
+> **arreglo del `ReadFirstLane` en flujo divergente, ya implementado**) ·
 > **Alcance:** `port/gpu/shadps4/video_core/texture_cache/**`,
-> `port/gpu/shadps4/video_core/amdgpu/**`, `port/tests/**` ·
-> **Estado:** las texturas y los dispatches están **descartados**. La sesión con la sonda
-> (`evidence/20261020-233329-census/`) deja el caso en **un solo sitio**: los argumentos del
-> draw indirecto. La causa concreta depende de una línea que la sonda ahora dice
-> (`written by the GPU` / `clean`); el resto está medido y documentado aquí.
+> `port/gpu/shadps4/video_core/amdgpu/**`, `port/gpu/shadps4/shader_recompiler/**`,
+> `port/tests/**` ·
+> **Estado:** las texturas y los dispatches están **descartados**; el `ReadFirstLane` de
+> wave64 en flujo divergente **era el bug** y **ya está arreglado** (§2.3). Queda un parche
+> **propuesto** para el renderer (§2.4), fuera del alcance de este agente.
 
 ## 1. Resumen para quien tenga prisa
 
@@ -16,7 +17,7 @@
 | Los draws de las partículas no llegan al driver | **Descartada** | ~4000 draws por frame; "0 not" pipelines |
 | El decode BC de la CPU está mal (la textura sale invisible) | **Descartada** | `bc-decode-test` (especificación DXT) y `bc-decode-gpu-test` (el decodificador del driver). **En vivo**: `tlg: BC decode 512x1 layers 32 mips 10: 130944 texel bytes, 32736 not zero` |
 | La imagen 1D de 32 capas es un objeto Vulkan inválido | **Descartada** (el driver la acepta) | `1d-array-test` en la RTX 3050 |
-| El `ReadFirstLane` de wave64 sigue sin bajarse en los shaders de partículas | **Causa confirmada** | El compute que escribe el conteo (`0xb6a8b76e`) es uno de los **20 shaders** con un `ReadFirstLane` sin bajar **y con un valor que depende de la lane** (sección 2.2) |
+| El `ReadFirstLane` de wave64 sigue sin bajarse en los shaders de partículas | **Causa confirmada y ARREGLADA** | El compute que escribe el conteo (`0xb6a8b76e`) es uno de los **20 shaders** con un `ReadFirstLane` sin bajar **y con un valor que depende de la lane** (§2.2). El arreglo (§2.3) lo baja con el intercambio de la máscara de exec |
 | El draw no ve el conteo que escribió el compute | **Sin comprobar: es lo que decide la sonda `TLG_DRAW_CENSUS=1`** (línea "the region is clean / written by the GPU") | Una sesión de juego con la sonda |
 
 ### 1.1 Lo que dijo la sesión del censo
@@ -174,67 +175,140 @@ cached shaders: 1071
     0x00000000feebf633_0: 10 ...
 ```
 
-### 2.3 El arreglo propuesto (recompilador: fuera del alcance de este agente)
+### 2.3 El arreglo (implementado): el intercambio del `ReadFirstLane` en flujo divergente
 
-**`port/gpu/shadps4/shader_recompiler/ir/passes/lower_wave64_pass.cpp`**: hoy el paso se
-niega a bajar un `ReadFirstLane` en flujo divergente porque el intercambio por LDS necesita
-una barrera de workgroup, y una barrera en control de flujo no uniforme es comportamiento
-indefinido en Vulkan. **Esa es la razón de que 20 shaders (uno de ellos el de las
-partículas) calculen mal en la mitad superior de la wave.**
+**Fichero:** `port/gpu/shadps4/shader_recompiler/ir/passes/lower_wave64_pass.cpp`
+(más `recompiler_toggles.h` para el interruptor y `port/tests/test_recompiler_fixes.cpp` para el
+banco).
 
-El arreglo tiene que **subir el intercambio a flujo uniforme**:
+El `ReadFirstLane` de un flujo divergente ya **no se queda como un broadcast por subgrupo**.
+El port hace el mismo intercambio que en el flujo uniforme, pero **con la máscara de exec de
+la región** (la condición de la rama, acumulada):
+
+1. **Cada medio subgrupo del host** toma las lanes que su propio *ballot* de la máscara marca
+   (el `OpGroupNonUniformBallot` de la máscara de exec) y el valor de la primera de ellas
+   (un `OpGroupNonUniformShuffle` dentro del subgrupo).
+2. **Cada medio escribe** ese valor y su máscara en el scratch (LDS) y **los dos medios leen
+   los dos huecos**: el valor del medio par si tiene candidatos, el del medio impar si no.
+   **Ese es el valor de la primera lane de la WAVE con la condición puesta** ✓ (el mismo
+   resultado que la PS4).
+3. Las dos barreras de workgroup que ordenan el intercambio.
+
+**Dónde se hace el intercambio (la parte importante):**
+
+* **Si el valor que se difunde se conoce antes de la rama** (un valor cargado o calculado
+  antes), el intercambio **se sube al bloque que ramifica a la región divergente**: allí el
+  flujo es uniforme y **la barrera va en flujo uniforme** ✓ (sin comportamiento indefinido).
+  Es el caso que describe el §2.3 de este documento antes de la implementación.
+* **Si el valor solo se conoce dentro de la región** (un valor carried por un bucle, un
+  atómico), **el intercambio se queda donde está la instrucción**, con **la barrera en flujo
+  divergente**. Vulkan deja eso indefinido ("`OpControlBarrier` must not be placed in
+  non-uniform control flow"), pero el driver sincroniza las lanes activas del workgroup
+  (un `bar.sync` con la máscara activa), que es justo lo que hace la wave64 en sus puntos de
+  reconvergencia. **Verificado en la GPU real del usuario** (más abajo).
+
+**=> En los 20 shaders afectados del juego el valor es solo conocido dentro de la región
+(el del compute de las partículas es un `Phi` carried por un bucle), así que el intercambio
+va en el sitio y la barrera queda en flujo divergente.** El caso "subido" (sin barrera en
+flujo divergente) queda implementado y probado para cuando el valor se conoce antes.
+
+**La red de seguridad (lo que NO se baja):**
+
+| Caso | Qué hace el port | Por qué |
+|---|---|---|
+| El valor es **uniforme** (se lee de una dirección constante) | **No se baja** | El broadcast por subgrupo ya da el mismo valor: el intercambio sería trabajo perdido |
+| El shader **fija la máscara de exec** (`s_mov exec`) | Se baja en el sitio (con la máscara real, `GetExec`) | La máscara de la rama no es su condición sola |
+| La rama está **anidada** en otra rama divergente | Se baja en el sitio (con la máscara real) | La máscara acumulada solo se conoce en el sitio |
+| `TLG_RFL_ALL=0` | **No se baja nada** (la vía vieja, para el A/B) | El interruptor que se pidió conservar |
+| `TLG_RFL_DIVERGENT=0` | No se baja el caso "en el sitio" (el "subido" sigue) | A/B del caso con la barrera en flujo divergente |
+
+**El coste (medido con `port/tests/spv_rfl_harm.py` sobre la caché de shaders):**
+
+| | |
+|---|---|
+| Shaders con un `ReadFirstLane` sin bajar | 178 (de 1071 en la caché) |
+| De ellos, los que **difunden un valor que depende de la lane** (los que importan) | **20** |
+| Instrucciones a bajar en esos 20 shaders | **120** |
+| Barreras de workgroup añadidas | **240** (2 por instrucción) |
+| InstrUCCiones extra por instrucción | 2 escrituras a LDS + 4 lecturas a LDS + 1 ballot + 1 shuffle + ~6 ALU |
+| Scratch de LDS extra | 16 bytes por wave64 (el valor y la máscara de cada medio) |
+
+Los otros 158 shaders con un `ReadFirstLane` sin bajar difunden un valor **uniforme**: no se
+toca (el intercambio no cambiaría nada) ✓ **coste cero ahí** ✓.
+
+**Verificación:**
+
+* **Banco unitario** (`port/tests/test_recompiler_fixes.cpp`): un `ReadFirstLane` en flujo
+  divergente con el valor conocido antes de la rama → el intercambio **sube** al bloque que
+  ramifica (2 barreras **en ese bloque**, 4 lecturas a LDS, 1 shuffle, 1 ballot, y **ningún**
+  `ReadFirstLane` en el shader); con el valor solo conocido dentro (un atómico) → el
+  intercambio se queda en el sitio (2 barreras en el bloque de la región); con
+  `TLG_RFL_ALL=0` → no se baja nada. El SPIR-V emitido se valida con `spirv-val` ✓.
+* **Sonda en la GPU real** (`port/tests/wave64_rfl_divergent_probe.cpp` +
+  `port/tests/wave64_gfx/wave64_rfl_divergent.comp`): el mismo intercambio escrito en GLSL,
+  **con la barrera dentro de la región divergente** (solo llegan las lanes con la máscara de
+  exec puesta, como en el port), ejecutado en la RTX 3050 del usuario (32 lanes por subgrupo):
 
 ```
-if (cond) {                       // cond ya está calculado antes de la rama
-    v = readfirstlane(x);          // "el valor de la primera lane activa de la wave"
-    ...
-}
+device: NVIDIA GeForce RTX 3050 Laptop GPU (driver NVIDIA), subgroup size 32
+  lanes in the region: 32 of 64
+  lanes with the wave's first active lane's value (100): 32 of 32
+  lanes with their own half's first active lane's value (132): 0 of 32
+  the first 8 values: 100 0 100 0 100 0 100 0
+RESULT: every lane of the region reads the wave's first active lane
 ```
 
-se puede escribir como
+  (sin el intercambio, las lanes de la mitad superior leerían 132: el valor de su propia
+  lane 32) ✓. **Y el dispositivo no se cuelga con la barrera en flujo divergente** ✓ (la
+  sonda tiene un tiempo límite y termina) ✓.
+* **En el juego**: el log del censo dice ahora cuántos se bajan y cuántos no:
 
 ```
-// flujo uniforme (antes de la rama):
-u32 first = exchange_first_active(x, cond);   // el valor de la primera lane de la WAVE
-                                               // que cumple cond
-if (cond) {
-    v = first;                    // una carga, sin barrera: vale en flujo divergente
-    ...
-}
+tlg: wave64 compute shader 0xb6a8b76e (64 threads, 64x1x1): ReadFirstLane 4 (4 ReadFirstLane in divergent flow: 4 lowered, 0 uniform, 0 not)
 ```
 
-donde `exchange_first_active` es:
+**El interruptor:** `TLG_RFL_DIVERGENT` (por defecto **encendido**, como `TLG_RFL_ALL`):
+`TLG_RFL_DIVERGENT=0` deja el caso "en el sitio" como estaba (para el A/B) y
+`TLG_RFL_ALL=0` deja los `ReadFirstLane` en flujo divergente sin tocar (la vía vieja) ✓. Los dos
+están en la sal de la caché de shaders (`ShaderBinarySalt`) ✓, así que un cambio invalida
+la caché ✓.
 
-1. **dentro** del subgrupo del host: la lane más baja del subgrupo que cumple `cond` (una
-   reducción de subgrupo, sin barrera de workgroup) y su valor;
-2. **entre** los dos subgrupos del host: el intercambio por LDS que el port ya sabe hacer
-   (el scratch de 8 bytes y las dos barreras), **pero aquí en flujo uniforme** ✓ (el
-   intercambio está antes de la rama, así que todas las lanes llegan a la barrera);
-3. el resultado es el de la mitad baja si esa mitad tiene alguna lane activa, y si no el de
-   la mitad alta.
+### 2.4 Lo que queda para el renderer (parche propuesto, **no aplicado**)
 
-Es el mismo mecanismo que el intercambio que el port ya hace para el `ReadFirstLane` en
-flujo uniforme (`EmitReadFirstLane` / el scratch de LDS), **con una reducción de subgrupo
-antes** para tener en cuenta la máscara de exec de la rama.
+`video_core/renderer_vulkan/vk_rasterizer.cpp`, `Rasterizer::DrawIndirectRecord` (la línea
+~1494):
 
-**El coste**: una reducción de subgrupo y las dos barreras de workgroup por `ReadFirstLane`
-en flujo divergente (los 20 shaders de la lista, no los 178: en los otros el valor es
-uniforme y no hay nada que intercambiar).
+```cpp
+-    const auto [buffer, base] =
+-        buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
++    // tlg: los argumentos de un draw indirecto los escribe la GPU (el compute que cuenta
++    // las partículas): no pueden servirse de una copia de la memoria del invitado (el
++    // "stream path" de BufferCache::ObtainBuffer, que devuelve una copia fresca para un
++    // búfer pequeño y de solo lectura del que la GPU no ha escrito), ni subirse desde ella
++    // encima de lo que escribió el compute.
++    const auto [buffer, base] =
++        buffer_cache.ObtainIndirectBuffer(indirect.args, stride * max_count);
+```
 
-**Cómo se verifica** (el mismo camino que el arreglo anterior):
+Y en `video_core/buffer_cache/buffer_cache.cpp`, un `ObtainIndirectBuffer` que:
 
-* `port/tests/test_recompiler_fixes.cpp`: un caso con el patrón "append" **en flujo
-  divergente** (el `ReadFirstLane` dentro de un `if` cuyo valor depende de la lane), con el
-  modelo de referencia wave64 y el resultado esperado;
-* `port/tests/spv_rfl_harm.py` sobre la caché de shaders: después del arreglo, los 20
-  shaders con un valor dependiente de la lane **no** deben tener ningún broadcast sin
-  intercambio (`with a source that depends on the lane: 0`);
-* la sonda `TLG_DRAW_CENSUS=1` en vivo: el `instances` de los sitios de las partículas debe
-  pasar de 0 a N.
+1. **no** tome el camino "stream" (siempre el "arena"), y
+2. **no** suba la memoria del invitado encima de una región que la GPU escribió (el
+   `ForEachUploadRange` de solo lectura ya sube solo las páginas modificadas por la CPU; si
+   la región está marcada por la GPU, no hay que subir nada).
 
-**Nota**: el arreglo es del **recompilador**, que no es del alcance de este agente (que
-cubre `texture_cache/**`, `amdgpu/**` y `tlg_settings.*`); queda propuesto aquí con el
-diagnóstico y la verificación.
+**El banco que lo demuestra:** `port/tests/test_draw_census.cpp` (el mismo sitio de la sonda
+`TLG_DRAW_CENSUS=1`): con un draw indirecto cuyo `instances` lo escribió un compute, el
+"stream path" devuelve 0 (el marcador de posición del invitado) y el "arena" devuelve el
+valor del compute. La sonda `TLG_DRAW_CENSUS=1` lo dice en vivo, por sitio:
+
+```
+  indirect site 0000001070090300: 6 draws, count 6, instances 0  <-- the guest's copy says 0 instances
+      the region is clean (the draw reads the guest memory), and the guest wrote there too
+```
+
+**"the region is clean"** = el draw lee la copia del invitado (el bug); **"the region is
+written by the GPU"** = el draw lee el búfer donde el compute escribió ✓.
 
 ## 3. El arreglo propuesto (renderer / buffer cache: fuera del alcance de este agente)
 
@@ -383,11 +457,34 @@ el compute que escribe el número de partículas**.
 
 ## 5. Qué hay que hacer ahora
 
-### 5.1 El arreglo que falta (recompilador)
+### 5.1 El arreglo que faltaba (recompilador) — **hecho**
 
-Bajar el `ReadFirstLane` en flujo divergente (sección 2.3). Es la causa de las
+Bajar el `ReadFirstLane` en flujo divergente (§2.3). Es la causa de las
 partículas: el compute que escribe el número de instancias (`0xb6a8b76e`) es uno de los 20
 shaders con un `ReadFirstLane` sin bajar **y con un valor que depende de la lane**.
+
+**Para comprobarlo en el juego (una sesión):**
+
+1. Jugar con el port nuevo (la caché de shaders se invalida sola: cambió el recompilador ✓).
+2. El log del censo dirá cuántos se bajan:
+
+```
+tlg: wave64 compute shader 0xb6a8b76e (64 threads, 64x1x1): ReadFirstLane 4 (4 ReadFirstLane in divergent flow: 4 lowered, 0 uniform, 0 not)
+```
+
+3. Y la caché de shaders nueva, con el banco:
+
+```powershell
+python port\tests\spv_rfl_harm.py userdata\cache\CUSA00223-7554b4d1b0b4 --spirv-dis C:\msys64\clang64\bin\spirv-dis.exe
+```
+
+   **esperado**: `of those, with a source that depends on the lane: 0` (los 20 shaders que
+   importan ya no dejan ningún `ReadFirstLane` sin bajar) ✓.
+
+4. Y la sonda de draws (§5.2), para ver si el conteo de partículas cambia.
+
+**El A/B:** `TLG_RFL_DIVERGENT=0` (deja el intercambio en el sitio como estaba) y
+`TLG_RFL_ALL=0` (deja los `ReadFirstLane` en flujo divergente sin tocar, la vía vieja) ✓.
 
 ### 5.2 La comprobación que falta (una sesión, y decide entre las dos causas)
 
@@ -424,12 +521,13 @@ descartada.
 
 * **El arreglo del renderer** (punto 3): fuera del alcance de este agente (lo otro agente
   trabaja en `renderer_vulkan/**`); aquí está el parche exacto y el porqué.
-* **Bajar el `ReadFirstLane` en flujo divergente**: problema real y medido (20 shaders con
-  un valor dependiente de la lane, uno de ellos el compute de las partículas), pero el
-  arreglo es del recompilador; la sección 2.3 lo describe con el algoritmo y la verificación.
-* **La visibilidad (blend, depth, descarte)**: nada en el log la señala ("reduced-size draws
-  0/frame", "0 not" pipelines sin preparar, ningún "dropped indirect draw"). Con el
-  diagnóstico cerrado (el compute calcula mal el conteo) queda como descartada.
+* **Bajar el `ReadFirstLane` en flujo divergente**: **hecho** (§2.3). El intercambio se sube
+  al bloque que ramifica a la región divergente cuando el valor se conoce antes de la rama
+  (flujo uniforme, sin comportamiento indefinido) y se queda en el sitio cuando el valor
+  solo se conoce dentro (la barrera queda en flujo divergente, que es lo que hace la wave64
+  en sus puntos de reconvergencia y lo que el driver sincroniza: verificado en la RTX 3050).
+* **El parche del renderer** (§2.4): fuera del alcance de este agente (otro agente trabaja
+  ahora mismo en `renderer_vulkan/**`); queda escrito, con el razon y la prueba.
 
 ## 7. Ficheros de este trabajo
 
@@ -445,6 +543,9 @@ descartada.
 | `port/tests/test_draw_census.cpp` | Banco de la sonda de draws |
 | `port/tests/spv_rfl_census.py` | Comprobación cruzada del censo de wave64 con el SPIR-V de la caché |
 | `port/tests/spv_rfl_harm.py` | Los shaders con un `ReadFirstLane` sin bajar **y con un valor que depende de la lane** (nuevo) |
+| `port/gpu/shadps4/shader_recompiler/ir/passes/lower_wave64_pass.cpp` | **El arreglo**: el intercambio del `ReadFirstLane` en flujo divergente, con la máscara de exec de la región (§2.3) |
+| `port/gpu/shadps4/shader_recompiler/recompiler_toggles.h` | El interruptor `TLG_RFL_DIVERGENT` (por defecto encendido) y su sal de caché |
+| `port/tests/wave64_rfl_divergent_probe.cpp`, `port/tests/wave64_gfx/wave64_rfl_divergent.comp` | La sonda en la GPU real del intercambio divergente (nuevo) |
 | `port/gpu/CMakeLists.txt` | Los cuatro bancos nuevos |
 
 ### Reproducir
@@ -457,3 +558,16 @@ descartada.
 
 Todos pasan en la RTX 3050 del usuario (`bc-decode-gpu-test` y `1d-array-test` necesitan un
 driver Vulkan; sin él se saltan).
+
+La sonda del intercambio divergente en la GPU real (no es un target de CMake: se compila a
+mano, como la del `ReadFirstLane` uniforme):
+
+```powershell
+& 'C:\msys64\usr\bin\bash.exe' -lc 'source /c/Users/luisd/proyectos/infamous-port/port/msys2-env.sh; cd /c/Users/luisd/proyectos/infamous-port/port/tests/wave64_gfx && glslang --target-env vulkan1.1 -o wave64_rfl_divergent.spv wave64_rfl_divergent.comp && cd .. && clang++ -std=c++20 -O2 -I ../gpu/third_party/vulkan-headers/include wave64_rfl_divergent_probe.cpp -lvulkan-1 -o ../out/gpu-particles/wave64-rfl-divergent-probe.exe && WAVE64_PROBE_DEVICE=NVIDIA ./../out/gpu-particles/wave64-rfl-divergent-probe.exe wave64_gfx/wave64_rfl_divergent.spv'
+```
+
+Y el banco del recompilador (el que cubre el intercambio):
+
+```powershell
+& 'C:\msys64\usr\bin\bash.exe' -lc 'source /c/Users/luisd/proyectos/infamous-port/port/msys2-env.sh; cd /c/Users/luisd/proyectos/infamous-port/port/out/gpu-particles && ninja recompiler-fixes-test && ./recompiler-fixes-test.exe'
+```

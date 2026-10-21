@@ -254,6 +254,112 @@ static ReadFirstLaneForm RunReadFirstLaneForm(bool varying, bool divergent, u32 
     return form;
 }
 
+// tlg: the ReadFirstLane in divergent flow, whose exchange is hoisted to the block that
+// branches to the divergent region (uniform flow, where a workgroup barrier is allowed).
+//
+// The value the branch broadcasts has to be known before the branch: when it is not (a loop
+// carried value, an atomic inside the region), the instruction stays a host broadcast and
+// the upper half of the wave reads its own lane 32.
+struct DivergentForm {
+    u32 broadcasts{}; // the ReadFirstLane instructions left in the shader
+    u32 barriers{};   // the barriers of the exchange
+    u32 in_hoist{};   // the barriers in the block that branches to the divergent region
+    u32 loads{};      // the LDS loads of the exchange
+    u32 writes{};     // the LDS writes of the exchange
+    u32 shuffles{};   // the shuffles (the value of the first lane of the subgroup)
+    u32 ballots{};    // the ballots (the lanes of the subgroup with the exec mask set)
+};
+
+static DivergentForm RunDivergentReadFirstLane(bool value_before_branch,
+                                                const char* spirv_path = nullptr) {
+    Info info{};
+    info.hw_stage = HwStage::Compute;
+    info.sw_stage = SwStage::Compute;
+    RuntimeInfo runtime{};
+    runtime.Initialize(HwStage::Compute, SwStage::Compute);
+    runtime.hw.cs.shared_memory_size = 256;
+    runtime.hw.cs.workgroup_size = {64, 1, 1};
+    Common::ObjectPool<IR::Inst> pool;
+    IR::Block hoist(pool);
+    IR::Block body(pool);
+    IR::Block merge(pool);
+    // The block that branches to the divergent region: the condition and, when it is known
+    // before the branch, the value the ReadFirstLane broadcasts.
+    IR::IREmitter hoist_ir(hoist);
+    const IR::U32 tid = hoist_ir.GetAttributeU32(IR::Attribute::LocalInvocationId, 0);
+    const IR::U1 cond{
+        hoist_ir.INotEqual(hoist_ir.BitwiseAnd(tid, hoist_ir.Imm32(1u)), hoist_ir.Imm32(0u))};
+    // The value the branch broadcasts has to be known before the branch, and it has to be
+    // able to differ between the lanes (a uniform value needs no exchange).
+    const IR::U32 source_before = IR::U32{tid};
+    // The divergent region.
+    IR::IREmitter ir(body);
+    // The value the branch broadcasts: known before the branch, or only inside the region.
+    const IR::U32 source =
+        value_before_branch ? source_before
+                            : IR::U32{ir.SharedAtomicIAdd(ir.Imm32(0u), ir.Imm32(1u), false)};
+    const IR::U32 base = IR::U32{ir.ReadFirstLane(source)};
+    ir.WriteShared(32, base, ir.Imm32(0u));
+    ir.Epilogue();
+    IR::Program program(info);
+    program.blocks.push_back(&hoist);
+    program.blocks.push_back(&body);
+    program.blocks.push_back(&merge);
+    program.post_order_blocks.push_back(&hoist);
+    program.post_order_blocks.push_back(&body);
+    program.post_order_blocks.push_back(&merge);
+    program.syntax_list.push_back({.data = {.block = &hoist},
+                                   .type = IR::AbstractSyntaxNode::Type::Block});
+    program.syntax_list.push_back(
+        {.data = {.if_node = {.cond = cond, .body = &body, .merge = &merge}},
+         .type = IR::AbstractSyntaxNode::Type::If});
+    program.syntax_list.push_back({.data = {.block = &body},
+                                   .type = IR::AbstractSyntaxNode::Type::Block});
+    program.syntax_list.push_back({.data = {.end_if = {.merge = &merge}},
+                                   .type = IR::AbstractSyntaxNode::Type::EndIf});
+    program.syntax_list.push_back({.data = {.block = &merge},
+                                   .type = IR::AbstractSyntaxNode::Type::Block});
+    program.syntax_list.push_back({.type = IR::AbstractSyntaxNode::Type::Return});
+    Profile profile{};
+    profile.subgroup_size = 32;
+    profile.supported_spirv = 0x00010600;
+    profile.support_int64 = true;
+    Optimization::LowerWave64BallotPass(program, runtime, profile);
+    DivergentForm form{};
+    form.broadcasts = Count(body, IR::Opcode::ReadFirstLane);
+    form.barriers = Count(body, IR::Opcode::Barrier) + Count(hoist, IR::Opcode::Barrier);
+    form.in_hoist = Count(hoist, IR::Opcode::Barrier);
+    form.loads = Count(hoist, IR::Opcode::LoadSharedU32) + Count(body, IR::Opcode::LoadSharedU32);
+    form.writes = Count(hoist, IR::Opcode::WriteSharedU32) + Count(body, IR::Opcode::WriteSharedU32);
+    form.shuffles = Count(hoist, IR::Opcode::Shuffle) + Count(body, IR::Opcode::Shuffle);
+    form.ballots = Count(hoist, IR::Opcode::Ballot) + Count(body, IR::Opcode::Ballot);
+    if (spirv_path) {
+        Optimization::CollectShaderInfoPass(program, profile);
+        Backend::Bindings bindings{};
+        const auto code = Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
+        std::ofstream out(spirv_path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u32));
+        Check(bool(out) && !code.empty(), "the lowered divergent wave64 shader emits SPIR-V");
+    }
+    return form;
+}
+
+// tlg: the model of the exchange: the value every lane of the wave sees is the value of the
+// first lane of the wave whose condition holds (the reference is the PS4's wave64). The
+// condition of the test is the parity of the lane id, so the even lanes are active and the
+// first active lane of the wave is the lane 0.
+struct DivergentModel {
+    static u32 Reference(bool varying) {
+        return varying ? 100u : 7u;
+    }
+    /// The value the host's per-subgroup broadcast gives to a lane: the first active lane of
+    /// its own half (the upper half reads its own lane 32).
+    static u32 HostPerHalf(u32 lane, bool varying) {
+        const u32 first = (lane / 32) * 32;
+        return varying ? 100u + first : 7u;
+    }
+};
+
 // A 64-thread compute block with one ReadFirstLane (of a lane-varying value when `varying`) and
 // no ballot: lowered for wave64 (two workgroup barriers) only with TLG_RFL_ALL.
 static u32 ReadFirstLaneBarriers(bool varying) {
@@ -518,11 +624,42 @@ int main(int argc, char** argv) {
               AppendPattern::Slots(AppendPattern::Form::Exchange, 100) == 64 &&
               !AppendPattern::WritesInsideTheList(AppendPattern::Form::HostPerHalf, 100),
           "append pattern: the per subgroup broadcast writes the upper half outside the list");
-    // A ReadFirstLane in divergent flow cannot be exchanged (the barrier would sit in non
-    // uniform control flow): it stays a host broadcast and the log says so.
+    // A ReadFirstLane in divergent flow is exchanged too now: the exchange stays where the
+    // instruction is (the barrier in non uniform control flow) or is hoisted to the block
+    // that branches to the divergent region when the value is known there.
     const ReadFirstLaneForm divergent = RunReadFirstLaneForm(true, true);
-    Check(divergent.broadcasts == 1 && divergent.barriers == 0 && divergent.exchanges == 0,
-          "append pattern in divergent flow: the ReadFirstLane is left alone");
+    Check(rfl_all ? (divergent.broadcasts == 0 && divergent.barriers == 2)
+                  : (divergent.broadcasts == 1 && divergent.barriers == 0),
+          "append pattern in divergent flow: the ReadFirstLane is exchanged too (TLG_RFL_ALL)");
+    // A ReadFirstLane in divergent flow is now exchanged too, with the exchange hoisted to
+    // the block that branches to the divergent region (uniform flow, where the barrier is
+    // allowed). The value it broadcasts has to be known before the branch.
+    const DivergentForm divergent_hoisted = RunDivergentReadFirstLane(true);
+    Check(rfl_all ? (divergent_hoisted.broadcasts == 0 && divergent_hoisted.in_hoist == 2 &&
+                     divergent_hoisted.loads == 4 && divergent_hoisted.writes == 3 &&
+                     divergent_hoisted.shuffles == 1 && divergent_hoisted.ballots == 1)
+                  : (divergent_hoisted.broadcasts == 1 && divergent_hoisted.barriers == 0),
+          "ReadFirstLane in divergent flow: the exchange is hoisted to the block that branches "
+          "to the divergent region (TLG_RFL_ALL)");
+    // The value is only known inside the divergent region (an atomic there): the exchange
+    // cannot be hoisted, so it stays where the instruction is, with its barrier in non
+    // uniform control flow.
+    const DivergentForm divergent_inner = RunDivergentReadFirstLane(false);
+    Check(rfl_all ? (divergent_inner.broadcasts == 0 && divergent_inner.barriers == 2 &&
+                     divergent_inner.in_hoist == 0 && divergent_inner.loads == 4)
+                  : (divergent_inner.broadcasts == 1 && divergent_inner.barriers == 0),
+          "ReadFirstLane whose value is only known inside the divergent region is exchanged in "
+          "place");
+    // The model: the exchange gives every lane the value of the first lane of the wave with
+    // the condition set, and the per subgroup broadcast gives the upper half its own lane 32.
+    Check(DivergentModel::Reference(true) == 100 && DivergentModel::HostPerHalf(63, true) == 132,
+          "divergent exchange: only the per subgroup broadcast loses the upper half of the wave");
+    if (!spirv.empty()) {
+        // The SPIR-V of the lowered divergent shader (for spirv-val).
+        const auto path = (std::filesystem::path{spirv}.parent_path() / "wave64-rfl-divergent.spv")
+                              .string();
+        RunDivergentReadFirstLane(true, path.c_str());
+    }
     // Two waves in the workgroup: each wave has its own slot pair.
     const ReadFirstLaneForm two_waves = RunReadFirstLaneForm(true, false, 128);
     Check(two_waves.exchanges == (rfl_all ? 1u : 0u) && two_waves.barriers == (rfl_all ? 2u : 0u) &&
@@ -558,7 +695,8 @@ int main(int argc, char** argv) {
     Check(Toggles::ShaderBinarySalt() ==
               ((small ? 1u : 0u) | (multi ? 2u : 0u) | (Toggles::LdsUniformReadLane() ? 4u : 0u) |
                (wqm ? 0u : 8u) | (Toggles::LaneDivergence() ? 16u : 0u) |
-               (Toggles::ReadFirstLaneAll() ? 32u : 0u)),
+               (Toggles::ReadFirstLaneAll() ? 32u : 0u) |
+               (Toggles::ReadFirstLaneDivergent() ? 64u : 0u)),
           "shader cache salt follows the switches");
     {
         // Backport switches: tlg.ini choices apply unless the environment sets the entry; only the

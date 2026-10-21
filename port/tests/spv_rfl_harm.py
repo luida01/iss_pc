@@ -124,6 +124,126 @@ def source_lane_dependent(text: str, name: str) -> bool:
     return walk(ids[-1], set())
 
 
+def enclosing_branch(text: str, block_of: dict, name: str):
+    """The innermost branch (a OpBranchConditional) whose body holds the given instruction.
+
+    The SPIR-V is structured: a block with OpSelectionMerge and OpBranchConditional opens a
+    region whose blocks are the ones that reach the merge block through it. The region of a
+    branch is the set of blocks that reach its merge through it.
+    """
+    merges = {}
+    for line in text.splitlines():
+        m = re.match(r"^\s*OpSelectionMerge (%\S+)", line)
+        if m:
+            merges[block_of.get(name)] = m.group(1)
+    return merges.get(block_of.get(name))
+
+
+def region_blocks(text: str, entry: str, merge: str) -> set:
+    """The blocks that reach `merge` through the branch that opens it."""
+    # The blocks of the region: those that branch (directly or through the tree) to the merge.
+    region = set()
+    for line in text.splitlines():
+        m = re.match(r"^\s*OpBranch (%\S+)", line)
+        if m and m.group(1) == merge:
+            region.add(line)
+    return region
+
+
+def successors(text: str):
+    """The successors of every block, and the merge of every branch."""
+    edges = {}
+    merges = {}
+    current = None
+    targets = {}
+    for line in text.splitlines():
+        m = DEF_RE.match(line)
+        if m and m.group(2) == "OpLabel":
+            current = m.group(1)
+            targets[current] = []
+            continue
+        if current is None:
+            continue
+        m = re.match(r"^\s*OpSelectionMerge (%\S+)", line)
+        if m:
+            merges[current] = m.group(1)
+            continue
+        m = re.match(r"^\s*OpBranchConditional (%\S+) (%\S+) (%\S+)", line)
+        if m:
+            targets[current] = [m.group(2), m.group(3)]
+            continue
+        m = re.match(r"^\s*OpBranch (%\S+)", line)
+        if m:
+            targets[current] = [m.group(1)]
+            continue
+        m = re.match(r"^\s*OpLoopMerge (%\S+) (%\S+)", line)
+        if m:
+            merges[current] = m.group(1)
+            continue
+    for block, succ in targets.items():
+        edges[block] = succ
+    return edges, merges
+
+
+def region_of(edges, merge):
+    """The blocks that reach `merge` without going through it (the body of the branch)."""
+    region = set()
+    stack = [merge]
+    # The blocks that branch to the merge are the entry points of the region.
+    for block, succ in edges.items():
+        if merge in succ:
+            stack.extend(succ)
+    while stack:
+        block = stack.pop()
+        if block in region or block == merge:
+            continue
+        region.add(block)
+        stack.extend(edges.get(block, []))
+    return region
+
+
+def hoistable(text: str, name: str, defs: dict) -> bool:
+    """Whether the value the broadcast takes is defined outside the divergent region.
+
+    The port hoists the exchange to the block that branches to the divergent region, so the
+    value has to be known there. A value computed inside the region (a load there, a loop
+    carried value) cannot be hoisted.
+    """
+    block_of = {}
+    current = None
+    for line in text.splitlines():
+        m = DEF_RE.match(line)
+        if m:
+            if m.group(2) == "OpLabel":
+                current = m.group(1)
+            else:
+                block_of[m.group(1)] = current
+    entry = defs.get(name)
+    if entry is None:
+        return False
+    ids = re.findall(r"%\S+", entry[1])
+    if not ids:
+        return False
+    source_block = block_of.get(ids[-1])
+    entry_block = block_of.get(name)
+    if source_block is None or entry_block is None:
+        return False
+    if source_block == entry_block:
+        # Defined in the same block: the block is inside the divergent region (the branch to it
+        # comes later), so the value is only known inside the region.
+        return False
+    edges, merges = successors(text)
+    # The branch the entry is in: the innermost merge whose region holds the entry.
+    for block, merge in merges.items():
+        if merge is None:
+            continue
+        region = region_of(edges, merge)
+        if entry_block in region and source_block in region:
+            # The value is computed inside the same region: it cannot be hoisted.
+            return False
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("cache", type=Path)
@@ -141,12 +261,22 @@ def main() -> int:
             continue
         total += 1
         if any(source_lane_dependent(text, name) for name in left):
-            harmful.append((path.stem, len(left), len(exchanged)))
+            defs = {}
+            for line in text.splitlines():
+                m = DEF_RE.match(line)
+                if m:
+                    defs[m.group(1)] = (m.group(2), m.group(3))
+            hoist = any(hoistable(text, name, defs) for name in left)
+            harmful.append((path.stem, len(left), len(exchanged), hoist))
     print(f"cached shaders: {len(list(args.cache.glob('*.spv')))}")
     print(f"  with a ReadFirstLane left as a host broadcast: {total}")
     print(f"  of those, with a source that depends on the lane: {len(harmful)}")
-    for name, left, exchanged in harmful:
-        print(f"    {name}: {left} broadcast(s) left as they are ({exchanged} exchanged)")
+    hoistable_count = sum(1 for h in harmful if h[3])
+    print(f"  of those, the value is known before the branch (the exchange can be hoisted): "
+          f"{hoistable_count}")
+    for name, left, exchanged, hoist in harmful:
+        print(f"    {name}: {left} broadcast(s) left as they are ({exchanged} exchanged), "
+              f"{'hoistable' if hoist else 'the value is only known inside the region'}")
     return 0
 
 

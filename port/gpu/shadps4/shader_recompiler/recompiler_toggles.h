@@ -93,12 +93,26 @@ inline bool ReadFirstLaneAll() {
     return enabled;
 }
 
+/// tlg: lowers the v_readfirstlane that is in divergent flow and whose value is only known
+/// inside the divergent region (a loop carried value, an atomic): the exchange stays where the
+/// instruction is, with its workgroup barrier in non uniform control flow. Vulkan leaves that
+/// undefined, but the driver syncs the active lanes of the workgroup, and that is what the
+/// wave64 does at its reconvergence points. Without it the upper half of the wave reads its
+/// own lane 32 (inFAMOUS: the compute that counts the particles wrote a different count for
+/// each half, and no particle appeared).
+/// TLG_RFL_DIVERGENT=0 leaves them as they were, for the A/B.
+inline bool ReadFirstLaneDivergent() {
+    static const bool enabled = Detail::EnvFlag("TLG_RFL_DIVERGENT", &Detail::AlwaysOn);
+    return enabled;
+}
+
 /// Bits for the shader binary cache version: shaders recompiled under other switches must not
 /// be reused (the cache key only hashes the recompiler sources).
 inline std::uint32_t ShaderBinarySalt() {
     return (SmallGroupLdsBarriers() ? 1u : 0u) | (MultiWaveLdsBarriers() ? 2u : 0u) |
            (LdsUniformReadLane() ? 4u : 0u) | (WholeQuadMode() ? 0u : 8u) |
-           (LaneDivergence() ? 16u : 0u) | (ReadFirstLaneAll() ? 32u : 0u);
+           (LaneDivergence() ? 16u : 0u) | (ReadFirstLaneAll() ? 32u : 0u) |
+           (ReadFirstLaneDivergent() ? 64u : 0u);
 }
 
 /// One line per switch with its state (shown once, when the GPU starts). Takes the logger as a
@@ -115,6 +129,9 @@ inline void LogStates(Log&& log) {
     log("TLG_RFL_ALL", ReadFirstLaneAll(),
         "wave64 ReadFirstLane lowered in every wide compute shader (upper half of a wave64 reads "
         "the wave's first lane, not its own lane 32)");
+    log("TLG_RFL_DIVERGENT", ReadFirstLaneDivergent(),
+        "wave64 ReadFirstLane in divergent flow exchanged too (the barrier is in non uniform "
+        "control flow)");
 }
 
 } // namespace Shader::Toggles

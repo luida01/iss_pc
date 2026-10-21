@@ -9,6 +9,7 @@
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/breadth_first_search.h"
+#include "shader_recompiler/ir/dominance.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
@@ -289,6 +290,118 @@ static LaneOpCensus CountLaneOps(IR::Program& program) {
     return census;
 }
 
+// tlg: the scope of a block inside a divergent branch: the condition of the branch (the exec
+// mask of the wave there) and the block that ends with the branch, where the exchange can be
+// hoisted to (in uniform flow, where a workgroup barrier is allowed).
+struct DivergentScope {
+    IR::U1 cond;             ///< the condition of the innermost divergent branch
+    IR::Block* hoist_block{}; ///< the block that branches to it
+    u32 branch_depth{};       ///< the divergent branches enclosing the block
+    u32 loop_depth{};        ///< the divergent loops enclosing the block
+};
+
+/// tlg: the divergent scope of every block, from the syntax list. The exec mask of a block
+/// is the condition of the branch that leads to it, so a block inside a divergent branch
+/// knows the mask its lane operations run under.
+static std::unordered_map<IR::Block*, DivergentScope> FindDivergentScopes(const IR::Program& program) {
+    std::unordered_map<IR::Block*, DivergentScope> scopes;
+    const auto divergent_loops = FindDivergentLoops(program);
+    std::vector<std::pair<IR::Block*, bool>> conditionals;
+    std::vector<IR::U1> conds;
+    std::vector<IR::Block*> hoists;
+    std::vector<IR::Block*> loops;
+    u32 branch_depth = 0;
+    u32 loop_depth = 0;
+    IR::Block* last_block = nullptr;
+    for (const auto& node : program.syntax_list) {
+        switch (node.type) {
+        case IR::AbstractSyntaxNode::Type::Block:
+            scopes.emplace(node.data.block,
+                           DivergentScope{conds.empty() ? IR::U1{} : conds.back(),
+                                         hoists.empty() ? nullptr : hoists.back(), branch_depth,
+                                         loop_depth});
+            last_block = node.data.block;
+            break;
+        case IR::AbstractSyntaxNode::Type::If: {
+            const bool divergent = IsDivergentCondition(node.data.if_node.cond);
+            conditionals.emplace_back(node.data.if_node.merge, divergent);
+            if (divergent) {
+                conds.push_back(node.data.if_node.cond);
+                hoists.push_back(last_block);
+                ++branch_depth;
+            }
+            break;
+        }
+        case IR::AbstractSyntaxNode::Type::EndIf: {
+            if (conditionals.empty()) {
+                break;
+            }
+            if (conditionals.back().second) {
+                conds.pop_back();
+                hoists.pop_back();
+                --branch_depth;
+            }
+            conditionals.pop_back();
+            break;
+        }
+        case IR::AbstractSyntaxNode::Type::Loop:
+            loops.push_back(node.data.loop.merge);
+            if (std::ranges::contains(divergent_loops, node.data.loop.merge)) {
+                ++loop_depth;
+            }
+            break;
+        case IR::AbstractSyntaxNode::Type::Repeat:
+            if (loops.empty()) {
+                break;
+            }
+            if (std::ranges::contains(divergent_loops, loops.back())) {
+                --loop_depth;
+            }
+            loops.pop_back();
+            break;
+        default:
+            break;
+        }
+    }
+    return scopes;
+}
+
+/// tlg: whether a value can be read at a point of the program: it is an immediate, it is
+/// defined in that block (before the branch) or in a block that dominates it.
+static bool IsAvailableAt(const IR::Value& value, const IR::Block* block) {
+    if (value.IsImmediate()) {
+        return true;
+    }
+    const IR::Inst* const def = value.Inst();
+    if (!def) {
+        return false;
+    }
+    IR::Block* const parent = def->GetParent();
+    if (!parent) {
+        return false;
+    }
+    if (parent == block) {
+        return true;
+    }
+    return IR::Dominates(parent, const_cast<IR::Block*>(block));
+}
+
+/// tlg: whether the exec mask of a branch is the condition of the branch alone. The shader
+/// can set the exec mask itself (s_mov exec); when it does, the mask of the branch is not
+/// just its condition and the exchange below would use the wrong lanes.
+static bool HasNoExecChangeBefore(const IR::Program& program, const IR::Block* hoist_block,
+                                  const IR::Block* block) {
+    for (const IR::Block* current = block; current && current != hoist_block;
+         current = current->imm_predecessors.empty() ? nullptr : current->imm_predecessors.front()) {
+        for (const IR::Inst& inst : current->Instructions()) {
+            if (inst.GetOpcode() == IR::Opcode::SetExec) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info,
                            const Profile& profile) {
     if (program.info.hw_stage != HwStage::Compute) {
@@ -359,7 +472,29 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
     std::vector<IR::Inst*> worklist;
     std::vector<IR::Inst*> divergent_ballots;
     u32 divergent_readfirstlanes{};
+    u32 divergent_readfirstlanes_lowered{};
+    u32 divergent_readfirstlanes_uniform{};
     const auto uniform_blocks = FindWave64UniformBlocks(program);
+    const auto divergent_scopes = FindDivergentScopes(program);
+    // tlg: the ReadFirstLane in divergent flow that the exchange can be hoisted for: the
+    // value it broadcasts has to be known before the branch, and the exec mask of the
+    // branch has to be its condition alone.
+    struct HoistedReadFirstLane {
+        IR::Inst* inst;
+        IR::Block* hoist_block;
+        IR::U1 cond;
+    };
+    std::vector<HoistedReadFirstLane> hoisted;
+    // tlg: the ReadFirstLane in divergent flow whose value is only known inside the region:
+    // the exchange has to stay there, with its barrier in non uniform control flow (which
+    // Vulkan leaves undefined, but the driver syncs the active lanes of the workgroup, and
+    // that is what the wave64 does at its reconvergence points). TLG_RFL_DIVERGENT=0 leaves
+    // them as they were, for the A/B.
+    struct InPlaceReadFirstLane {
+        IR::Inst* inst;
+        IR::U1 cond;
+    };
+    std::vector<InPlaceReadFirstLane> in_place;
     for (IR::Block* block : program.blocks) {
         const bool is_uniform = std::ranges::contains(uniform_blocks, block);
         const auto push_worklist = [&](IR::Inst& inst) {
@@ -380,12 +515,52 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
                 push_worklist(inst);
             } else if (inst.GetOpcode() == IR::Opcode::ReadFirstLane) {
                 if (!is_uniform) {
-                    // tlg: a ReadFirstLane in divergent flow cannot be exchanged through LDS
-                    // (the barrier would sit in non uniform control flow). It stays a host
-                    // broadcast, which on a 32-wide host gives the upper half of the wave the
-                    // value of its own lane 32. Counted, so the log says which shaders still
-                    // have it.
+                    // tlg: a ReadFirstLane in divergent flow used to stay a host broadcast,
+                    // which on a 32-wide host gives the upper half of the wave the value of
+                    // its own lane 32 instead of the wave's first active lane. It is now
+                    // lowered too, by hoisting the exchange to the block that branches to
+                    // the divergent region (uniform flow, where the barrier is allowed): the
+                    // exchange computes the value of the first lane of the wave whose exec
+                    // mask (the condition of the branch) is set.
                     ++divergent_readfirstlanes;
+                    if (!Toggles::ReadFirstLaneAll()) {
+                        // tlg: TLG_RFL_ALL=0 keeps the old behaviour (the instruction stays a
+                        // host broadcast), for the A/B.
+                        continue;
+                    }
+                    if (IsProvablyWaveUniform(inst.Arg(0))) {
+                        // tlg: the value is the same in every lane, so the broadcast does not
+                        // matter (the host broadcast gives the same value): nothing to exchange.
+                        ++divergent_readfirstlanes_uniform;
+                        continue;
+                    }
+                    const auto scope = divergent_scopes.find(block);
+                    if (scope == divergent_scopes.end() || !scope->second.hoist_block ||
+                        scope->second.branch_depth != 1 || scope->second.loop_depth != 0) {
+                        // tlg: the exec mask of the branch is not its condition alone (the
+                        // shader set the exec mask itself), or the branch is nested in
+                        // another divergent branch or loop: the exchange cannot be hoisted
+                        // there, so it stays where the instruction is.
+                        if (Toggles::ReadFirstLaneDivergent()) {
+                            in_place.push_back({&inst, IR::U1{}});
+                            ++divergent_readfirstlanes_lowered;
+                        }
+                        continue;
+                    }
+                    if (!IsAvailableAt(inst.Arg(0), scope->second.hoist_block) ||
+                        !HasNoExecChangeBefore(program, scope->second.hoist_block, block)) {
+                        // tlg: the value the branch broadcasts is only known inside the
+                        // divergent region (a loop carried value, an atomic): the exchange
+                        // cannot be hoisted, so it stays where the instruction is, with its
+                        // barrier in non uniform control flow.
+                        if (Toggles::ReadFirstLaneDivergent()) {
+                            in_place.push_back({&inst, scope->second.cond});
+                            ++divergent_readfirstlanes_lowered;
+                        }
+                        continue;
+                    }
+                    hoisted.push_back({&inst, scope->second.hoist_block, scope->second.cond});
+                    ++divergent_readfirstlanes_lowered;
                     continue;
                 }
                 // tlg: append pattern: the wave counts its items (ballot / prefix mask), one
@@ -438,25 +613,36 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
     }
     // tlg: the census line (one per compute shader wider than a 32-lane wave that uses lane
     // operations) says what the shader does with its lanes and what the host cannot do with
-    // it: a ReadFirstLane in divergent flow stays a per-subgroup broadcast (its upper half
-    // reads its own lane 32 instead of the wave's first lane).
+    // it: a ReadFirstLane in divergent flow is exchanged too (with the exec mask of the
+    // region), so the wave's first active lane decides.
     if (!lane_ops.empty()) {
         const std::string divergent =
             divergent_readfirstlanes
-                ? fmt::format(" ({} ReadFirstLane in divergent flow, not lowered)",
-                              divergent_readfirstlanes)
+                ? fmt::format(" ({} ReadFirstLane in divergent flow: {} lowered, {} uniform, {} not)",
+                              divergent_readfirstlanes, divergent_readfirstlanes_lowered,
+                              divergent_readfirstlanes_uniform,
+                              divergent_readfirstlanes - divergent_readfirstlanes_lowered -
+                                  divergent_readfirstlanes_uniform)
                 : std::string{};
         LOG_WARNING(Render_Recompiler,
                     "tlg: wave64 compute shader {:#x} ({} threads, {}x{}x{}): {}{}",
                     program.info.pgm_hash, num_threads, size_x, size_y, size_z, lane_ops, divergent);
     }
-    if (worklist.empty()) {
+    if (worklist.empty() && hoisted.empty() && in_place.empty()) {
         return;
     }
 
+    // tlg: the scratch of the exchange: the mask area (one u32 per host subgroup, the pair
+    // of a wave side by side) and, for the exchange of a divergent branch, the value area
+    // (the value and the mask of each host subgroup, 16 bytes per wave). The value area
+    // starts at a 16 byte boundary: the two halves of a wave read the pair of slots there.
+    const u32 num_subgroups = Common::AlignUp(num_threads, 64) / profile.subgroup_size;
+    const u32 num_waves = Common::AlignUp(num_threads, 64) / 64;
     const u32 scratch_base = Common::AlignUp(runtime_info.hw.cs.shared_memory_size, sizeof(u64));
-    const u32 scratch_size =
-        (Common::AlignUp(num_threads, 64) / profile.subgroup_size) * sizeof(u32);
+    const u32 mask_area_size = num_subgroups * sizeof(u32);
+    const u32 value_base = Common::AlignUp(scratch_base + mask_area_size, 16);
+    const u32 value_area_size = num_waves * 16;
+    const u32 scratch_size = (value_base + value_area_size) - scratch_base;
     program.info.shared_memory_scratch_size =
         scratch_base + scratch_size - runtime_info.hw.cs.shared_memory_size;
 
@@ -512,6 +698,82 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
             inst->ReplaceUsesWithAndRemove(
                 ir.CompositeExtract(ir.UnpackUint2x32(mask), inst->Arg(1).U32()));
         }
+    }
+
+    // tlg: the ReadFirstLane in divergent flow, with the exchange hoisted to the block that
+    // branches to the divergent region (uniform flow, where the barrier is allowed).
+    //
+    // The exchange gives every lane of the wave the value the wave's first active lane
+    // holds, under the exec mask of the branch (its condition):
+    //   * each host subgroup takes the lanes its own ballot of the condition marks, and the
+    //     value of the first of them (a shuffle inside the subgroup);
+    //   * each subgroup writes that value and its mask to the scratch, and the two halves of
+    //     the wave read both: the even half's value when it has a candidate, the odd half's
+    //     otherwise. That is the value of the first lane of the WAVE with the condition set.
+    for (const auto& entry : hoisted) {
+        LOG_INFO(Render_Recompiler, "Lowering ReadFirstLane for wave64 in divergent flow");
+        IR::IREmitter ir{*entry.hoist_block, entry.hoist_block->end()};
+        const IR::U32 invocation_index = ir.GetAttributeU32(IR::Attribute::LocalInvocationIndex);
+        const IR::U32 subgroup_id = ir.ShiftRightLogical(invocation_index, ir.Imm32(5));
+        // The lanes of this subgroup with the exec mask of the branch set.
+        const IR::U64 ballot = ir.Ballot(entry.cond);
+        const IR::U32 mask_low = IR::U32{ir.CompositeExtract(ir.UnpackUint2x32(ballot), 0)};
+        const IR::U1 has_candidate = ir.INotEqual(mask_low, ir.Imm32(0u));
+        // The first of them (the index is inside the subgroup). The shuffle needs an index
+        // that is inside the subgroup even when there is no candidate, so it takes the first
+        // lane; the mask says whether the value means anything.
+        const IR::U32 first_local =
+            IR::U32{ir.Select(has_candidate, ir.BallotFindLsb(ballot), ir.Imm32(0u))};
+        const IR::U32 value_local = ir.Shuffle(IR::U32{entry.inst->Arg(0)}, first_local);
+        // The exchange: the value and the mask of each subgroup, 8 bytes each.
+        const IR::U32 offset =
+            ir.IAdd(ir.Imm32(value_base), ir.ShiftLeftLogical(subgroup_id, ir.Imm32(3u)));
+        ir.WriteShared(32, value_local, offset);
+        ir.WriteShared(32, mask_low, ir.IAdd(offset, ir.Imm32(4u)));
+        ir.Barrier();
+        // Both halves of the wave read the pair of slots of their wave.
+        const IR::U32 pair = ir.BitwiseAnd(offset, ir.Imm32(~15u));
+        const IR::U32 even_value = IR::U32{ir.LoadShared(32, false, pair)};
+        const IR::U32 even_mask = IR::U32{ir.LoadShared(32, false, ir.IAdd(pair, ir.Imm32(4u)))};
+        const IR::U32 odd_value = IR::U32{ir.LoadShared(32, false, ir.IAdd(pair, ir.Imm32(8u)))};
+        const IR::U32 odd_mask = IR::U32{ir.LoadShared(32, false, ir.IAdd(pair, ir.Imm32(12u)))};
+        const IR::U1 even_has_candidate = ir.INotEqual(even_mask, ir.Imm32(0u));
+        const IR::U32 value = IR::U32{ir.Select(even_has_candidate, even_value, odd_value)};
+        ir.Barrier();
+        entry.inst->ReplaceUsesWithAndRemove(value);
+    }
+
+    // tlg: the ReadFirstLane in divergent flow whose value is only known inside the region:
+    // the exchange stays where the instruction is, with its barrier in non uniform control
+    // flow. The driver syncs the active lanes of the workgroup (and the wave64 syncs its
+    // lanes at the reconvergence points), so the two halves of the wave read the same value.
+    for (const auto& entry : in_place) {
+        LOG_INFO(Render_Recompiler,
+                 "Lowering ReadFirstLane for wave64 in divergent flow (in place)");
+        IR::IREmitter ir{*entry.inst->GetParent(), IR::Block::InstructionList::s_iterator_to(*entry.inst)};
+        const IR::U32 invocation_index = ir.GetAttributeU32(IR::Attribute::LocalInvocationIndex);
+        const IR::U32 subgroup_id = ir.ShiftRightLogical(invocation_index, ir.Imm32(5));
+        // The lanes of this subgroup with the exec mask set (the mask of the wave here).
+        const IR::U64 ballot = ir.Ballot(ir.GetExec());
+        const IR::U32 mask_low = IR::U32{ir.CompositeExtract(ir.UnpackUint2x32(ballot), 0)};
+        const IR::U1 has_candidate = ir.INotEqual(mask_low, ir.Imm32(0u));
+        const IR::U32 first_local =
+            IR::U32{ir.Select(has_candidate, ir.BallotFindLsb(ballot), ir.Imm32(0u))};
+        const IR::U32 value_local = ir.Shuffle(IR::U32{entry.inst->Arg(0)}, first_local);
+        const IR::U32 offset =
+            ir.IAdd(ir.Imm32(value_base), ir.ShiftLeftLogical(subgroup_id, ir.Imm32(3u)));
+        ir.WriteShared(32, value_local, offset);
+        ir.WriteShared(32, mask_low, ir.IAdd(offset, ir.Imm32(4u)));
+        ir.Barrier();
+        const IR::U32 pair = ir.BitwiseAnd(offset, ir.Imm32(~15u));
+        const IR::U32 even_value = IR::U32{ir.LoadShared(32, false, pair)};
+        const IR::U32 even_mask = IR::U32{ir.LoadShared(32, false, ir.IAdd(pair, ir.Imm32(4u)))};
+        const IR::U32 odd_value = IR::U32{ir.LoadShared(32, false, ir.IAdd(pair, ir.Imm32(8u)))};
+        const IR::U32 odd_mask = IR::U32{ir.LoadShared(32, false, ir.IAdd(pair, ir.Imm32(12u)))};
+        const IR::U1 even_has_candidate = ir.INotEqual(even_mask, ir.Imm32(0u));
+        const IR::U32 value = IR::U32{ir.Select(even_has_candidate, even_value, odd_value)};
+        ir.Barrier();
+        entry.inst->ReplaceUsesWithAndRemove(value);
     }
 }
 
