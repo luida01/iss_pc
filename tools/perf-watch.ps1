@@ -40,7 +40,8 @@ param(
     [ValidateRange(30, 3600)][int]$DurationSec = 100,
     [string]$Tag = 'watch',
     [hashtable]$Env = @{},
-    [hashtable]$Ini = @{}
+    [hashtable]$Ini = @{},
+    [string]$Scenario = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -55,6 +56,7 @@ for ($i = 1; $i -le $Runs; $i++) {
     Write-Host "=== pasada $i/$Runs ($Tag) ===" -ForegroundColor Cyan
     $args = @{ DurationSec = $DurationSec; Resolution = '720p'; Tag = "$Tag-$i"; ExtraEnv = $Env }
     if ($Ini.Count -gt 0) { $args['IniExtra'] = $Ini }
+    if ($Scenario) { $args['AutoPlayScenario'] = $Scenario }
     & '.\tools\run-baseline.ps1' @args | Out-Null
 
     $dir = Get-ChildItem 'evidence' -Directory -Filter "*-$Tag-$i" -ErrorAction SilentlyContinue |
