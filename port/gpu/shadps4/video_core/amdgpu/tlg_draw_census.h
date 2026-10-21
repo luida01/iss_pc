@@ -21,6 +21,12 @@
 // if every site has none, the CPU cannot see the GPU's values and the renderer (not this
 // agent's scope) has to say it.
 //
+// The census also says, per site, whether the region holds data the GPU wrote ("written by
+// the GPU") and whether the guest wrote there too. That is what decides where the draw
+// reads its arguments from: a small read-only buffer that the GPU has not written gets a
+// fresh copy of the guest memory (the buffer cache's "stream" path), and then the draw does
+// not see what the compute wrote (the count the compute filled in for the particles).
+//
 // Header-only and free of Vulkan and guest memory: the caller reads the arguments and
 // hands them over, so a test can check the accounting alone.
 #pragma once
@@ -48,12 +54,20 @@ public:
     /// An indirect draw whose arguments live at `site` (the base address plus the packet's
     /// data offset). `read` is called at most once per site and window: it returns the
     /// (count, instances) pair the CPU sees.
+    ///
+    /// `gpu_modified` says whether the region holds data the GPU wrote (the compute that
+    /// fills the draw's arguments): if it does not, the draw reads the guest memory (the
+    /// buffer cache's stream path) and the count the compute wrote is not what the draw
+    /// sees. `cpu_modified` says whether the guest wrote there too (its copy would be
+    /// uploaded over the GPU's).
     template <typename Read>
-    void NoteIndirectSite(std::uint64_t site, Read&& read) {
+    void NoteIndirectSite(std::uint64_t site, bool gpu_modified, bool cpu_modified, Read&& read) {
         std::scoped_lock lock{mutex};
         auto& entry = indirect[site];
         entry.site = site;
         ++entry.draws;
+        entry.gpu_modified = gpu_modified;
+        entry.cpu_modified = cpu_modified;
         if (entry.read) {
             return;
         }
@@ -135,7 +149,15 @@ public:
             std::printf("  indirect site %p: %llu draws, count %u, instances %u%s\n",
                         reinterpret_cast<const void*>(entry->site),
                         static_cast<unsigned long long>(entry->draws), entry->count,
-                        entry->instances, entry->instances ? "" : "  <-- NOTHING DRAWN");
+                        entry->instances,
+                        entry->instances ? "" : "  <-- the guest's copy says 0 instances");
+            // The draw reads the buffer the buffer cache gives it. A small read-only buffer
+            // that the GPU has not written gets a fresh copy of the guest memory (the
+            // "stream" path), and then the draw does not see what the compute wrote.
+            std::printf("      the region is %s (the draw reads the %s)%s\n",
+                        entry->gpu_modified ? "written by the GPU" : "clean",
+                        entry->gpu_modified ? "arena (what the compute wrote)" : "guest memory",
+                        entry->cpu_modified ? ", and the guest wrote there too" : "");
         }
         if (sites.size() > shown) {
             std::printf("  ... and %zu more indirect sites\n", sites.size() - shown);
@@ -165,6 +187,8 @@ private:
         std::uint32_t count{};
         std::uint32_t instances{};
         bool read{};
+        bool gpu_modified{}; ///< the region holds data the GPU wrote
+        bool cpu_modified{}; ///< the guest wrote there too
     };
 
     static constexpr std::size_t kDirectBuckets = 8;

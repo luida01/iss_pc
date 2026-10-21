@@ -810,11 +810,25 @@ std::pair<u32, u32> ReadIndirectArgs(u64 address) {
 }
 
 /// An indirect draw: its site is the address of its arguments.
-void NoteIndirectSite(u64 address) {
+///
+/// The census also says whether the region holds data the GPU wrote: the buffer cache
+/// gives a small read-only buffer a fresh copy of the guest memory (its "stream" path), and
+/// that copy is what the draw reads when the region is not marked as written by the GPU. The
+/// compute that fills the draw's arguments (the particle count) writes it on the GPU, so a
+/// region that is not marked means the draw does not see what the compute wrote.
+void NoteIndirectSite(Vulkan::Rasterizer* rasterizer, u64 address, u32 size) {
     if (!g_draw_census_on) {
         return;
     }
-    g_draw_census.NoteIndirectSite(address, [&] { return ReadIndirectArgs(address); });
+    bool gpu_modified = false;
+    bool cpu_modified = false;
+    if (rasterizer) {
+        auto& buffer_cache = rasterizer->GetBufferCache();
+        gpu_modified = buffer_cache.IsRegionGpuModified(address, size);
+        cpu_modified = buffer_cache.IsRegionCpuModified(address, size);
+    }
+    g_draw_census.NoteIndirectSite(address, gpu_modified, cpu_modified,
+                                   [&] { return ReadIndirectArgs(address); });
 }
 
 /// A direct draw with the instance count the game asked for.
@@ -1228,7 +1242,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
-                NoteIndirectSite(indirect_args_addr + offset);
+                NoteIndirectSite(rasterizer, indirect_args_addr + offset, stride);
                 if (!rasterizer) {
                     break;
                 }
@@ -1248,7 +1262,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
-                NoteIndirectSite(indirect_args_addr + offset);
+                NoteIndirectSite(rasterizer, indirect_args_addr + offset, draw_indirect->stride);
                 if (!rasterizer) {
                     break;
                 }
@@ -1270,7 +1284,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
-                NoteIndirectSite(indirect_args_addr + offset);
+                NoteIndirectSite(rasterizer, indirect_args_addr + offset, stride);
                 if (!rasterizer) {
                     break;
                 }
@@ -1290,7 +1304,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
-                NoteIndirectSite(indirect_args_addr + offset);
+                NoteIndirectSite(rasterizer, indirect_args_addr + offset, draw_index_indirect->stride);
                 if (!rasterizer) {
                     break;
                 }
@@ -1311,7 +1325,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
-                NoteIndirectSite(indirect_args_addr + offset);
+                NoteIndirectSite(rasterizer, indirect_args_addr + offset, draw_index_indirect->stride);
                 if (!rasterizer) {
                     break;
                 }

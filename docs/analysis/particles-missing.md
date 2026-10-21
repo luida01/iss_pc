@@ -1,39 +1,145 @@
 # Las partículas siguen sin aparecer: qué se ha descartado y cómo se cierra el caso
 
-> **Fecha:** 2026-10-20 · **Alcance:** `port/gpu/shadps4/video_core/texture_cache/**`,
+> **Fecha:** 2026-10-20 (actualizado el 2026-10-21 con la sesión del censo) ·
+> **Alcance:** `port/gpu/shadps4/video_core/texture_cache/**`,
 > `port/gpu/shadps4/video_core/amdgpu/**`, `port/tests/**` ·
-> **Estado:** el *fix* anterior (`dc12e8d`, `ReadFirstLane` de wave64) **no explica** las
-> partículas que faltan: se ha medido que sigue sin aplicarse a los shaders que importan.
-> La causa concreta **no está cerrada todavía**: este documento deja fuera de discusión las
-> cuatro hipótesis que se podían comprobar sin jugar y deja una sonda que la cierra en una
-> sola sesión.
+> **Estado:** las texturas y los dispatches están **descartados**. La sesión con la sonda
+> (`evidence/20261020-233329-census/`) deja el caso en **un solo sitio**: los argumentos del
+> draw indirecto. La causa concreta depende de una línea que la sonda ahora dice
+> (`written by the GPU` / `clean`); el resto está medido y documentado aquí.
 
 ## 1. Resumen para quien tenga prisa
 
 | Hipótesis | Estado | Cómo se comprueba |
 |---|---|---|
-| Los dispatches de compute no se emiten | **Descartada** | El log de la sesión: 550 dispatches por frame; el puerto los cuenta (`TlgStats::dispatches`) y los emite |
-| Los draws de las partículas no llegan al driver | **Descartada** (el puerto los envía) | 4000 draws por frame; el conteo del pipeline: "0 not" |
-| El decode BC de la CPU está mal (la textura sale invisible) | **Descartada** | `bc-decode-test` (contra la especificación DXT) y `bc-decode-gpu-test` (contra el decodificador del driver) |
+| Los dispatches de compute no se emiten | **Descartada** | 550-1100 dispatches por frame en el log |
+| Los draws de las partículas no llegan al driver | **Descartada** | ~4000 draws por frame; "0 not" pipelines |
+| El decode BC de la CPU está mal (la textura sale invisible) | **Descartada** | `bc-decode-test` (especificación DXT) y `bc-decode-gpu-test` (el decodificador del driver). **En vivo**: `tlg: BC decode 512x1 layers 32 mips 10: 130944 texel bytes, 32736 not zero` |
 | La imagen 1D de 32 capas es un objeto Vulkan inválido | **Descartada** (el driver la acepta) | `1d-array-test` en la RTX 3050 |
 | El `ReadFirstLane` de wave64 sigue sin bajarse en los shaders de partículas | **Medido, y sigue siendo un agujero** | El censo de la corrida + el SPIR-V de la caché (68 de 68 coinciden) |
-| **El draw de las partículas pide 0 instancias** (el compute no llenó la lista) | **Sin comprobar: es lo que decide la sonda `TLG_DRAW_CENSUS=1`** | Una sesión de juego con la sonda |
+| **El draw de las partículas no ve el conteo que escribió el compute** | **Vivo: es lo que queda** | La sesión del censo: los draws indirectos piden `count 4/6/36` (el juego lo escribe desde la CPU) y `instances 0` (lo escribe el compute en la GPU). La vista de la CPU no puede ver el valor del compute, así que hace falta el estado de la región |
 
-La sonda nueva (`TLG_DRAW_CENSUS=1`, en `video_core/amdgpu/tlg_draw_census.h`) imprime, cada
-5 s, **los argumentos de cada draw indirecto** (el número de instancias que el juego
-calculó en la GPU) y **el tamaño de cada dispatch**. Con eso, una sola sesión separa las
-tres posibilidades que quedan:
+### 1.1 Lo que dijo la sesión del censo
 
-* un draw indirecto con **0 instancias** → el compute que llena la lista de partículas no
-  produce nada (el problema está en el compute, no en el draw);
-* un draw indirecto con **N instancias** → el draw está y la lista está: el problema está
-  en la visibilidad (blend, depth, textura) o en el estado del pipeline;
-* **ningún dispatch** con la forma de la actualización de partículas → el compute ni
-  siquiera se lanza.
+```
+Draw census: 3151 direct draws, 2 indirect draws (2 sites, 0 with 0 instances), 16 dispatches
+  indirect site 000000106E27C200: 1 draws, count 0, instances 1
+  indirect site 000000107007C200: 15 draws, count 0, instances 1
+  indirect site 0000001070090300: 6 draws, count 6, instances 0  <-- NOTHING DRAWN
+  indirect site 0000001070090300: 15 draws, count 4, instances 0  <-- NOTHING DRAWN
+  indirect site 0000001070090300: 13 draws, count 4, instances 0  <-- NOTHING DRAWN
+  indirect site 0000001070090300: 15 draws, count 36, instances 0  <-- NOTHING DRAWN
+```
 
-## 2. Lo que se ha medido, con pruebas
+Tres cosas se leen aquí:
 
-### 2.1 El compute del juego sí se emite
+1. **El `count` cambia** (6, 4, 4, 36) en el mismo sitio: lo escribe **el juego, desde la
+   CPU**, cada frame. 4 y 6 son squads y triángulos; 36 es una malla.
+2. **El `instances` es siempre 0**: ese campo lo escribe **el compute** (el que cuenta las
+   partículas) **en la GPU**. La vista de la CPU no lo ve nunca (el juego no lo lee), así que
+   el 0 del log **no prueba** que el draw pida 0 instancias: prueba que la CPU no tiene el
+   valor.
+3. **El patrón es el de la PS4**: el juego escribe la estructura del draw (el conteo de
+   vértices) desde la CPU y el compute rellena el número de instancias. Es el
+   "GPU-driven rendering" de toda la vida.
+
+**Y la pregunta de fondo (la del punto 4 del encargo) tiene respuesta:** el puerto **no lee**
+el `count` al grabar el draw. Graba `vkCmdDrawIndirect` y **la GPU lee el búfer**. El puerto
+solo lee los argumentos para su propia comprobación de cordura (`TLG_INDIRECT_CHECK`) y para
+la sonda. Lo que la GPU lee es lo que hay en el búfer de Vulkan, y **el port puede haber
+sustituido ese búfer por una copia de la memoria del invitado**.
+
+## 2. El mecanismo: el "stream path" del búfer de argumentos
+
+`video_core/buffer_cache/buffer_cache.cpp`, `BufferCache::ObtainBuffer`:
+
+```cpp
+if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+    // ... copia la memoria del invitado a un búfer "stream" y devuelve ese
+    memory->CopySparseMemory(device_addr, data, size);
+    return {&stream_buffer, offset};
+}
+```
+
+Un búfer **pequeño y de solo lectura** (los argumentos de un draw indirecto son 16 o 20
+bytes) del que la GPU no ha escrito se sirve de una **copia fresca de la memoria del
+invitado**. El draw lee **esa copia**, no el búfer donde el compute escribió el conteo.
+
+Y el otro camino, el del "arena", sube al búfer de Vulkan las páginas que la **CPU**
+modificó (`ForEachUploadRange`), y solo esas: las que escribió la GPU se quedan ✓.
+
+**=> Los dos caminos dependen de una sola cosa: que la escritura del compute esté
+registrada.** Si la región no está marcada como "escrita por la GPU":
+
+* el draw se sirve de la **copia del invitado** (el `count` del juego y el `instances` = 0
+  del marcador de posición) → **el draw no dibuja nada** → **no hay partículas**;
+* y si además el compute se sirve él mismo del búfer "stream" (porque su recurso tampoco
+  está marcado como escrito), **su escritura se va a una copia temporal** y se pierde del
+  todo.
+
+**=> La línea que lo decide es si el puerto marca el búfer del compute como "escrito"**, y
+eso lo decide el recompilador (`resource_patching_pass.cpp`: `.is_written = IsBufferStore(inst)`,
+que cubre los stores y los atómicos) y, en el camino, que la región quede marcada en el
+rastreador de memoria.
+
+### 2.1 La sonda que lo decide (nueva, en este trabajo)
+
+`TLG_DRAW_CENSUS=1` dice ahora, por sitio de draw indirecto, **si la región tiene datos
+escritos por la GPU** y si el invitado escribió ahí también:
+
+```
+  indirect site 0000001070090300: 6 draws, count 6, instances 0  <-- the guest's copy says 0 instances
+      the region is written by the GPU (the draw reads the arena (what the compute wrote))
+```
+
+o
+
+```
+  indirect site 0000001070090300: 6 draws, count 6, instances 0  <-- the guest's copy says 0 instances
+      the region is clean (the draw reads the guest memory), and the guest wrote there too
+```
+
+| Lo que dice la sonda | Dónde está el problema | El arreglo |
+|---|---|---|
+| **the region is clean** (y el invitado escribió allí) | La escritura del compute **no se registró**: el draw se sirve de la copia del invitado y no ve el conteo | Que el recurso del compute se marque como escrito (recompilador) **o** que los argumentos de un draw indirecto nunca se sirvan de la memoria del invitado (buffer cache / renderer) |
+| **the region is written by the GPU** | El draw sí lee el búfer donde el compute escribió → si el conteo sigue siendo 0, **el compute no cuenta las partículas** | El compute (el `ReadFirstLane` en flujo divergente, el `ballot`, el prefijo de la suma) |
+| **clean y el invitado no escribió** | No hay ni datos del compute ni del invitado: el draw no tiene nada que dibujar | El compute (no escribe) |
+
+## 3. El arreglo propuesto (renderer / buffer cache: fuera del alcance de este agente)
+
+**El cambio mínimo, en `video_core/renderer_vulkan/vk_rasterizer.cpp`
+(`Rasterizer::DrawIndirectRecord`):**
+
+```cpp
+-    const auto [buffer, base] =
+-        buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
++    // Los argumentos de un draw indirecto los escribe la GPU (el compute que cuenta las
++    // partículas): no pueden servirse de una copia de la memoria del invitado (el "stream
++    // path" del buffer cache), ni subirse desde ella encima de lo que escribió el compute.
++    const auto [buffer, base] =
++        buffer_cache.ObtainIndirectBuffer(indirect.args, stride * max_count);
+```
+
+**Y en `video_core/buffer_cache/buffer_cache.cpp`, un `ObtainIndirectBuffer` que:**
+
+1. **no** tome el camino "stream" (siempre el "arena"), y
+2. **no** suba la memoria del invitado encima de una región que la GPU escribió (el
+   `ForEachUploadRange` de solo lectura ya sube solo las páginas modificadas por la CPU; si
+   la región está marcada por la GPU, no hay que subir nada).
+
+Con eso, el draw lee **siempre** el búfer donde el compute escribió el conteo, tanto si el
+recompilador marca el recurso como escrito como si no.
+
+**La alternativa del lado del recompilador** (también fuera del alcance de este agente):
+que `resource_patching_pass.cpp` marque el búfer como escrito cuando el shader escribe en
+él. Hoy lo hace (`IsBufferStore` cubre stores y atómicos), así que **si la sonda dice
+"the region is clean", el sitio exacto a mirar es por qué ese store no se vio** (un store
+hecho a través de un puntero, un búfer(global) con otro descriptor, o un recurso que el
+shader solo lee en una rama).
+
+## 4. Lo que se ha descartado, con pruebas
+
+### 4.1 El compute del juego sí se emite
 
 Del log de la sesión `evidence/20261020-195723-juego-final/run.log`:
 
@@ -42,38 +148,31 @@ Del log de la sesión `evidence/20261020-195723-juego-final/run.log`:
 3986 draws,  591 dispatches, 58 submissions; ...
 ```
 
-Un frame normal del juego lleva **500 a 1100 dispatches** y **3500 a 4700 draws**. El
-decode de PM4 por clase lo confirma: `register 1,6 %, draw 11,4 %, dispatch 4,1 %`. Los
-dispatches no se saltan: en `video_core/amdgpu/liverpool.cpp` la única condición que
-descarta un dispatch es `(cs_program.dispatch_initiator & 1) == 0`, que es el bit "inmediato"
-del paquete PM4 y no ocurre en los shaders del juego (si ocurriera, el propio log del
-censo lo contaría).
+Un frame normal lleva **500 a 1100 dispatches** y **3500 a 4700 draws**. En el decode de PM4
+la única condición que descarta un dispatch es `(cs_program.dispatch_initiator & 1) == 0`, el
+bit "inmediato" del paquete PM4, que no ocurre en los shaders del juego.
 
 El pipeline también está listo: `Draw preparation: 121856 prepared pipelines used, 0 not`.
 
-### 2.2 La textura: el decode BC de la CPU es correcto
+### 4.2 La textura: el decode BC de la CPU es correcto
 
-El juego usa texturas **BC 1D** (el log: `tlg: BC image 512x1 Bc1RgbaSrgbBlock type 12
-tile Thin1DThin layers 32 mips 10`, y también 1024x1, 256x1, 128x1, más dos de 1x1 BC4 y
-BC5). El driver NVIDIA las rechaza, así que el puerto las decodifica en la CPU
-(`TLG_BC_TINY`, `video_core/amdgpu/tlg_bc_tiny.h`) y sube texels planos.
+El juego usa texturas **BC 1D** (el log: `tlg: BC image 512x1 Bc1RgbaSrgbBlock type 12 tile
+Thin1DThin layers 32 mips 10`, y también 1024x1, 256x1, 128x1, más dos de 1x1 BC4 y BC5). El
+driver NVIDIA las rechaza, así que el puerto las decodifica en la CPU (`TLG_BC_TINY`).
 
 **Banco 1 (sin GPU): `port/tests/test_bc_decode.cpp`**, ampliado en este trabajo:
 
-* un bloque BC1 con un patrón conocido (los cuatro índices en las cuatro columnas) → el
-  RGBA esperado, canal a canal;
+* un bloque BC1 con un patrón conocido → el RGBA esperado, canal a canal;
 * BC4 y BC5 con el canal que trae el alfa (o el verde) y los ocho niveles interpolados;
 * **la imagen entera que binds el juego** (512x1, 32 capas, 10 mips): el banco construye la
   memoria del invitado con la distribución de micro-tiles del detiler del driver
   (`host_shaders/tiling.comp`) y comprueba que el decode devuelve **los texels de cada
-  capa** (una capa que leyera los bloques de otra es un atlas de sprites que muestra el
-  sprite equivocado, o ninguno).
+  capa**.
 
 Para que el banco diga lo que hace el puerto, el decode de una imagen **se extrajo del
 upload a la cabecera** `video_core/texture_cache/tlg_bc_decode.h` (`ImageLayout`,
-`LevelTexelBytes`, `DecodeLevel`); `texture_cache.cpp` llama a esa función, así que el
-banco y el puerto hacen **exactamente lo mismo** (antes el bucle estaba dentro de
-`UploadDecodedImage` y el banco no podía reaches).
+`LevelTexelBytes`, `DecodeLevel`); `texture_cache.cpp` llama a esa función, así que el banco
+y el puerto hacen **exactamente lo mismo**.
 
 **Banco 2 (con GPU): `port/tests/test_bc_decode_gpu.cpp`**, nuevo. El driver decodifica una
 imagen BC y un shader de compute la lee; el banco compara los texels del driver con los
@@ -88,46 +187,40 @@ device: NVIDIA GeForce RTX 3050 Laptop GPU (driver NVIDIA)
 bc-decode-gpu-test: the CPU decoder matches the GPU's
 ```
 
-(La paleta, los índices y los niveles coinciden; la diferencia de hasta 3/255 en los
-niveles interpolados de BC4/BC5 es el redondeo del driver, no del decodificador. La sonda
-solo puede comparar el **primer canal**: con un *combined image sampler* este driver
-devuelve solo el rojo de una imagen comprimida; los shaders del propio puerto usan
-imagen y sampler **separados** (`OpSampledImage`), y las texturas del juego salen
-bien —lo confirma la captura de la sesión—, así que eso es un artefacto de la sonda.)
+(La diferencia de hasta 3/255 en los niveles interpolados de BC4/BC5 es el redondeo del
+driver. La sonda solo compara el primer canal: con un *combined image sampler* este driver
+devuelve solo el rojo de una imagen comprimida; los shaders del propio puerto usan imagen y
+sampler **separados** (`OpSampledImage`), y las texturas del juego salen bien.)
 
-**En vivo, para cerrar el caso:** `TLG_BC_PROBE=1` imprime, por cada imagen BC decodificada,
-cuántos bytes no son cero y una suma de verificación:
+**En vivo** (la sesión del censo), la sonda `TLG_BC_PROBE=1` dice que las texturas están
+bien:
 
 ```
-tlg: BC decode 512x1 layers 32 mips 10: 130944 texel bytes, 123456 not zero, checksum ..., first texel (r, g, b, a)
+tlg: BC decode 512x1 layers 32 mips 10: 130944 texel bytes, 32736 not zero, checksum ..., first texel (...)
+tlg: BC decode 1024x1 layers 1 mips 11: 8208 texel bytes, 8182 not zero, checksum ..., first texel (...)
 ```
 
-Si la línea dice "0 not zero", la textura está vacía y el problema es el decode; si dice
-"casi todos", la textura está bien y el problema es el draw.
+**=> La textura no es el problema.**
 
-### 2.3 La imagen 1D de 32 capas: objeto Vulkan inválido, pero el driver lo acepta
+### 4.3 La imagen 1D de 32 capas: objeto Vulkan inválido, pero el driver lo acepta
 
 `info.type` es el **tipo base** de la imagen del invitado, así que una imagen 1D de tipo
-`Color1DArray` (12) se crea en el host como `VK_IMAGE_TYPE_1D` con `arrayLayers = 32`.
-Eso **no es válido en Vulkan** (`VUID-VkImageCreateInfo-arrayLayers-00981`: una imagen 1D
-tiene una sola capa; un array 1D en Vulkan es una imagen 2D de altura 1).
+`Color1DArray` (12) se crea en el host como `VK_IMAGE_TYPE_1D` con `arrayLayers = 32`. Eso
+**no es válido en Vulkan** (`VUID-VkImageCreateInfo-arrayLayers-00981`).
 
 Banco nuevo `port/tests/test_1d_array_image.cpp`, en la RTX 3050 del usuario:
 
 ```
 1D  (what the port creates): vkCreateImage(imageType=1D, arrayLayers=32) -> 0
 1D  (what the port creates): 32 of 32 layers read back as uploaded
-1D  (what the port creates): vkCreateImageView(viewType=1D_ARRAY) -> 0
-2D  (what Vulkan wants):    vkCreateImage(imageType=2D, arrayLayers=32) -> 0
 2D  (what Vulkan wants):    32 of 32 layers read back as uploaded
 RESULT: the driver accepts the 1D image with 32 layers and keeps the data
 ```
 
-**Descartada como causa**: el driver acepta la imagen y guarda las 32 capas donde toca. Queda
-como deuda técnica (un objeto inválido puede romper en otro driver), pero no es lo que
-falta hoy.
+**Descartada como causa**; queda como deuda técnica (un objeto inválido puede romper en otro
+driver).
 
-### 2.4 El `fix` anterior (`dc12e8d`) no cubre los shaders que importan
+### 4.4 El `fix` anterior (`dc12e8d`) no cubre los shaders que importan
 
 El censo de `lower_wave64_pass.cpp` dice, por shader compute ancho:
 
@@ -137,127 +230,72 @@ tlg: wave64 compute shader 0x4e523719 (64 threads, 64x1x1): ReadFirstLane 1 (1 R
 
 De los **68 shaders de wave64** que compiló la sesión del 20-10-20 19:57, **67** tienen
 **todos** sus `ReadFirstLane` en **flujo divergente**, donde el puerto **no los baja**: el
-intercambio por LDS necesita una barrera de workgroup, y una barrera en control de flujo
-no uniforme es comportamiento indefinido en Vulkan.
+intercambio por LDS necesita una barrera de workgroup, y una barrera en control de flujo no
+uniforme es comportamiento indefinido en Vulkan.
 
-Eso significa que el arreglo anterior (bajar el `ReadFirstLane` en todo shader ancho)
-**no tocó estos 67 shaders**: el documento `docs/analysis/wave64-particles.md` dice "331 de
-346 shaders bajados", pero ese número venía del censo **anterior** al cambio, que no
-contaba los divergentes (el aviso se añadió en el mismo commit).
+**Comprobación cruzada con el SPIR-V real** (`port/tests/spv_rfl_census.py`): el censo y los
+`.spv` que la corrida dejó en `userdata/cache/CUSA00223-7554b4d1b0b4/` coinciden **68 de 68**.
 
-**Comprobación cruzada con el SPIR-V real** (nuevo: `port/tests/spv_rfl_census.py`): el
-censo y los `.spv` que la corrida dejó en `userdata/cache/CUSA00223-7554b4d1b0b4/`
-coinciden **68 de 68**:
-
-```
-$ python port/tests/spv_rfl_census.py userdata/cache/CUSA00223-7554b4d1b0b4 \
-      evidence/20261020-195723-juego-final/run.log --spirv-dis /c/msys64/clang64/bin/spirv-dis.exe
-cached shaders: 1071
-  with OpGroupNonUniformBroadcastFirst (a wave64 ReadFirstLane): 178
-
-against the run's census:
-  0x4e523719: census 1/1 not lowered; 1 broadcast(s) in the SPIR-V -> 1 unlowered (agrees)
-  ...
-  68 agree, 0 disagree, 0 not in the cache
-```
-
-**PERO, en el shader examinado, el aviso no tiene consecuencias**: el valor que se difunde
-es **uniforme**, así que el broadcast por subgrupo da lo mismo que el de la wave. En
-`0x4e523719` (SPIR-V, `spirv-dis`):
-
-```
-%2000 = OpIAdd %u32_id %u32_id_0 %buf10_dword_off      <- una dirección constante
-%2001 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_11 %u32_id_0 %2000
-%2002 = OpLoad %u32_id %2001                          <- el mismo valor en todas las lanes
-%2004 = OpConvertFToU %u32_id %2003
-%2005 = OpGroupNonUniformBroadcastFirst %u32_id %u32_id_3 %2004
-```
-
-El `ReadFirstLane` difunde un valor que **ya es igual en todas las lanes**, así que da igual
-que lo difunda el subgrupo o la wave. **El aviso del censo es, en este shader, ruido.**
+**PERO, en el shader examinado, el aviso no tiene consecuencias**: el valor que se difunde es
+**uniforme** (se lee de una dirección constante), así que el broadcast por subgrupo da lo
+mismo que el de la wave.
 
 > **Conclusión de este punto:** el `fix` anterior es incompleto (67 shaders sin bajar) pero
 > **no es la causa de las partículas que faltan**. Lo que hace falta es saber, para esos
 > shaders, si el valor que difunden **depende de la lane**; con eso se decide si hay que
-> bajar el `ReadFirstLane` en flujo divergente (intercambio por LDS en flujo uniforme, o
-> un intercambio por memoria) o si el aviso se puede silenciar. Eso es trabajo del
-> recompilador de shaders (`shader_recompiler/**`), fuera del alcance de este agente.
+> bajar el `ReadFirstLane` en flujo divergente o si el aviso se puede silenciar. Es trabajo
+> del recompilador (`shader_recompiler/**`), fuera del alcance de este agente.
 
-## 3. La sonda que cierra el caso: `TLG_DRAW_CENSUS=1`
-
-Nueva en `video_core/amdgpu/tlg_draw_census.h` (con su banco,
-`port/tests/test_draw_census.cpp`), conectada al decode de PM4
-(`video_core/amdgpu/liverpool.cpp`).
-
-Por cada ventana de 5 s imprime:
-
-```
-Draw census: 3 direct draws, 3 indirect draws (2 sites, 1 with 0 instances), 3 dispatches
-  direct draws by instance count: 1:2 4:1
-  indirect site 0000000000001000: 2 draws, count 6, instances 120
-  indirect site 0000000000002000: 1 draws, count 6, instances 0  <-- NOTHING DRAWN
-  dispatches by size: (64,1,1)x2 (256,1,1)x1
-```
-
-* **los draws indirectos**, por sitio (la dirección de sus argumentos): el `count` (vértices
-  o índices por instancia) y las **`instances`** (el número de partículas que el juego
-  calculó en la GPU). Los argumentos se leen una vez por sitio y ventana, así que el coste
-  es de unas decenas de lecturas por 5 s, no de miles por frame.
-* **los draws directos**, por número de instancias.
-* **los dispatches**, por su tamaño (x, y, z): el que actualiza la lista de partículas
-  tiene una forma propia.
-
-La línea `instances 0  <-- NOTHING DRAWN` es la firma de "el compute no llenó la lista".
-
-> **Cómo se leen los números:** son la vista de la CPU sobre la memoria del invitado. Una
-> ranura que la GPU escribió y que el juego nunca leyó de vuelta está ahí desfasada (a
-> menudo a cero), así que los números se leen **en grupo**: si los otros sitios tienen
-> instancias y uno no, ese no dibuja nada de verdad; si **todos** los sitios están a cero,
-> la CPU no ve los valores de la GPU y hay que preguntar al renderer (fuera del alcance de
-> este agente).
-
-### Cómo usarla
+## 5. Qué hay que hacer ahora (una sesión)
 
 ```powershell
-$env:TLG_DRAW_CENSUS = '1'
-$env:TLG_BC_PROBE = '1'      # la sonda de la textura (opcional, misma sesión)
+$env:TLG_DRAW_CENSUS = '1'      # la sonda, ahora con el estado de la región
 python port\run.py
 ```
 
-Con las dos sondas, una sola sesión dice:
+Y leer, por cada sitio de draw indirecto, la línea:
 
-| Lo que dice el log | Dónde está el problema |
-|---|---|
-| `instances 0` en el sitio de las partículas | El compute que llena la lista: el `ReadFirstLane` en flujo divergente, el `ballot` o el prefijo de la suma (recompilador) |
-| `instances N` (N > 0) | El draw está: la visibilidad (blend, depth) o el pipeline (renderer) |
-| Ningún dispatch con la forma de la actualización | El dispatch se salta antes de llegar al driver |
-| `tlg: BC decode ... 0 not zero` | La textura: el decode de la CPU |
+```
+      the region is written by the GPU (the draw reads the arena (what the compute wrote))
+```
 
-## 4. Lo que queda fuera de este trabajo
+o
 
-* **Bajar el `ReadFirstLane` en flujo divergente.** Es un problema real y medido (67
-  shaders), pero el arreglo es del recompilador (`shader_recompiler/ir/passes/`), no del
-  alcance de este agente, y necesita un intercambio entre los dos subgrupos del host que
-  no puede ser una barrera de workgroup en flujo no uniforme.
-* **La visibilidad (blend, depth, descarte).** Nada en el log la señala: "reduced-size
-  draws 0/frame", "0 not" pipelines sin preparar, ningún "dropped indirect draw" (la
-  comprobación de `TLG_INDIRECT_CHECK` que descarta un draw con argumentos absurdos no
-  aparece en el log). Queda por confirmar con la sonda, que separa el draw del compute.
-* **El motor del juego (SotC) y el "shader cache"**: sin cambios en este trabajo.
+```
+      the region is clean (the draw reads the guest memory), and the guest wrote there too
+```
 
-## 5. Ficheros de este trabajo
+**Si sale "clean"**, el arreglo es el del punto 3 (que los argumentos del draw indirecto
+nunca se sirvan de la memoria del invitado) y se puede aplicar en el renderer.
+
+**Si sale "written by the GPU"**, el draw ya lee lo que escribió el compute, y el problema
+está en el compute: el `ReadFirstLane` en flujo divergente (punto 4.4) es el primer
+sospechoso, y la forma de arreglarlo es la que se explica en
+`docs/analysis/wave64-particles.md`.
+
+## 6. Lo que queda fuera de este trabajo
+
+* **El arreglo del renderer** (punto 3): fuera del alcance de este agente (lo otro agente
+  trabaja en `renderer_vulkan/**`); aquí está el parche exacto y el porqué.
+* **Bajar el `ReadFirstLane` en flujo divergente**: problema real y medido (67 shaders), pero
+  del recompilador.
+* **La visibilidad (blend, depth, descarte)**: nada en el log la señala ("reduced-size draws
+  0/frame", "0 not" pipelines sin preparar, ningún "dropped indirect draw"). Queda por
+  confirmar con la sonda, que separa el draw del compute.
+
+## 7. Ficheros de este trabajo
 
 | Fichero | Qué es |
 |---|---|
 | `port/gpu/shadps4/video_core/texture_cache/tlg_bc_decode.h` | El decode de una imagen BC entera (`ImageLayout`, `LevelTexelBytes`, `DecodeLevel`), extraído del upload para que el banco y el puerto hagan lo mismo |
 | `port/gpu/shadps4/video_core/texture_cache/texture_cache.cpp` | El upload usa el decode extraído; sonda `TLG_BC_PROBE=1` (bytes no nulos y suma de verificación de cada imagen decodificada) |
-| `port/gpu/shadps4/video_core/amdgpu/tlg_draw_census.h` | La sonda `TLG_DRAW_CENSUS=1` (nuevo) |
-| `port/gpu/shadps4/video_core/amdgpu/liverpool.cpp` | La sonda conectada al decode de PM4: draws indirectos con sus argumentos, draws directos y dispatches |
-| `port/tests/test_bc_decode.cpp` | Banco del decodificador contra la especificación DXT (patrón conocido, BC4/BC5, la imagen de 32 capas) |
-| `port/tests/test_bc_decode_gpu.cpp`, `port/tests/bc_gfx/bc_decode.comp` | Banco del decodificador contra el del driver (nuevo) |
-| `port/tests/test_1d_array_image.cpp` | Sonda: qué hace el driver con una imagen 1D de 32 capas (nuevo) |
-| `port/tests/test_draw_census.cpp` | Banco de la sonda de draws (nuevo) |
-| `port/tests/spv_rfl_census.py` | Comprobación cruzada del censo de wave64 con el SPIR-V de la caché (nuevo) |
+| `port/gpu/shadps4/video_core/amdgpu/tlg_draw_census.h` | La sonda `TLG_DRAW_CENSUS=1`: draws indirectos con sus argumentos **y el estado de su región**, draws directos y dispatches |
+| `port/gpu/shadps4/video_core/amdgpu/liverpool.cpp` | La sonda conectada al decode de PM4 |
+| `port/tests/test_bc_decode.cpp` | Banco del decodificador contra la especificación DXT |
+| `port/tests/test_bc_decode_gpu.cpp`, `port/tests/bc_gfx/bc_decode.comp` | Banco del decodificador contra el del driver |
+| `port/tests/test_1d_array_image.cpp` | Sonda: qué hace el driver con una imagen 1D de 32 capas |
+| `port/tests/test_draw_census.cpp` | Banco de la sonda de draws |
+| `port/tests/spv_rfl_census.py` | Comprobación cruzada del censo de wave64 con el SPIR-V de la caché |
 | `port/gpu/CMakeLists.txt` | Los cuatro bancos nuevos |
 
 ### Reproducir

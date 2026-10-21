@@ -13,11 +13,13 @@ using AmdGpu::DrawCensus;
 int main() {
     DrawCensus census;
 
-    // Two indirect sites: one with instances, one without (the particle list empty).
-    census.NoteIndirectSite(0x1000, [] { return std::pair<uint32_t, uint32_t>{6, 120}; });
-    census.NoteIndirectSite(0x2000, [] { return std::pair<uint32_t, uint32_t>{6, 0}; });
+    // Two indirect sites: one with instances, one without (the particle list empty). The
+    // first holds data the GPU wrote (the compute that fills the draw's arguments), the
+    // second does not.
+    census.NoteIndirectSite(0x1000, true, false, [] { return std::pair<uint32_t, uint32_t>{6, 120}; });
+    census.NoteIndirectSite(0x2000, false, true, [] { return std::pair<uint32_t, uint32_t>{6, 0}; });
     // The same site again: the arguments are read once per site and window.
-    census.NoteIndirectSite(0x1000, [] { return std::pair<uint32_t, uint32_t>{6, 0}; });
+    census.NoteIndirectSite(0x1000, true, false, [] { return std::pair<uint32_t, uint32_t>{6, 0}; });
     assert(census.IndirectDraws() == 3);
 
     // The direct draws, by instance count.
