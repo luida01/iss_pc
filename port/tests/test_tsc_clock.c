@@ -33,7 +33,11 @@ static void assert_same_clock(uint64_t hz) {
 
 int main(void) {
     /* The process-clock mode (TLG_TSC=process, see runtime_kernel.c); read once, before any call. */
+#ifdef _WIN32
+    _putenv_s("TLG_TSC", "process");
+#else
     setenv("TLG_TSC", "process", 1);
+#endif
     const uint64_t hz = tsc_frequency();
     /* One clock for the guest: the TSC counts on sceKernelGetProcessTimeCounter's clock. A core
        whose raw TSC is offset (3.9 s on the Xeon E5-2680 v4 of #42) would otherwise make the
