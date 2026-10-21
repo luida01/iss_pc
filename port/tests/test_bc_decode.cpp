@@ -222,11 +222,163 @@ static void BenchmarkDecode() {
                 ms, mib, mib / (ms / 1000.0), double(elapsed) / double(blocks), checksum);
 }
 
+// tlg: a BC1 block with a known pattern, the way a sprite atlas holds it: a red/green
+// gradient in the four columns. The endpoints are 565 colours and the four indices pick
+// them, so the expected texels are known exactly (this is the shape of the game's
+// particle sprites: one BC1 block, four texels wide).
+static void TestBc1KnownPattern() {
+    uint8_t block[8];
+    uint8_t out[16 * 4];
+    // c0 = red (31,0,0), c1 = green (0,63,0). Four-colour mode (c0 > c1).
+    Put16(block, Rgb565(31, 0, 0));
+    Put16(block + 2, Rgb565(0, 63, 0));
+    // The columns: 0, 1, 2, 3, 3, 2, 1, 0, repeated in the four rows.
+    const int idx[16] = {0, 1, 2, 3, 3, 2, 1, 0, 0, 1, 2, 3, 3, 2, 1, 0};
+    Put32(block + 4, ColorIndices(idx));
+    DecodeBlock(Kind::Bc1, block, out);
+    // The interpolated colours: (2*c0 + c1) / 3 and (c0 + 2*c1) / 3, with the 5/6 bits
+    // replicated (31 -> 255, 63 -> 255).
+    ExpectRgba(out + 0 * 4, 255, 0, 0, 255);
+    ExpectRgba(out + 1 * 4, 0, 255, 0, 255);
+    ExpectRgba(out + 2 * 4, 170, 85, 0, 255);
+    ExpectRgba(out + 3 * 4, 85, 170, 0, 255);
+    // The texels are row-major: texel t is (t % 4, t / 4). Row 1 starts with the index 3
+    // (the pattern repeats every four texels), so its first texel is the fourth colour.
+    ExpectRgba(out + 4 * 4, 85, 170, 0, 255);
+    ExpectRgba(out + 12 * 4, 85, 170, 0, 255);
+}
+
+// tlg: BC4 and BC5 carry the alpha (or the green) channel the sprites need: BC4 is one
+// channel, BC5 two. The game binds BC1, BC4 and BC5 1D textures (the log of the session:
+// "tlg: BC image 1x1 Bc4UnormBlock" and "tlg: BC image 1x1 Bc5UnormBlock").
+static void TestBc4Bc5Channels() {
+    uint8_t block[16];
+    uint8_t out[16 * 2];
+
+    // BC4: a single channel, from 0 to 255 across the block (the 8-value mode, e0 > e1).
+    block[0] = 255;
+    block[1] = 0;
+    const int idx[16] = {0, 1, 2, 3, 4, 5, 6, 7, 7, 6, 5, 4, 3, 2, 1, 0};
+    PutChannelIndices(block, idx);
+    DecodeBlock(Kind::Bc4Unorm, block, out);
+    const int want[8] = {255, 0, 219, 182, 146, 109, 73, 36};
+    for (int t = 0; t < 16; ++t) {
+        assert(out[t] == want[idx[t]]);
+    }
+
+    // BC5: two channels, the red and the green, interleaved as RG.
+    block[0] = 250;
+    block[1] = 10;
+    const int idx2[16] = {0, 1, 2, 3, 4, 5, 6, 7, 7, 6, 5, 4, 3, 2, 1, 0};
+    PutChannelIndices(block, idx2);
+    block[8] = 128;
+    block[9] = 64;
+    const int zero[16] = {};
+    PutChannelIndices(block + 8, zero);
+    DecodeBlock(Kind::Bc5Unorm, block, out);
+    // The red channel of the 8-value mode with e0 = 250, e1 = 10.
+    const int want_r[8] = {250, 10, 216, 181, 147, 113, 79, 44};
+    for (int t = 0; t < 16; ++t) {
+        assert(out[2 * t] == want_r[idx2[t]]);
+        // The green channel: e0 = 128, e1 = 64 (8-value mode); every index is 0, so every
+        // texel of the green channel is e0.
+        assert(out[2 * t + 1] == 128);
+    }
+}
+
+// tlg: the whole image the game binds: a 512x1, 32-layer, 10-mip BC1 texture (the log of
+// the session: "tlg: BC image 512x1 Bc1RgbaSrgbBlock type 12 tile Thin1DThin layers 32
+// mips 10"). The test builds the guest memory the way the GPU's detiler lays it out and
+// checks that the port's decode (tlg_bc_decode.h DecodeLevel, the same code the port
+// uploads) gives every layer its own texels: a layer that reads another layer's blocks is
+// a sprite atlas that shows the wrong sprite (or none).
+static void TestOneDArrayImage() {
+    constexpr uint32_t kWidth = 512;
+    constexpr uint32_t kLayers = 32;
+    constexpr uint32_t kLevels = 10;
+    // The guest layout of a Thin1DThin BC1 image: 128 blocks of pitch, 8 blocks of height
+    // (the micro tile is 8x8 blocks), 64 bits per block, one slice per layer.
+    constexpr uint32_t kPitchBlocks = kWidth / 4;
+    constexpr uint32_t kHeightBlocks = 8;
+
+    ImageLayout layout;
+    layout.kind = Kind::Bc1;
+    layout.is_tiled = true;
+    layout.micro_mode = MicroThin;
+    layout.thickness = 1;
+    layout.num_bits = 64;
+    layout.layers = kLayers;
+    layout.width = kWidth;
+    layout.height = 1;
+    layout.levels = kLevels;
+    uint64_t offset = 0;
+    for (uint32_t m = 0; m < kLevels; ++m) {
+        const uint32_t blocks = std::max((kWidth >> m) / 4, 1u);
+        layout.mips[m].offset = offset;
+        layout.mips[m].pitch = blocks * 4;
+        layout.mips[m].height = 32; // 8 blocks of height, in texels
+        offset += uint64_t(blocks) * kHeightBlocks * 8 * kLayers;
+    }
+
+    // The guest memory: every block of every layer holds the layer's number in its first
+    // two bytes, so a decode that reads the wrong block is visible.
+    std::vector<uint8_t> guest(offset, 0);
+    for (uint32_t layer = 0; layer < kLayers; ++layer) {
+        for (uint32_t bx = 0; bx < kPitchBlocks; ++bx) {
+            const uint64_t at = MicroTiledOffset(bx, 0, layer, kPitchBlocks, kHeightBlocks, MicroThin,
+                                            1, 64);
+            assert(at + 8 <= guest.size());
+            guest[at] = uint8_t(layer);
+            guest[at + 1] = uint8_t(bx);
+            // The colour endpoints: c0 = (layer, bx, 0) as a 565 colour, c1 = black. The
+            // four indices all pick c0, so every texel of the block is that colour.
+            const uint16_t c0 = Rgb565((layer & 31) * 2, bx & 31, 0);
+            Put16(guest.data() + at, c0);
+            Put16(guest.data() + at + 2, 0);
+            Put32(guest.data() + at + 4, 0);
+        }
+    }
+
+    std::vector<uint8_t> out(LevelTexelBytes(layout, 0));
+    DecodeLevel(layout, 0, guest.data(), guest.size(), out.data());
+    for (uint32_t layer = 0; layer < kLayers; ++layer) {
+        for (uint32_t bx = 0; bx < kPitchBlocks; ++bx) {
+            const uint8_t* const texel = out.data() + (uint64_t(layer) * kWidth + bx * 4) * 4;
+            const uint16_t c0 = Rgb565((layer & 31) * 2, bx & 31, 0);
+            // The 565 expansion replicates the top bits: 5 bits of red, 6 of green.
+            const uint8_t want_r = uint8_t((((c0 >> 11) & 31) << 3) | (((c0 >> 11) & 31) >> 2));
+            const uint8_t want_g = uint8_t((((c0 >> 5) & 63) << 2) | (((c0 >> 5) & 63) >> 4));
+            if (texel[0] != want_r || texel[1] != want_g || texel[2] != 0 || texel[3] != 255) {
+                std::fprintf(stderr,
+                             "layer %u block %u: got %u %u %u %u, wanted %u %u 0 255\n", layer, bx,
+                             texel[0], texel[1], texel[2], texel[3], want_r, want_g);
+                assert(false);
+            }
+        }
+    }
+
+    // The mip chain: every level decodes, and the layers stay apart.
+    for (uint32_t m = 1; m < kLevels; ++m) {
+        const uint64_t bytes = LevelTexelBytes(layout, m);
+        std::vector<uint8_t> level(bytes, 0xcd);
+        DecodeLevel(layout, m, guest.data(), guest.size(), level.data());
+        uint64_t non_zero = 0;
+        for (uint64_t i = 0; i < bytes; ++i) {
+            non_zero += level[i] != 0xcd ? 1 : 0;
+        }
+        // Every level has data (the decode wrote over the whole buffer).
+        assert(non_zero == bytes);
+    }
+}
+
 int main() {
     TestBc1();
+    TestBc1KnownPattern();
     TestBc2AndBc3();
     TestBc4AndBc5();
+    TestBc4Bc5Channels();
     TestMicroTiling();
+    TestOneDArrayImage();
     BenchmarkDecode();
     std::puts("bc-decode-test: ok");
     return 0;

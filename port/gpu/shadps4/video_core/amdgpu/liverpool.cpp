@@ -26,6 +26,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "tlg_write_log.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/amdgpu/tlg_draw_census.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_frame_record.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -787,6 +788,67 @@ void Liverpool::ApplyGraphicsRegisterPacket(Regs& regs, const PM4Header* header,
     checksum = HashRegisterPacket(checksum, reinterpret_cast<const u32*>(header), count + 1);
 }
 
+// tlg: TLG_DRAW_CENSUS=1 — what the game draws and dispatches, per site (amdgpu/
+// tlg_draw_census.h): the indirect draws' arguments (the count the game computed on the
+// GPU) and the dispatches' dimensions. It tells a missing compute from a draw that asks
+// for 0 instances, which is what a missing effect (the particles) looks like.
+namespace {
+AmdGpu::DrawCensus g_draw_census;
+std::chrono::steady_clock::time_point g_draw_census_window = std::chrono::steady_clock::now();
+bool g_draw_census_on = [] {
+    const char* v = std::getenv("TLG_DRAW_CENSUS");
+    return v && v[0] == '1';
+}();
+
+/// The (count, instances) pair of an indirect draw, as the CPU sees it. The game's
+/// compute writes it a frame earlier, so it is one frame old: enough to tell "0" from
+/// "N", which is what the census is for.
+std::pair<u32, u32> ReadIndirectArgs(u64 address) {
+    u32 args[2]{};
+    Core::Memory::Instance()->CopySparseMemory(address, reinterpret_cast<u8*>(args), sizeof(args));
+    return {args[0], args[1]};
+}
+
+/// An indirect draw: its site is the address of its arguments.
+void NoteIndirectSite(u64 address) {
+    if (!g_draw_census_on) {
+        return;
+    }
+    g_draw_census.NoteIndirectSite(address, [&] { return ReadIndirectArgs(address); });
+}
+
+/// A direct draw with the instance count the game asked for.
+void NoteDirectDraw(u32 instances) {
+    if (!g_draw_census_on) {
+        return;
+    }
+    g_draw_census.NoteDirectDraw(instances);
+}
+
+/// A compute dispatch of this many workgroups.
+void NoteDispatch(u32 x, u32 y, u32 z) {
+    if (!g_draw_census_on) {
+        return;
+    }
+    g_draw_census.NoteDispatch(x, y, z);
+}
+
+/// Prints the census every 5 s and starts a new window.
+void ReportDrawCensus() {
+    if (!g_draw_census_on) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(now - g_draw_census_window).count();
+    if (secs < 5.0) {
+        return;
+    }
+    g_draw_census_window = now;
+    g_draw_census.Report();
+    g_draw_census.Reset();
+}
+} // namespace
+
 // tlg: TLG_DCB_STATS=1 — structure of graphics command buffers (read-only scan, printed every
 // 5 s): how many buffers, draws per buffer, state set before the first draw. Input for
 // processing command buffers on several threads.
@@ -942,6 +1004,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const PM4ItOpcode opcode = header->type3.opcode;
             // tlg: the time this packet costs the decode (TLG_PM4_PROFILE=1).
             const Pm4Timer pm4_timer{Liverpool::Pm4Profile::Classify(opcode)};
+            // tlg: the draw census (TLG_DRAW_CENSUS=1) prints its window here.
+            ReportDrawCensus();
             ApplyGraphicsRegisterPacket(regs, header, gfx_reg_checksum, &pipe_dirty);
             // DmaData to 0x3022C does nothing here (skipped below): no need to wait.
             if (rasterizer && !PipelinedOpcode(opcode) &&
@@ -1115,6 +1179,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+                NoteDirectDraw(regs.num_instances.num_instances);
                 if (!rasterizer) {
                     break;
                 }
@@ -1130,6 +1195,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+                NoteDirectDraw(regs.num_instances.num_instances);
                 if (!rasterizer) {
                     break;
                 }
@@ -1145,6 +1211,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+                NoteDirectDraw(regs.num_instances.num_instances);
                 if (!rasterizer) {
                     break;
                 }
@@ -1161,6 +1228,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+                NoteIndirectSite(indirect_args_addr + offset);
                 if (!rasterizer) {
                     break;
                 }
@@ -1180,6 +1248,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+                NoteIndirectSite(indirect_args_addr + offset);
                 if (!rasterizer) {
                     break;
                 }
@@ -1201,6 +1270,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+                NoteIndirectSite(indirect_args_addr + offset);
                 if (!rasterizer) {
                     break;
                 }
@@ -1220,6 +1290,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+                NoteIndirectSite(indirect_args_addr + offset);
                 if (!rasterizer) {
                     break;
                 }
@@ -1240,6 +1311,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+                NoteIndirectSite(indirect_args_addr + offset);
                 if (!rasterizer) {
                     break;
                 }
@@ -1270,6 +1342,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                     break;
                 }
+                NoteDispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 rasterizer->ScopeMarker("gfx:{}:DispatchDirect", fmt::make_format_args(cmd_address),
                                         [&] { rasterizer->DispatchDirect(); });
@@ -1801,6 +1874,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                 break;
             }
+            // tlg: the draw census counts the dispatches of the compute queue too.
+            NoteDispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
             const auto cmd_address = reinterpret_cast<const void*>(header);
             rasterizer->ScopeMarker("asc[{}]:{}:DispatchDirect",
                                     fmt::make_format_args(vqid, cmd_address),

@@ -431,6 +431,31 @@ target_include_directories(lighting-test-knob-test PRIVATE shadps4)
 add_executable(bc-decode-test EXCLUDE_FROM_ALL ../tests/test_bc_decode.cpp)
 target_compile_options(bc-decode-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(bc-decode-test PRIVATE shadps4)
+# tlg: the same decoder against the driver's own (the CPU decode is what the port uploads
+# when the driver refuses a 1D BC image). The shader is compiled with glslang, as the host
+# shaders are.
+set(BC_GFX_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tests/bc_gfx)
+set(BC_GFX_HEADER ${CMAKE_CURRENT_BINARY_DIR}/include/tests/bc_decode_gpu_spv.h)
+add_custom_command(OUTPUT ${BC_GFX_HEADER}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/include/tests
+    COMMAND ${GLSLANG_COMPILER} --target-env vulkan1.1 -DWIDTH=4 -o ${BC_GFX_HEADER}
+            --vn BC_DECODE_GPU_SPV ${BC_GFX_SRC}/bc_decode.comp
+    COMMAND ${CMAKE_COMMAND} "-DHEADER_FILE=${BC_GFX_HEADER}" -P ${SHADER_SRC}/AddShaderHeaderInclude.cmake
+    DEPENDS ${BC_GFX_SRC}/bc_decode.comp VERBATIM)
+add_executable(bc-decode-gpu-test EXCLUDE_FROM_ALL ../tests/test_bc_decode_gpu.cpp ${BC_GFX_HEADER})
+target_compile_options(bc-decode-gpu-test PRIVATE -UNDEBUG -Wall -Wextra -Werror -Wno-missing-field-initializers)
+target_include_directories(bc-decode-gpu-test PRIVATE shadps4 ${CMAKE_CURRENT_BINARY_DIR}/include)
+target_link_libraries(bc-decode-gpu-test PRIVATE Vulkan::Vulkan)
+# tlg: what the driver does with a 1D image with more than one layer (Vulkan has no 1D
+# array: VK_IMAGE_TYPE_1D must have arrayLayers == 1).
+add_executable(1d-array-test EXCLUDE_FROM_ALL ../tests/test_1d_array_image.cpp)
+target_compile_options(1d-array-test PRIVATE -UNDEBUG -Wall -Wextra -Werror -Wno-missing-field-initializers)
+target_link_libraries(1d-array-test PRIVATE Vulkan::Vulkan)
+# tlg: the draw census (video_core/amdgpu/tlg_draw_census.h), the probe that tells a missing
+# compute from a draw that asks for 0 instances.
+add_executable(draw-census-test EXCLUDE_FROM_ALL ../tests/test_draw_census.cpp)
+target_compile_options(draw-census-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(draw-census-test PRIVATE shadps4)
 add_executable(amd-paths-test EXCLUDE_FROM_ALL ../tests/test_amd_paths.cpp)
 target_compile_options(amd-paths-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(amd-paths-test PRIVATE shadps4)

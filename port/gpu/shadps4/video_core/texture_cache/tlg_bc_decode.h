@@ -239,4 +239,83 @@ inline uint64_t MicroTiledOffset(uint32_t x, uint32_t y, uint32_t z, uint32_t pi
            uint64_t(MicroTileElementIndex(x, y, z, micro_mode, thickness, bits)) * bits / 8;
 }
 
+/// One mip level of a guest image: where it starts in the guest memory and how big it is.
+/// The pitch and the height are in texels (a block covers 4x4 texels).
+struct MipLayout {
+    uint64_t offset = 0;
+    uint32_t pitch = 0;
+    uint32_t height = 0;
+};
+
+/// The guest layout of a block-coded image, enough to decode all its blocks. The port's
+/// upload (video_core/texture_cache/texture_cache.cpp) and the tests
+/// (port/tests/test_bc_decode.cpp) use the same code, so a test says what the port does.
+struct ImageLayout {
+    Kind kind = Kind::Bc1;
+    bool is_tiled = true;
+    uint32_t micro_mode = MicroThin;
+    uint32_t thickness = 1;
+    uint32_t num_bits = 64; ///< the bits of one block (64 for BC1/BC4, 128 for BC2/BC3/BC5)
+    uint32_t layers = 1;
+    uint32_t width = 0;  ///< level 0 width in texels
+    uint32_t height = 0; ///< level 0 height in texels
+    uint32_t levels = 1;
+    MipLayout mips[16]{};
+};
+
+/// The size of one level, in texels.
+inline void LevelExtent(const ImageLayout& layout, uint32_t level, uint32_t& width,
+                        uint32_t& height) {
+    width = std::max(layout.width >> level, 1u);
+    height = std::max(layout.height >> level, 1u);
+}
+
+/// The bytes the decoded texels of one level take (the layers one after another).
+inline uint64_t LevelTexelBytes(const ImageLayout& layout, uint32_t level) {
+    uint32_t width = 0, height = 0;
+    LevelExtent(layout, level, width, height);
+    return uint64_t(width) * height * layout.layers * TexelBytes(layout.kind);
+}
+
+/// Decodes one level of a guest image into `out` (the layers one after another, each with
+/// its rows of texels, row-major). The blocks are read from the guest memory the way the
+/// GPU's detiler lays them out (micro tiling, or linear for a linear surface), and a
+/// block that falls outside the guest memory decodes as zeroes.
+inline void DecodeLevel(const ImageLayout& layout, uint32_t level, const uint8_t* guest,
+                        size_t guest_size, uint8_t* out) {
+    const uint32_t block_bytes = BlockBytes(layout.kind);
+    const uint32_t texel_bytes = TexelBytes(layout.kind);
+    uint32_t width = 0, height = 0;
+    LevelExtent(layout, level, width, height);
+    const MipLayout& mip = layout.mips[level];
+    const uint32_t pitch_blocks = std::max((mip.pitch + 3) / 4, 1u);
+    const uint32_t height_blocks = std::max((mip.height + 3) / 4, 1u);
+    uint8_t texels[16 * 4];
+    for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+        for (uint32_t by = 0; by < (height + 3) / 4; ++by) {
+            for (uint32_t bx = 0; bx < (width + 3) / 4; ++bx) {
+                const uint64_t offset =
+                    mip.offset +
+                    (layout.is_tiled
+                         ? MicroTiledOffset(bx, by, layer, pitch_blocks, height_blocks,
+                                            layout.micro_mode, layout.thickness, layout.num_bits)
+                         : ((uint64_t(layer) * height_blocks + by) * pitch_blocks + bx) *
+                               block_bytes);
+                if (offset + block_bytes <= guest_size) {
+                    DecodeBlock(layout.kind, guest + offset, texels);
+                } else {
+                    std::memset(texels, 0, sizeof(texels));
+                }
+                for (uint32_t ty = 0; ty < 4 && by * 4 + ty < height; ++ty) {
+                    const uint32_t y = by * 4 + ty;
+                    const uint32_t x = bx * 4;
+                    const uint32_t count = std::min(4u, width - x);
+                    std::memcpy(out + ((uint64_t(layer) * height + y) * width + x) * texel_bytes,
+                                texels + ty * 4 * texel_bytes, count * texel_bytes);
+                }
+            }
+        }
+    }
+}
+
 } // namespace VideoCore::BcDecode

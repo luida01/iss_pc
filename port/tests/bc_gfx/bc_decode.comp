@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// The reference decode: the driver decodes a block-compressed image and the shader reads
+// its texels, so the test can compare the GPU's texels with the CPU decoder's
+// (video_core/texture_cache/tlg_bc_decode.h, the code the port uploads when the driver
+// refuses a 1D BC image).
+//
+// The image is bound as a combined image sampler: GLSL has no syntax for a separate
+// sampler and image. On this driver that path returns only the first channel of a
+// compressed image (the port's own shaders use separate descriptors, OpSampledImage, and
+// the game's textures come out right), so the probe compares the first channel: the
+// palette, the indices and the levels, which is what the decode has to get right.
+#version 450
+layout(local_size_x = 4, local_size_y = 4) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1) buffer Out {
+    uvec4 data[];
+} out_buf;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    // A sample at the centre of the texel (the sampler is NEAREST): a compressed image is
+    // sampled, not fetched, so the driver decodes the block.
+    vec2 uv = (vec2(p) + 0.5) / float(WIDTH);
+    vec4 c = texture(src, uv);
+    uvec4 u = uvec4(uint(c.x * 255.0 + 0.5), uint(c.y * 255.0 + 0.5),
+                   uint(c.z * 255.0 + 0.5), uint(c.w * 255.0 + 0.5));
+    uint i = uint(gl_GlobalInvocationID.y) * uint(WIDTH) + uint(gl_GlobalInvocationID.x);
+    out_buf.data[i] = u;
+}

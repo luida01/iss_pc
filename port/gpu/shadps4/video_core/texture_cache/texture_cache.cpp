@@ -1602,17 +1602,35 @@ void TextureCache::UploadDecodedImage(Image& image) {
     // tlg: TLG_BC_TINY (video_core/amdgpu/tlg_bc_tiny.h). The blocks are read from guest memory
     // with the layout the GPU detiler and the BC upload copies use (mips_layout pitch and height
     // in texels; micro tiling as host_shaders/tiling.comp), decoded and uploaded as texels.
+    // The decode itself is video_core/texture_cache/tlg_bc_decode.h (DecodeLevel), which the
+    // tests exercise with the same layouts, so a test says what the port uploads.
     // tlg: the decode is CPU work inside the frame. The counters say how much: a re-created
     // image decodes again, so the eviction cycle multiplies this cost.
     const auto decode_start = std::chrono::steady_clock::now();
     const ImageInfo& info = image.info;
     const auto kind = BcTinyDecodeKind(info.bc_format);
     ASSERT_MSG(kind.has_value(), "TLG_BC_TINY image without a decodable BC format");
-    const u32 block_bytes = BcDecode::BlockBytes(*kind);
     const u32 texel_bytes = BcDecode::TexelBytes(*kind);
     const u32 num_layers = info.resources.layers;
     const u32 micro_mode = u32(AmdGpu::GetMicroTileMode(info.tile_mode));
     const u32 thickness = AmdGpu::GetMicroTileThickness(info.array_mode);
+
+    // The guest layout of the image, in the units the decode wants.
+    BcDecode::ImageLayout layout;
+    layout.kind = *kind;
+    layout.is_tiled = info.props.is_tiled;
+    layout.micro_mode = micro_mode;
+    layout.thickness = thickness;
+    layout.num_bits = info.num_bits;
+    layout.layers = num_layers;
+    layout.width = info.size.width;
+    layout.height = info.size.height;
+    layout.levels = info.resources.levels;
+    for (u32 m = 0; m < info.resources.levels; ++m) {
+        layout.mips[m].offset = info.mips_layout[m].offset;
+        layout.mips[m].pitch = info.mips_layout[m].pitch;
+        layout.mips[m].height = info.mips_layout[m].height;
+    }
 
     std::vector<u8> guest(info.guest_size);
     Core::Memory::Instance()->CopySparseMemory(info.guest_address, guest.data(), guest.size());
@@ -1635,47 +1653,52 @@ void TextureCache::UploadDecodedImage(Image& image) {
             .imageOffset = {0, 0, 0},
             .imageExtent = {width, height, 1},
         });
-        total += Common::AlignUp(u64(width) * height * num_layers * texel_bytes, 16);
+        total += Common::AlignUp(BcDecode::LevelTexelBytes(layout, m), 16);
     }
 
     const auto staging = runtime.GetStagingPool().Request(total, MemoryType::HostUncached, 16);
-    u8 texels[16 * 4];
     for (u32 m = 0; m < info.resources.levels; ++m) {
-        const auto& mip = info.mips_layout[m];
-        const u32 width = copies[m].imageExtent.width;
-        const u32 height = copies[m].imageExtent.height;
-        const u32 pitch_blocks = std::max((mip.pitch + 3) / 4, 1u);
-        const u32 height_blocks = std::max((mip.height + 3) / 4, 1u);
         u8* const dst = staging.mapped + copies[m].bufferOffset;
-        for (u32 layer = 0; layer < num_layers; ++layer) {
-            for (u32 by = 0; by < Common::DivCeil(height, 4u); ++by) {
-                for (u32 bx = 0; bx < Common::DivCeil(width, 4u); ++bx) {
-                    const u64 offset =
-                        mip.offset +
-                        (info.props.is_tiled
-                             ? BcDecode::MicroTiledOffset(bx, by, layer, pitch_blocks,
-                                                          height_blocks, micro_mode, thickness,
-                                                          info.num_bits)
-                             : ((u64(layer) * height_blocks + by) * pitch_blocks + bx) *
-                                   block_bytes);
-                    if (offset + block_bytes <= guest.size()) {
-                        BcDecode::DecodeBlock(*kind, guest.data() + offset, texels);
-                    } else {
-                        std::memset(texels, 0, sizeof(texels));
-                    }
-                    for (u32 ty = 0; ty < 4 && by * 4 + ty < height; ++ty) {
-                        const u32 y = by * 4 + ty;
-                        const u32 x = bx * 4;
-                        const u32 count = std::min(4u, width - x);
-                        std::memcpy(dst + ((u64(layer) * height + y) * width + x) * texel_bytes,
-                                    texels + ty * 4 * texel_bytes, count * texel_bytes);
-                    }
-                }
-            }
-        }
+        BcDecode::DecodeLevel(layout, m, guest.data(), guest.size(), dst);
         copies[m].bufferOffset += staging.offset;
     }
     staging.Flush();
+
+    // tlg: TLG_BC_PROBE=1 — what the CPU decode produced: how many texels are not zero and
+    // a checksum of them. An image that decodes to zeroes (or to a uniform colour) is a
+    // texture that draws nothing, which is what a missing sprite atlas looks like. The
+    // first lines and then one every hundredth, so a session does not fill the log.
+    if (std::getenv("TLG_BC_PROBE")) {
+        static std::atomic<u32> probe_lines{0};
+        const u32 line = probe_lines.fetch_add(1, std::memory_order_relaxed);
+        if (line < 20 || line % 100 == 0) {
+            u64 checksum = 0;
+            u64 non_zero = 0;
+            u8 first[4] = {0, 0, 0, 0};
+            for (u32 m = 0; m < info.resources.levels; ++m) {
+                // staging.mapped already points at the request; the copy's offset carries the
+                // request's own offset too, so the level's data is at the difference.
+                const u8* const src = staging.mapped + (copies[m].bufferOffset - staging.offset);
+                const u64 bytes = BcDecode::LevelTexelBytes(layout, m);
+                for (u64 i = 0; i < bytes; ++i) {
+                    checksum = checksum * 131 + src[i];
+                    non_zero += src[i] != 0 ? 1 : 0;
+                }
+                if (m == 0 && bytes >= 4) {
+                    for (int i = 0; i < 4; ++i) {
+                        first[i] = src[i];
+                    }
+                }
+            }
+            std::printf("tlg: BC decode %ux%u layers %u mips %u: %llu texel bytes, %llu not zero, "
+                        "checksum %llx, first texel (%u, %u, %u, %u)\n",
+                        info.size.width, info.size.height, num_layers, info.resources.levels,
+                        static_cast<unsigned long long>(total),
+                        static_cast<unsigned long long>(non_zero),
+                        static_cast<unsigned long long>(checksum), first[0], first[1], first[2],
+                        first[3]);
+        }
+    }
 
     scheduler.EndRendering();
     runtime.UploadImage(&image, staging.buffer, copies);
