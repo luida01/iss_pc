@@ -17,6 +17,9 @@ if [[ "${1:-}" == "--build" ]]; then
     exit 0
 fi
 exe="$out/test_write_fault.exe"
-for mode in none page window merged state guard; do
+for mode in none page window merged state guard guardwin; do
     "$exe" --mode="$mode" --threads=8 --seconds=3
 done
+"$exe" --mode=protect
+"$exe" --mode=correct --read-first=1
+"$exe" --mode=correct --read-first=0
