@@ -16,8 +16,8 @@ páginas de 2 MiB el código del invitado iría mucho más rápido?
 | Las tres rutas de páginas de 2 MiB | **error 1314** (privilegio) y **1300** (el privilegio no está en el token) | aquí no se pueden obtener ni probar |
 | Alcance del TLB (persecución de punteros) | 4,9 ns a 1 MiB, 21,7 ns a 8 MiB, **52,5 ns a 16 MiB** | el escalón está entre 8 y 16 MiB |
 | Coste de la indirección de la sección | **idéntico a memoria anónima** en todos los tamaños | la sección no cuesta nada |
-| Cambio de protección (el del rastreador del GPU) | 44-52 ns/página; 74 944 páginas por ventana de 5 s → **3,5 ms / 5 s** | el 0,08 % de un núcleo |
-| Lo que el pool cuesta frente a memoria normal | el primer toque **2x** (1,0-1,3 µs/página contra 0,4-0,7) | ~0,8 s al arrancar, una sola vez |
+| Cambio de protección (el del rastreador del GPU) | 48-59 ns/página (el log: 4,4 ms por 74 944 páginas) | el 0,08 % de un núcleo |
+| Lo que el pool cuesta frente a memoria normal | el primer toque **2x** (0,8-1,3 µs/página contra 0,4-0,7) | ~0,5-0,8 s al arrancar, una sola vez |
 | Escena de introducción | 58,2 FPS, mediana 16,76 ms, espera de vsync 1,9 ms | **ya está atascada en el vsync** |
 
 Conclusión: la memoria del invitado **no es el cuello de botella del fotograma**. El coste que
@@ -36,12 +36,13 @@ geometría del pool del runtime y mide **solo el host** (sin juego, sin GPU, sin
 puede correr junto a una sesión:
 
 ```
-bash port/tests/run_guest_tlb.sh          # tamaño de página, rutas de 2 MiB, alcance del TLB
-                                           #   y coste del backing con el working set recortado
-clang ... tests/test_guest_tlb3.c          #.section vs anónimo: dónde vive la sección, cuántas
-                                           #   vistas, alineación, y el coste del write fault
-clang ... tests/test_guest_tlb4.c          # creación del pool real (6080 MiB), SEC_COMMIT vs
-                                           #   SEC_RESERVE, y la vista de respaldo
+bash port/tests/run_guest_tlb.sh          # construye y ejecuta los tres bancos:
+                                           #   test_guest_tlb.c  (página real, rutas de 2 MiB,
+                                           #                      alcance del TLB, backing)
+                                           #   test_guest_tlb3.c (sección contra memoria normal:
+                                           #                      dónde vive, cuántas vistas, write fault)
+                                           #   test_guest_tlb4.c (crear el pool de 6080 MiB,
+                                           #                      SEC_COMMIT frente a SEC_RESERVE)
 bash port/tests/run_guest_pool.sh         # el pool real (enlaza src/runtime_memory.c)
 ```
 
@@ -143,8 +144,10 @@ Además, el *write fault* en sí cuesta lo mismo en los dos casos (3,4 µs/pági
 la anónima: la sección no paga un peaje por estar respaldada por el pagefile).
 
 **Consecuencia para el fotograma**: el log del usuario muestra `protect calls 957 (74944 pages)`
-por ventana de 5 s, es decir 74 944 páginas × ~50 ns = **3,7 ms por ventana de 5 s = el 0,08 %
-de un núcleo**. La ruta de protección no es un cuello de botella.
+entre dos informes de tirón, y en ese mismo bloque el hilo del GPU dice `ms in: ... protect 4,4`
+→ **59 ns por página**, que es justo lo que mide el banco (48-52 ns/página). Son 4,4 ms de CPU
+por cada periodo entre informes: **el 0,08 % de un núcleo**. La ruta de protección no es un cuello
+de botella.
 
 ## 7. Medición 5: lo que el pool sí paga frente a memoria normal
 
@@ -156,7 +159,7 @@ de un núcleo**. La ruta de protección no es un cuello de botella.
 
 Lo único que la sección cuesta de más es **el commit de la primera escritura**: el doble que una
 página anónima (la página del pagefile se trae de cero y se marca sucia). El juego reserva
-5 301 534 720 bytes de memoria directa (1 380 604 páginas), así que eso son **~0,8 s de CPU
+5 301 534 720 bytes de memoria directa (1 294 323 páginas), así que eso son **~0,5-0,8 s de CPU
 repartidos durante el arranque**, una sola vez (después las páginas ya están residentes).
 
 Y el experimento inverso: **un fichero en el NVMe es peor** que el pagefile para el primer toque
@@ -172,7 +175,7 @@ puede recuperar). Con `SEC_COMMIT` ese mismo primer toque cuesta 1,01 µs/págin
 
 | Dato del log | Lectura |
 |---|---|
-| `protect calls 957 (74944 pages)` por ventana de 5 s | 3,7 ms de CPU por ventana (0,08 % de un núcleo) |
+| `protect calls 957 (74944 pages)` y `ms in: ... protect 4,4` en el mismo bloque | 59 ns por página (el banco mide 48-52): 4,4 ms de CPU entre informes, el 0,08 % de un núcleo |
 | `Runtime: flexible maps=0 ... protects=0` | el juego no usa la memoria flexible (1 GiB del pool) ni llama a `sceKernelMprotect` |
 | `Runtime: direct memory allocations=3, maps=3` | 3 reservas y 3 mapeos en toda la sesión: la geometría del pool no cambia durante el juego |
 | `1574 write faults/s` (hasta 2 485/s) | fallos del rastreador del GPU: el invitado escribe en una página que el GPU tiene en solo lectura |
@@ -197,10 +200,10 @@ escritura del rastreador del GPU**, y el cuello de botella del fotograma está e
   tiempo de esa ventana deja `GPU ticks 25,5 %` y `GPU thread ... idle 1,4 %`: el hilo del
   invitado está esperando al GPU y el GPU está invalidando memoria en cada fallo de escritura.
 
-El coste por fallo de escritura medido en el log (299,3 ms repartidos entre 1 574-2 485 fallos/s
-en la ventana entre dos informes) sale en **38-190 µs por fallo**, y la parte del runtime son
-3-5 µs: el resto está en la invalidación del rastreador y de la caché de texturas y de búferes
-(`port/gpu/shadps4/video_core/page_manager.cpp`, `vk_rasterizer.cpp`,
+El coste por fallo de escritura medido en el log (299,3 ms repartidos entre 1 574-2 485 fallos/s,
+con una ventana entre informes de entre 1 y 5 s) sale en **38-190 µs por fallo**, y la parte del
+runtime son 3-5 µs: el resto está en la invalidación del rastreador y de la caché de texturas y de
+búferes (`port/gpu/shadps4/video_core/page_manager.cpp`, `vk_rasterizer.cpp`,
 `video_core/buffer_cache/buffer_cache.cpp`), que es de los agentes del renderer.
 
 ## 10. Lo implementado: la ruta de páginas de 2 MiB, apagada por defecto
@@ -263,8 +266,10 @@ el vsync (58,2 FPS con mediana de 16,76 ms). Si la sesión elevada mostrara una 
 sería un dato que estos números no explican y habría que mirar con la herramienta de perfiles
 del propio juego.
 
-Si el flag se usa sin privilegio (o con `align`), el port avisa y sigue con el pool de 4 KiB:
-el A/B mide entonces exactamente lo mismo que la referencia.
+Si el flag se usa **sin privilegio**, el port avisa y sigue con el pool de 4 KiB: el A/B mide
+entonces exactamente lo mismo que la referencia. Con `TLG_HUGE_PAGES=align` el pool sigue con
+4 KiB pero con la geometría de 2 MiB (desplazamientos y direcciones alineados): sirve para
+comprobar que la geometría no rompe el juego, no para medir páginas grandes.
 
 ## 12. Archivos
 
