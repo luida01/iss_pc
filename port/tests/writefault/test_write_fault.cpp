@@ -362,16 +362,16 @@ LONG CALLBACK FaultHandler(EXCEPTION_POINTERS* info) {
         break;
     case kModeWindow:
     case kModeState: {
-        const size_t window = static_cast<size_t>(g_opts.window_kib) * 1024;
         const auto [start, size] = WindowOf(page);
         if (g_opts.mode == kModeState) {
             // The state cache: skip the calls that would not change anything.
-            const size_t pages = window / kPageSize;
+            const size_t pages = size / kPageSize;
             const size_t base = (start - reinterpret_cast<uintptr_t>(g_pool)) / kPageSize;
             size_t first = 0;
             size_t run = 0;
             for (size_t i = 0; i <= pages; ++i) {
-                const bool prot = i < pages && g_protected[base + i] != 0;
+                const bool prot = i < pages && base + i < g_protected.size() &&
+                                  g_protected[base + i] != 0;
                 if (prot) {
                     if (run == 0) {
                         first = i;
@@ -380,7 +380,9 @@ LONG CALLBACK FaultHandler(EXCEPTION_POINTERS* info) {
                 } else if (run) {
                     UnprotectRange(start + first * kPageSize, run * kPageSize);
                     for (size_t k = first; k < first + run; ++k) {
-                        g_protected[base + k] = 0;
+                        if (base + k < g_protected.size()) {
+                            g_protected[base + k] = 0;
+                        }
                     }
                     run = 0;
                 }

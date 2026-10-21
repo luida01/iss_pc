@@ -97,6 +97,7 @@ Banco (`port/tests/writefault`, 8 hilos, sección de 256 MiB, 3 s, **mediana de 
 | `none` | sin protección | 0 fallos | | | | | 0 | 0 |
 | `page` | deja escribible la página (1 llamada de 4 KiB) | 21,1 µs | 8,7 µs | 17,7 µs | 17,6 µs | 3,4 µs | 61 582 | 3 857 ms/s |
 | `window` | **lo que hace el port**: la página y la ventana (2 llamadas) | 68,1 µs | 41,5 µs | 62,7 µs | 62,5 µs | 4,8 µs | 1 519 | 310 ms/s |
+| `state` | como `window`, pero solo las páginas que siguen protegidas | 54,1 µs | 34,5 µs | 52,5 µs | 52,4 µs | 3,8 µs | 2 128 | 244 ms/s |
 | `merged` | la unión en una llamada (el cambio ya hecho) | 59,9 µs | 37,1 µs | 54,0 µs | 53,9 µs | 4,3 µs | 1 430 | 256 ms/s |
 | `guard` | `PAGE_GUARD`: el kernel quita la guardia, el manejador no protege nada | **2,2 µs** | **1,8 µs** | 0,1 µs | 0,0 µs | 2,1 µs | **25 899** | 174 ms/s |
 | `guardwin` | `PAGE_GUARD` y el manejador deja la ventana accesible (el ciclo del port con la guardia) | 30,3 µs | 14,4 µs | 26,2 µs | **9,4 µs** | 4,1 µs | 847 | 70 ms/s |
@@ -106,6 +107,13 @@ mismo patrón de escritura (25 899/s contra 1 519/s): el total del parón de los
 **174 ms/s** (guard) contra **310 ms/s** (window). O sea: en un banco cuyo manejador solo protege,
 el patrón guard es mejor; en el port, cuyo manejador además drena e invalida, la cuenta cambia
 (§5).
+
+Una nota de realismo: el modo `window` del banco **siempre** toca las 64 páginas de la ventana,
+pero el port **solo** desprotege las páginas que siguen protegidas
+(`RegionManager::ExtendWriteFault`: `add = ~(gpu | writeable)`) y **no llama a nada** si la
+ventana ya está suelta. El modo `state` del banco (que hace eso) es el que se parece al port
+real, y su protección por fallo es de **52 µs** (no 62). Las cifras del port de §2.3 están en
+esa línea.
 
 El modo `guardwin` es el que conserva el número de fallos del port (la ventana sigue
 amortizando) y es el único candidato real: **la protección del fallo baja de 53 a 9,4 µs** (la
