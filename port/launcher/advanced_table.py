@@ -130,6 +130,15 @@ _ROWS = (
       'A porcentagem da memória da placa acima da qual o próprio driver passa por aperto (move alocações para a memória do '
       'sistema, e o jogo fica mais lento). Só vale quando o total de memória do driver cabe na placa.'),
      {'lo': 50, 'hi': 100, 'unit': '%'}),
+    ('read', 'VBLANK_HZ', 'choice', '60', ('Frame rate told to the game', 'Taxa de quadros informada ao jogo'),
+     ('The refresh rate the port reports to the game. At 30 Hz (the rate this game runs at on the PS4) the engine does '
+      'less work per frame and the game paces itself like the console, which measured about 15% more frames in the '
+      'heaviest scenes; at 60 Hz the light scenes reach 60 FPS.',
+      'A taxa de atualização que o port informa ao jogo. A 30 Hz (a taxa deste jogo na PS4) o motor faz menos trabalho '
+      'por quadro e o jogo mantém o ritmo da console, o que mediu cerca de 15% mais quadros nas cenas mais pesadas; '
+      'a 60 Hz as cenas leves chegam a 60 FPS.'),
+     {'choices': (('30', '30 Hz (console)', '30 Hz (console)'), ('60', '60 Hz', '60 Hz'),
+                  ('120', '120 Hz', '120 Hz'))}),
     ('read', 'STREAM_MEMORY', 'choice', 'cached', ('Where small copies stage', 'Onde as cópias pequenas ficam'),
      ('Where 128 MB of scratch memory for small copies lives: cached RAM, uncached RAM or video memory.',
       'Onde ficam 128 MB de memória temporária para cópias pequenas: RAM com cache, sem cache ou memória de vídeo.'),
