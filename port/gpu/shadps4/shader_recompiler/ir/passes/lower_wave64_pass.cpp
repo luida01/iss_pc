@@ -537,18 +537,19 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
                     const auto scope = divergent_scopes.find(block);
                     if (scope == divergent_scopes.end() || !scope->second.hoist_block ||
                         scope->second.branch_depth != 1 || scope->second.loop_depth != 0) {
-                        // tlg: the exec mask of the branch is not its condition alone (the
-                        // shader set the exec mask itself), or the branch is nested in
-                        // another divergent branch or loop: the exchange cannot be hoisted
-                        // there, so it stays where the instruction is.
-                        if (Toggles::ReadFirstLaneDivergent()) {
-                            in_place.push_back({&inst, IR::U1{}});
-                            ++divergent_readfirstlanes_lowered;
-                        }
+                        // tlg: the branch is nested in another divergent branch or loop: the
+                        // exec mask of the region is not the condition of the branch alone
+                        // (it is the accumulated one), and the exchange cannot know it here.
+                        // The instruction stays a host broadcast.
                         continue;
                     }
-                    if (!IsAvailableAt(inst.Arg(0), scope->second.hoist_block) ||
-                        !HasNoExecChangeBefore(program, scope->second.hoist_block, block)) {
+                    if (!HasNoExecChangeBefore(program, scope->second.hoist_block, block)) {
+                        // tlg: the shader sets the exec mask itself (s_mov exec): the mask of
+                        // the region is not the condition of the branch alone. The
+                        // instruction stays a host broadcast.
+                        continue;
+                    }
+                    if (!IsAvailableAt(inst.Arg(0), scope->second.hoist_block)) {
                         // tlg: the value the branch broadcasts is only known inside the
                         // divergent region (a loop carried value, an atomic): the exchange
                         // cannot be hoisted, so it stays where the instruction is, with its
@@ -753,8 +754,10 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
         IR::IREmitter ir{*entry.inst->GetParent(), IR::Block::InstructionList::s_iterator_to(*entry.inst)};
         const IR::U32 invocation_index = ir.GetAttributeU32(IR::Attribute::LocalInvocationIndex);
         const IR::U32 subgroup_id = ir.ShiftRightLogical(invocation_index, ir.Imm32(5));
-        // The lanes of this subgroup with the exec mask set (the mask of the wave here).
-        const IR::U64 ballot = ir.Ballot(ir.GetExec());
+        // The lanes of this subgroup with the exec mask of the region set. The mask is the
+        // condition of the branch: the region is not nested in another divergent branch and
+        // the shader does not set the exec mask itself (the checks above).
+        const IR::U64 ballot = ir.Ballot(entry.cond);
         const IR::U32 mask_low = IR::U32{ir.CompositeExtract(ir.UnpackUint2x32(ballot), 0)};
         const IR::U1 has_candidate = ir.INotEqual(mask_low, ir.Imm32(0u));
         const IR::U32 first_local =

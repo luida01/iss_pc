@@ -186,10 +186,17 @@ static ReadFirstLaneForm RunReadFirstLaneForm(bool varying, bool divergent, u32 
     runtime.hw.cs.shared_memory_size = 256;
     runtime.hw.cs.workgroup_size = {threads, 1, 1};
     Common::ObjectPool<IR::Inst> pool;
+    IR::Block hoist(pool);
     IR::Block body(pool);
     IR::Block merge(pool);
+    // The block that branches to the divergent region: the condition (a branch on the lane
+    // id) and, when it is known there, the value the ReadFirstLane broadcasts.
+    IR::IREmitter hoist_ir(hoist);
+    const IR::U32 tid = hoist_ir.GetAttributeU32(IR::Attribute::LocalInvocationId, 0);
+    const IR::U1 cond{
+        hoist_ir.INotEqual(hoist_ir.BitwiseAnd(tid, hoist_ir.Imm32(1u)), hoist_ir.Imm32(0u))};
+    // The divergent region.
     IR::IREmitter ir(body);
-    const IR::U32 tid = ir.GetAttributeU32(IR::Attribute::LocalInvocationId, 0);
     // The atomic's result: only the lane that reserves the slot holds it.
     const IR::U32 reserved = IR::U32{ir.SharedAtomicIAdd(ir.Imm32(0u), ir.Imm32(1u), false)};
     const IR::U32 source =
@@ -198,13 +205,16 @@ static ReadFirstLaneForm RunReadFirstLaneForm(bool varying, bool divergent, u32 
     ir.WriteShared(32, base, ir.Imm32(0u));
     ir.Epilogue();
     IR::Program program(info);
+    program.blocks.push_back(&hoist);
     program.blocks.push_back(&body);
+    program.post_order_blocks.push_back(&hoist);
     program.post_order_blocks.push_back(&body);
     if (divergent) {
         // A branch on the lane id: the ReadFirstLane inside it is in divergent flow.
         program.blocks.push_back(&merge);
         program.post_order_blocks.push_back(&merge);
-        const IR::U1 cond{ir.INotEqual(ir.BitwiseAnd(tid, ir.Imm32(1u)), ir.Imm32(0u))};
+        program.syntax_list.push_back({.data = {.block = &hoist},
+                                       .type = IR::AbstractSyntaxNode::Type::Block});
         program.syntax_list.push_back(
             {.data = {.if_node = {.cond = cond, .body = &body, .merge = &merge}},
              .type = IR::AbstractSyntaxNode::Type::If});
@@ -271,14 +281,15 @@ struct DivergentForm {
 };
 
 static DivergentForm RunDivergentReadFirstLane(bool value_before_branch,
-                                                const char* spirv_path = nullptr) {
+                                                const char* spirv_path = nullptr,
+                                                u32 threads = 64, u32 size_y = 1) {
     Info info{};
     info.hw_stage = HwStage::Compute;
     info.sw_stage = SwStage::Compute;
     RuntimeInfo runtime{};
     runtime.Initialize(HwStage::Compute, SwStage::Compute);
     runtime.hw.cs.shared_memory_size = 256;
-    runtime.hw.cs.workgroup_size = {64, 1, 1};
+    runtime.hw.cs.workgroup_size = {threads, size_y, 1};
     Common::ObjectPool<IR::Inst> pool;
     IR::Block hoist(pool);
     IR::Block body(pool);
@@ -359,6 +370,48 @@ struct DivergentModel {
         return varying ? 100u + first : 7u;
     }
 };
+
+// tlg: a shader that reads the exec mask (s_mov v, exec) cannot be translated exactly
+// (Vulkan has no exec mask) and used to kill the port with an assertion in the emitter
+// ("EmitGetExec: Unreachable code"). The emitter now assumes every lane is active and says
+// so in the log: the shader must still be emitted and be valid SPIR-V.
+static bool ExecMaskShaderEmits(const char* spirv_path = nullptr) {
+    Info info{};
+    info.hw_stage = HwStage::Compute;
+    info.sw_stage = SwStage::Compute;
+    RuntimeInfo runtime{};
+    runtime.Initialize(HwStage::Compute, SwStage::Compute);
+    runtime.hw.cs.shared_memory_size = 64;
+    runtime.hw.cs.workgroup_size = {64, 1, 1};
+    Common::ObjectPool<IR::Inst> pool;
+    IR::Block block(pool);
+    IR::IREmitter ir(block);
+    const IR::U1 exec = ir.GetExec();
+    ir.WriteShared(32, IR::U32{ir.Select(exec, ir.Imm32(1u), ir.Imm32(0u))}, ir.Imm32(0u));
+    ir.Epilogue();
+    IR::Program program(info);
+    program.blocks.push_back(&block);
+    program.post_order_blocks.push_back(&block);
+    program.syntax_list.push_back({.data = {.block = &block},
+                                   .type = IR::AbstractSyntaxNode::Type::Block});
+    program.syntax_list.push_back({.type = IR::AbstractSyntaxNode::Type::Return});
+    Profile profile{};
+    profile.subgroup_size = 32;
+    profile.supported_spirv = 0x00010600;
+    profile.support_int64 = true;
+    Optimization::CollectShaderInfoPass(program, profile);
+    Backend::Bindings bindings{};
+    const auto code = Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
+    if (code.empty()) {
+        return false;
+    }
+    if (spirv_path) {
+        std::ofstream out(spirv_path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u32));
+        Check(bool(out), "the shader with the exec mask writes its SPIR-V");
+    }
+    return true;
+}
 
 // A 64-thread compute block with one ReadFirstLane (of a lane-varying value when `varying`) and
 // no ballot: lowered for wave64 (two workgroup barriers) only with TLG_RFL_ALL.
@@ -650,6 +703,24 @@ int main(int argc, char** argv) {
                   : (divergent_inner.broadcasts == 1 && divergent_inner.barriers == 0),
           "ReadFirstLane whose value is only known inside the divergent region is exchanged in "
           "place");
+    // tlg: the workgroup of the game that crashed the port: 256 threads (16x16x1), four waves
+    // of 64. The exchange has to give each wave its own slots, and the SPIR-V has to be
+    // valid: the mask of the region is the condition of the branch (the emitter cannot read
+    // the exec mask, and asking for it took the game down).
+    for (const auto& shape : {std::pair<u32, u32>{64, 1}, {256, 16}}) {
+        const DivergentForm big = RunDivergentReadFirstLane(false, nullptr, shape.first, shape.second);
+        Check(rfl_all ? (big.broadcasts == 0 && big.barriers == 2 && big.loads == 4)
+                      : (big.broadcasts == 1 && big.barriers == 0),
+              "ReadFirstLane in divergent flow in a workgroup of 256 threads (16x16x1): the "
+              "exchange is emitted and the shader is valid");
+        if (!spirv.empty()) {
+            const auto path =
+                (std::filesystem::path{spirv}.parent_path() /
+                 (shape.first == 64 ? "wave64-rfl-divergent-64.spv" : "wave64-rfl-divergent-256.spv"))
+                    .string();
+            RunDivergentReadFirstLane(false, path.c_str(), shape.first, shape.second);
+        }
+    }
     // The model: the exchange gives every lane the value of the first lane of the wave with
     // the condition set, and the per subgroup broadcast gives the upper half its own lane 32.
     Check(DivergentModel::Reference(true) == 100 && DivergentModel::HostPerHalf(63, true) == 132,
@@ -691,6 +762,13 @@ int main(int argc, char** argv) {
               "BP06: readlane 32 in a 32-thread workgroup, 32-wide host");
         Check(ReadLanePastWorkgroup(64) == (bp06 ? 0u : 1u),
               "BP06: readlane 32 in a 32-thread workgroup, 64-wide host");
+    }
+    Check(ExecMaskShaderEmits(),
+          "a shader that reads the exec mask is emitted instead of killing the port");
+    if (!spirv.empty()) {
+        const auto path =
+            (std::filesystem::path{spirv}.parent_path() / "wave64-rfl-exec.spv").string();
+        ExecMaskShaderEmits(path.c_str());
     }
     Check(Toggles::ShaderBinarySalt() ==
               ((small ? 1u : 0u) | (multi ? 2u : 0u) | (Toggles::LdsUniformReadLane() ? 4u : 0u) |

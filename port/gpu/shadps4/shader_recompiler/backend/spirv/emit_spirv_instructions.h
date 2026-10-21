@@ -25,7 +25,7 @@ Id EmitPhi(EmitContext& ctx, IR::Inst* inst);
 void EmitVoid(EmitContext& ctx);
 Id EmitConditionRef(EmitContext& ctx, const IR::Value& value);
 void EmitGetScc(EmitContext& ctx);
-void EmitGetExec(EmitContext& ctx);
+Id EmitGetExec(EmitContext& ctx);
 void EmitGetVcc(EmitContext& ctx);
 void EmitGetVccLo(EmitContext& ctx);
 void EmitGetVccHi(EmitContext& ctx);

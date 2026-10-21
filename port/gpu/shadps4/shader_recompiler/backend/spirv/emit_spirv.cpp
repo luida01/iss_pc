@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <span>
 #include "common/backports.h"
 #include <type_traits>
@@ -713,8 +714,20 @@ void EmitGetScc(EmitContext& ctx) {
     UNREACHABLE_MSG("Unreachable instruction");
 }
 
-void EmitGetExec(EmitContext& ctx) {
-    UNREACHABLE_MSG("Unreachable instruction");
+// tlg: Vulkan has no exec mask: the lanes that run are the ones the control flow reaches, and
+// there is no way to read them. A shader that reads the mask (s_mov v, exec) or sets it
+// (s_mov exec, v) cannot be translated exactly, and the port used to die with an assertion
+// here ("Unreachable instruction"), which took the whole game down. The approximation is
+// that every lane is active: right in uniform flow, and a different mask than the PS4's in
+// a divergent region. The log says so once per shader, so the case is visible.
+Id EmitGetExec(EmitContext& ctx) {
+    static std::atomic<u32> warned{0};
+    if (warned.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_WARNING(Render_Recompiler,
+                    "tlg: a shader reads the exec mask, which Vulkan does not have: every lane "
+                    "is assumed active");
+    }
+    return ctx.true_value;
 }
 
 void EmitGetVcc(EmitContext& ctx) {
@@ -738,7 +751,12 @@ void EmitSetScc(EmitContext& ctx) {
 }
 
 void EmitSetExec(EmitContext& ctx) {
-    UNREACHABLE_MSG("Unreachable instruction");
+    static std::atomic<u32> warned{0};
+    if (warned.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_WARNING(Render_Recompiler,
+                    "tlg: a shader sets the exec mask, which Vulkan does not have: the mask is "
+                    "ignored");
+    }
 }
 
 void EmitSetVcc(EmitContext& ctx) {

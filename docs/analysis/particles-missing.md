@@ -183,7 +183,7 @@ banco).
 
 El `ReadFirstLane` de un flujo divergente ya **no se queda como un broadcast por subgrupo**.
 El port hace el mismo intercambio que en el flujo uniforme, pero **con la máscara de exec de
-la región** (la condición de la rama, acumulada):
+la región** (la condición de la rama):
 
 1. **Cada medio subgrupo del host** toma las lanes que su propio *ballot* de la máscara marca
    (el `OpGroupNonUniformBallot` de la máscara de exec) y el valor de la primera de ellas
@@ -192,6 +192,13 @@ la región** (la condición de la rama, acumulada):
    los dos huecos**: el valor del medio par si tiene candidatos, el del medio impar si no.
    **Ese es el valor de la primera lane de la WAVE con la condición puesta** ✓ (el mismo
    resultado que la PS4).
+3. Las dos barreras de workgroup que ordenan el intercambio.
+
+**La máscara de la región es la condición de la rama** (no la máscara de exec del punto de la
+instrucción: en Vulkan no hay máscara de exec ✗, ver §2.5). Eso es exacto cuando la
+región **no** está anidada en otra rama divergente, **no** está dentro de un bucle divergente
+y el shader no fija la máscara de exec ella misma; **en los demás casos el `ReadFirstLane`
+se queda como estaba** ✓.
 3. Las dos barreras de workgroup que ordenan el intercambio.
 
 **Dónde se hace el intercambio (la parte importante):**
@@ -217,8 +224,8 @@ flujo divergente) queda implementado y probado para cuando el valor se conoce an
 | Caso | Qué hace el port | Por qué |
 |---|---|---|
 | El valor es **uniforme** (se lee de una dirección constante) | **No se baja** | El broadcast por subgrupo ya da el mismo valor: el intercambio sería trabajo perdido |
-| El shader **fija la máscara de exec** (`s_mov exec`) | Se baja en el sitio (con la máscara real, `GetExec`) | La máscara de la rama no es su condición sola |
-| La rama está **anidada** en otra rama divergente | Se baja en el sitio (con la máscara real) | La máscara acumulada solo se conoce en el sitio |
+| La región está **anidada** en otra rama divergente, o dentro de un **bucle divergente** | **No se baja** | La máscara de la región no es la condición de la rama sola: no se puede saber aquí |
+| El shader **fija la máscara de exec** (`s_mov exec`) | **No se baja** | Igual: la máscara de la región no es la condición de la rama sola |
 | `TLG_RFL_ALL=0` | **No se baja nada** (la vía vieja, para el A/B) | El interruptor que se pidió conservar |
 | `TLG_RFL_DIVERGENT=0` | No se baja el caso "en el sitio" (el "subido" sigue) | A/B del caso con la barrera en flujo divergente |
 
@@ -309,6 +316,60 @@ valor del compute. La sonda `TLG_DRAW_CENSUS=1` lo dice en vivo, por sitio:
 
 **"the region is clean"** = el draw lee la copia del invitado (el bug); **"the region is
 written by the GPU"** = el draw lee el búfer donde el compute escribió ✓.
+
+### 2.5 El crash que introdujo el arreglo (y cómo se resolvió)
+
+La primera versión de este arreglo **rompió el arranque del juego** (sesión
+`evidence/20261021-003807-verify-particles/`, a los 23 s):
+
+```
+GPU [Render.Recompiler] <Warning> lower_wave64_pass.cpp:629 LowerWave64BallotPass: tlg: wave64 compute shader 0xce1675e0 (256 threads, 16x16x1): Ballot 7, ReadFirstLane 7 (2 ReadFirstLane in divergent flow: 2 lowered, 0 uniform, 0 not)
+GPU [Debug] <Critical> emit_spirv.cpp:717 EmitGetExec: Unreachable code!
+Unreachable instruction
+STOP: GPU library assertion failed (see GPU log above)
+```
+
+**La causa era del arreglo, no del juego:** el intercambio "en el sitio" (el caso en que el
+valor que se difunde solo se conoce dentro de la región divergente) usaba la **máscara de
+exec** del punto de la instrucción, con `ir.GetExec()`.
+
+**En Vulkan no hay máscara de exec** (las lanes activas son las que alcanza el control de
+flujo) y el emisor de SPIR-V no sabe traducirla: `EmitGetExec` era un
+`UNREACHABLE_MSG` → la assertion tumbaba el port (y con él, el juego).
+
+**El arreglo (dos cosas):**
+
+1. **El intercambio ya no pide la máscara de exec.** La máscara de la región es **la
+   condición de la rama**, y eso es exacto cuando la región **no** está anidada en otra
+   rama divergente (`branch_depth == 1`), **no** está dentro de un bucle divergente
+   (`loop_depth == 0`) y el shader **no fija la máscara de exec** ella misma
+   (`s_mov exec`, comprobado con `HasNoExecChangeBefore`). **En los demás casos el
+   `ReadFirstLane` se queda como estaba** (la red de seguridad) ✓.
+2. **El emisor ya no mata al port.** `EmitGetExec` y `EmitSetExec` devuelven la
+   aproximación ("toda lane está activa") con un aviso en el log, en vez de una assertion.
+   Un shader que lea la máscara de exec en la PS4 sigue sin traducirse exacto, pero **el
+   port no muere** (que era el requisito: ninguna assertion).
+
+**La verificación (bancos):**
+
+* `port/tests/test_recompiler_fixes.cpp`:
+  * el caso "el valor se conoce antes de la rama" → el intercambio sube al bloque que
+    ramifica (2 barreras **en ese bloque**, 4 lecturas a LDS, 1 shuffle, 1 ballot, y **ningún**
+    `ReadFirstLane` en el shader);
+  * el caso "el valor solo se conoce dentro" → el intercambio se queda en el sitio (2
+    barreras en el bloque de la región);
+  * **el caso que reventó el juego: 256 threads (16x16x1)**, el workgroup de 4 waves del
+    juego → el intercambio se emite y el SPIR-V **pasa `spirv-val`** ✓ (también el de 64
+    threads);
+  * un shader que **lee la máscara de exec** → se emite sin assertion y su SPIR-V es
+    válido ✓ (con `OpConstantTrue`: toda lane activa).
+* Los `.spv` que escribe el banco (para `spirv-val`):
+  `wave64-rfl-divergent.spv`, `wave64-rfl-divergent-64.spv`, `wave64-rfl-divergent-256.spv`,
+  `wave64-rfl-exec.spv` ✓.
+
+**Lo que hay que rehacer en el juego:** una sesión con el port ya corregido (la caché de
+shaders se invalida sola ✓) y comprobar que **el juego arranca** ✓ y que el censo dice
+`N lowered` en los shaders de la wave64 divergente ✓.
 
 ## 3. El arreglo propuesto (renderer / buffer cache: fuera del alcance de este agente)
 
