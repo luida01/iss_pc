@@ -47,7 +47,7 @@ PRESETS = (
     ('quality', {}, {'menu:fsr1': '1'}),
     ('ps4', {}, {'menu:fps_limit': '30', 'menu:fsr1': '0', 'menu:rcas': '0'}),
 )
-DEFAULT_PRESET = 'balanced'
+DEFAULT_PRESET = 'balanced_4gb'
 
 
 def item_by_id(item_id):
