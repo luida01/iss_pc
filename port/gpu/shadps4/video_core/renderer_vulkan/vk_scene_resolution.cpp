@@ -24,6 +24,10 @@ SceneTargets::SceneTargets(const Instance& i, Scheduler& s, Runtime& r, Lookup g
     runtime.scene_targets = this;
     const char* force = std::getenv("TLG_SCENE_STENCIL_BITS");
     force_stencil_bits = force && force[0] == '1';
+    // The counters of the frame statistics: they cost an atomic per check and answer why
+    // the scene is not reduced (the renderer decides, this counts what it decided on).
+    stats_on = TlgStats::enabled;
+    stats_window = std::chrono::steady_clock::now();
     CreateResampleResources();
 }
 SceneTargets::~SceneTargets() {
@@ -67,39 +71,110 @@ bool SceneTargets::ShaderResampled(const VideoCore::Image& image) const {
            (!(image.aspect_mask & vk::ImageAspectFlagBits::eStencil) ||
             instance.IsShaderStencilExportSupported() || force_stencil_bits);
 }
-// 1 for the scene size, 2 for half resolution (the game's post-processing chain), else 0.
-// Half resolution needs a scene size that halves exactly: the proxy keeps the scene's factor,
-// so the shaders' FragCoord conversion (1920 / scene width) stays correct for it.
-static u32 SizeDivisor(const VideoCore::ImageInfo& i, SceneResolution::Size scene) {
-    if (i.size.width == 1920 && i.size.height == 1080) return 1;
-    if (i.size.width == 960 && i.size.height == 540 && scene.width % 2 == 0 &&
-        scene.height % 2 == 0 && !TlgToggle::Disabled(TlgToggle::SceneHalfRes)) {
-        return 2;
-    }
-    return 0;
+bool SceneTargets::Filterable(vk::Format format) const {
+    // The colour copies of the proxy can be filtered (a downscale of the native image
+    // without the aliasing of the nearest neighbour); the integer and the depth formats
+    // have no linear filter.
+    const auto features = Features(format);
+    return (features & vk::FormatFeatureFlagBits::eSampledImageFilterLinear) !=
+           vk::FormatFeatureFlags{};
 }
-bool SceneTargets::Eligible(const VideoCore::Image& image) const {
+// The proxy of an image is its size with the scene's factor (the scene's size over the
+// guest's frame): the guest's targets keep their fraction of the scene, so the shaders'
+// FragCoord conversion (1920 / scene width) stays correct for all of them.
+// An image that does not scale with the guest's frame (a shadow map, a texture) has no
+// proxy: it is not a view of the scene.
+bool SceneTargets::ScalesWithTheScene(const VideoCore::ImageInfo& i) {
+    if (i.size.width == 0 || i.size.height == 0) return false;
+    // The same aspect ratio as the guest's frame (1920x1080).
+    return 1920ull * i.size.height == 1080ull * i.size.width;
+}
+SceneResolution::Size SceneTargets::ProxySizeFor(const VideoCore::ImageInfo& i,
+                                                 SceneResolution::Size scene, u32 level) {
+    if (!ScalesWithTheScene(i)) return {0, 0};
+    // The proxy of the image at the scene's factor, rounded down to an even size (the
+    // half-resolution effects need it).
+    const auto scaled = [&](u32 native, u32 scene_size, u32 guest) {
+        const u64 value = u64(native) * scene_size / guest;
+        const u32 even = u32(std::max<u64>(2, value & ~u64(1)));
+        return std::max(1u, even >> level);
+    };
+    return {scaled(i.size.width, scene.width, 1920), scaled(i.size.height, scene.height, 1080)};
+}
+void SceneTargets::CountSkip(ProxySkip skip) const {
+    if (!stats_on) return;
+    counters.skipped[static_cast<u32>(skip)].fetch_add(1, std::memory_order_relaxed);
+}
+bool SceneTargets::EligibleInternal(const VideoCore::Image& image, bool count) const {
     const auto& i = image.info;
-    const u32 div = SizeDivisor(i, size);
-    if (!div || i.size.depth != 1 || i.resources.layers != 1 || i.num_samples != 1 ||
-        i.props.is_block || !image.backing || image.backing->num_samples != 1) {
+    if (!ScalesWithTheScene(i)) {
+        if (count) CountSkip(ProxySkip::Size);
+        return false;
+    }
+    // The smaller targets (the game's post-processing chain) follow the scene only when
+    // the switch says so.
+    if (i.size.width < 1920 && TlgToggle::Disabled(TlgToggle::SceneHalfRes)) {
+        if (count) CountSkip(ProxySkip::Size);
+        return false;
+    }
+    if (i.size.depth != 1 || i.props.is_block) {
+        if (count) CountSkip(ProxySkip::Volume);
+        return false;
+    }
+    if (i.resources.layers != 1) {
+        if (count) CountSkip(ProxySkip::Layers);
+        return false;
+    }
+    if (i.num_samples != 1 || !image.backing || image.backing->num_samples != 1) {
+        if (count) CountSkip(ProxySkip::Samples);
         return false;
     }
     if (i.resources.levels != 1) {
         // Mip chains (the bloom pyramid at half resolution): one blitted proxy per level.
-        return div == 2 && i.resources.levels <= 16 && !i.props.is_depth &&
-               Blittable(image.backing->image.image_ci.format);
+        if (i.props.is_depth || i.resources.levels > 16 ||
+            !Blittable(image.backing->image.image_ci.format)) {
+            if (count) CountSkip(i.props.is_depth ? ProxySkip::Mips : ProxySkip::Format);
+            return false;
+        }
+    } else if (!Blittable(image.backing->image.image_ci.format) && !ShaderResampled(image)) {
+        if (count) CountSkip(ProxySkip::Format);
+        return false;
     }
-    return Blittable(image.backing->image.image_ci.format) || ShaderResampled(image);
+    if (count && stats_on) {
+        counters.eligible.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+bool SceneTargets::Eligible(const VideoCore::Image& image) const {
+    return EligibleInternal(image, true);
 }
 bool SceneTargets::EligibleScene(const VideoCore::Image& image) const {
-    return image.info.size.width == 1920 && image.info.size.height == 1080 && Eligible(image);
+    // The scene start (the G-buffer pass) asks for the depth: it is counted once, with the
+    // attachments of the pass.
+    return image.info.size.width == 1920 && image.info.size.height == 1080 &&
+           EligibleInternal(image, false);
 }
 SceneResolution::Size SceneTargets::ProxySize(const VideoCore::Image& image, u32 level) const {
-    const u32 div = std::max(1u, SizeDivisor(image.info, size));
-    return {std::max(1u, size.width / div >> level), std::max(1u, size.height / div >> level)};
+    auto proxy = ProxySizeFor(image.info, size, level);
+    if (!proxy.width || !proxy.height) {
+        // The image does not scale with the scene: it has no proxy (the rasterizer asks
+        // only for the eligible ones).
+        proxy = size;
+    }
+    if (stats_on) {
+        // The rasterizer asks for the size of every attachment of a pass and keeps the
+        // first one: a change means the pass mixes sizes and cannot be reduced.
+        if (last_proxy_size && *last_proxy_size != proxy) {
+            counters.size_changes.fetch_add(1, std::memory_order_relaxed);
+        }
+        last_proxy_size = proxy;
+    }
+    return proxy;
 }
 bool SceneTargets::SetSize(SceneResolution::Size next) {
+    // The frame statistics: what the scene offered and what the proxy could take. The
+    // window closes here (the caller asks for the size once per frame).
+    ReportStats();
     if (next == size) return false;
     ResolveAll();
     scheduler.Finish();
@@ -108,9 +183,47 @@ bool SceneTargets::SetSize(SceneResolution::Size next) {
     ++generation;
     recent = {};
     size = next;
+    last_proxy_size.reset();
     std::printf("Scene resolution: raster %ux%u, half-resolution targets %ux%u, UI 1920x1080 "
                 "(live)\n", size.width, size.height, size.width / 2, size.height / 2);
     return true;
+}
+SceneTargets::Stats SceneTargets::TakeStats() {
+    Stats snapshot;
+    snapshot.eligible = counters.eligible.exchange(0, std::memory_order_relaxed);
+    for (u32 i = 0; i < u32(ProxySkip::Count); ++i) {
+        snapshot.skipped[i] = counters.skipped[i].exchange(0, std::memory_order_relaxed);
+    }
+    snapshot.size_changes = counters.size_changes.exchange(0, std::memory_order_relaxed);
+    snapshot.proxies = counters.proxies.exchange(0, std::memory_order_relaxed);
+    snapshot.fills = counters.fills.exchange(0, std::memory_order_relaxed);
+    snapshot.resolves = counters.resolves.exchange(0, std::memory_order_relaxed);
+    snapshot.samples = counters.samples.exchange(0, std::memory_order_relaxed);
+    snapshot.writes = counters.writes.exchange(0, std::memory_order_relaxed);
+    return snapshot;
+}
+void SceneTargets::ReportStats() {
+    if (!stats_on) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - stats_window < std::chrono::seconds(2)) return;
+    stats_window = now;
+    const auto snapshot = TakeStats();
+    std::printf("Scene proxy: eligible %llu", static_cast<unsigned long long>(snapshot.eligible));
+    for (u32 i = 0; i < u32(ProxySkip::Count); ++i) {
+        const u64 count = snapshot.skipped[i];
+        if (count) {
+            std::printf(", %s %llu", ProxySkipName(static_cast<ProxySkip>(i)),
+                        static_cast<unsigned long long>(count));
+        }
+    }
+    std::printf("; size changes %llu; proxies %llu, fills %llu, resolves %llu, samples %llu, "
+                "drawn %llu\n",
+                static_cast<unsigned long long>(snapshot.size_changes),
+                static_cast<unsigned long long>(snapshot.proxies),
+                static_cast<unsigned long long>(snapshot.fills),
+                static_cast<unsigned long long>(snapshot.resolves),
+                static_cast<unsigned long long>(snapshot.samples),
+                static_cast<unsigned long long>(snapshot.writes));
 }
 void SceneTargets::ResolveAll() {
     for (auto& [key, entry] : entries) {
@@ -181,6 +294,9 @@ void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
                            : vk::Extent2D{proxy.width, proxy.height});
         // (Depth proxies are single-level: Eligible.)
         if (to_native) e.state.Resolved(); else e.state.CopiedToProxy();
+        if (stats_on) {
+            (to_native ? counters.resolves : counters.fills).fetch_add(1, std::memory_order_relaxed);
+        }
         copying = false;
         return;
     }
@@ -199,6 +315,11 @@ void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
                               s32(std::max(1u, original.info.size.height >> e.level)), 1};
     const vk::Offset3D reduced{s32(e.image.image_ci.extent.width),
                                s32(e.image.image_ci.extent.height), 1};
+    // The colour copies are filtered: the nearest neighbour of a downscale aliases the
+    // image the guest is going to draw over. The depth and stencil keep the nearest one
+    // (they are not filterable, and the integer formats have no linear filter either).
+    const bool filter = original.aspect_mask == vk::ImageAspectFlagBits::eColor &&
+                        Filterable(original.backing->image.image_ci.format);
     for (auto aspect : {vk::ImageAspectFlagBits::eColor, vk::ImageAspectFlagBits::eDepth,
                         vk::ImageAspectFlagBits::eStencil}) {
         if (!(original.aspect_mask & aspect)) continue;
@@ -210,12 +331,16 @@ void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
         };
         // Nearest preserves depth/stencil and avoids assuming linear blit support for
         // integer G-buffer formats. FSR reconstructs color at the HDR scene boundary.
-        scheduler.Record([src,dst,region](vk::CommandBuffer cmd) {
+        const auto vk_filter = filter ? vk::Filter::eLinear : vk::Filter::eNearest;
+        scheduler.Record([src,dst,region,vk_filter](vk::CommandBuffer cmd) {
             cmd.blitImage(src, vk::ImageLayout::eTransferSrcOptimal, dst,
-                          vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
+                          vk::ImageLayout::eTransferDstOptimal, region, vk_filter);
         });
     }
     if (to_native) e.state.Resolved(); else e.state.CopiedToProxy();
+    if (stats_on) {
+        (to_native ? counters.resolves : counters.fills).fetch_add(1, std::memory_order_relaxed);
+    }
     copying = false;
 }
 void SceneTargets::Resample(vk::Image src, vk::Image dst, const VideoCore::Image& original,
@@ -409,6 +534,9 @@ SceneTargets::Entry& SceneTargets::Get(VideoCore::ImageId id, u32 level) {
         ci.mipLevels = 1;
         entry->image.Create(ci);
         tracked.insert(original.image_uid);
+        if (stats_on) {
+            counters.proxies.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     recent[recent_next++ % recent.size()] = {key, entry.get()};
     if (!entry->state.valid) Copy(*entry, original, false);
@@ -447,6 +575,9 @@ SceneTargets::Target SceneTargets::Attachment(VideoCore::ImageId id,
     e.state.ProxyWrite();
     auto attachment_info = info;
     attachment_info.is_storage = true; // include stencil in attachment views
+    if (stats_on) {
+        counters.writes.fetch_add(1, std::memory_order_relaxed);
+    }
     return {e.image, View(e, original, attachment_info), e.layout, e.image.image_ci.usage};
 }
 bool SceneTargets::ProxyCurrent(const VideoCore::Image& image, u32 level, u32 levels) const {
@@ -476,6 +607,9 @@ std::optional<SceneTargets::Target> SceneTargets::SampleProxy(
     }
     auto& e = *entries.find(Key(image.image_uid, level))->second;
     const auto layout = PrepareSample(image, level);
+    if (stats_on) {
+        counters.samples.fetch_add(1, std::memory_order_relaxed);
+    }
     return Target{e.image, View(e, image, info), layout, e.image.image_ci.usage};
 }
 SceneTargets::Target SceneTargets::Read(VideoCore::ImageId id,

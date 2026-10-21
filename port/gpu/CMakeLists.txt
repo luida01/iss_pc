@@ -607,3 +607,19 @@ if (WIN32)
         -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/tlg_win_compat.h)
 endif()
 target_link_libraries(chunk-cost-test PRIVATE tlggpu)
+
+# tlg: the scene proxy (the reduced-size copy of the guest's targets): which sizes can
+# have one, that drawing into it and resolving it back keeps the image, and that a native
+# write invalidates it. docs/analysis/scene-proxy-halfres.md.
+add_executable(scene-proxy-test EXCLUDE_FROM_ALL ../tests/test_scene_proxy.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(scene-proxy-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(scene-proxy-test PRIVATE -UNDEBUG -fPIC)
+# The scheduler includes the draw pipe, which uses gettid() (the TEB) on Windows.
+if (WIN32)
+    target_compile_options(scene-proxy-test PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/tlg_win_compat.h)
+endif()
+set_source_files_properties(../tests/test_scene_proxy.cpp PROPERTIES
+    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+target_link_libraries(scene-proxy-test PRIVATE tlggpu)

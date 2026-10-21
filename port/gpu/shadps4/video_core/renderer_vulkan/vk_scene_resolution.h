@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <functional>
@@ -15,6 +17,33 @@ class Instance;
 class Runtime;
 class Scheduler;
 
+/// Why a guest image cannot have a reduced-size proxy. The counters of the frame statistics
+/// add them up: an image that is not eligible is the reason its pass is not reduced.
+enum class ProxySkip : u32 {
+    None = 0,
+    Size,    ///< the size is not a view of the guest's frame (1920x1080) or the switch of
+             ///< the smaller targets is off
+    Samples, ///< multisampled
+    Layers,  ///< an array or an array-layered image
+    Volume,  ///< 3D or block-compressed
+    Mips,    ///< a mip chain the proxy cannot mirror
+    Format,  ///< the format cannot be blitted nor resampled by a shader
+    Count,
+};
+
+/// The name of a reason, for the frame statistics.
+inline const char* ProxySkipName(ProxySkip skip) {
+    switch (skip) {
+    case ProxySkip::Size: return "size";
+    case ProxySkip::Samples: return "samples";
+    case ProxySkip::Layers: return "layers";
+    case ProxySkip::Volume: return "volume";
+    case ProxySkip::Mips: return "mips";
+    case ProxySkip::Format: return "format";
+    default: return "none";
+    }
+}
+
 // Reduced raster targets, with native-size images retained for unmodified guest compute,
 // integer texture loads, copies and CPU readbacks. All native access passes Runtime::Transit.
 class SceneTargets {
@@ -27,11 +56,20 @@ public:
     SceneResolution::Size Size() const { return size; }
     bool Reduced() const { return size != SceneResolution::Size{}; }
     /// A reduced proxy can stand in for the image: a 1920x1080 scene target or, scaled by
-    /// the same factor, a half-resolution (960x540) one (toggle SceneHalfRes).
+    /// the same factor, a smaller one (960x540, 480x270...; toggle SceneHalfRes).
     bool Eligible(const VideoCore::Image&) const;
+    /// Whether the size of an image is a view of the guest's frame (the same aspect ratio
+    /// of 1920x1080): the targets of the scene scale with it, the shadow maps and the
+    /// textures do not.
+    static bool ScalesWithTheScene(const VideoCore::ImageInfo&);
+    /// The proxy size of an image whose size scales with the guest's frame: its size with
+    /// the scene's factor (the scene's size over the guest's frame), of the mip level
+    /// (level 0 without one). The size zero when the image does not scale with it.
+    static SceneResolution::Size ProxySizeFor(const VideoCore::ImageInfo&, SceneResolution::Size,
+                                              u32 level = 0);
     /// Eligible at the full scene size (1920x1080): the upscaler's inputs, the scene start.
     bool EligibleScene(const VideoCore::Image&) const;
-    /// The proxy size of an eligible image: the scene size divided like the native size.
+    /// The proxy size of an eligible image: its size with the scene's factor.
     SceneResolution::Size ProxySize(const VideoCore::Image&, u32 level = 0) const;
     struct Target {
         vk::Image image;
@@ -64,6 +102,24 @@ public:
         return !copying && tracked.contains(image_uid);
     }
     void ResolveAll();
+
+    /// What the scene offered and what the proxy could take, since the last report. The
+    /// numbers answer why a pass is not reduced: an attachment that is not eligible (with
+    /// its reason), a proxy size that changes between attachments, and the life of the
+    /// proxies (created, filled, resolved, sampled, drawn into).
+    struct Stats {
+        u64 eligible = 0;    ///< attachment checks that passed
+        std::array<u64, u32(ProxySkip::Count)> skipped{}; ///< by reason
+        u64 size_changes = 0; ///< the proxy size changed between two checks
+        u64 proxies = 0;      ///< proxy images created
+        u64 fills = 0;        ///< copies from the native image into the proxy
+        u64 resolves = 0;     ///< copies from the proxy into the native image
+        u64 samples = 0;      ///< bindings that read the proxy
+        u64 writes = 0;       ///< attachments drawn into the proxy
+    };
+    /// The counters since the last call, and resets them.
+    Stats TakeStats();
+
     bool debug = false; ///< TLG_SCENE_DEBUG frame: print resolves and fills
 private:
     struct Entry {
@@ -81,10 +137,16 @@ private:
     Entry& Get(VideoCore::ImageId, u32 level = 0);
     vk::ImageView View(Entry&, const VideoCore::Image&, const VideoCore::ImageViewInfo&);
     void Copy(Entry&, VideoCore::Image&, bool to_native);
-    // Depth/stencil formats without blit support (D32S8 on RADV) are resampled by a
-    // fullscreen draw writing gl_FragDepth and, with stencil export, the stencil value.
+    /// The eligibility of an image and, when `count` is set, why it was refused.
+    bool EligibleInternal(const VideoCore::Image&, bool count) const;
+    /// Counts a reason (the frame statistics print them).
+    void CountSkip(ProxySkip) const;
+    /// Depth/stencil formats without blit support (D32S8 on RADV) are resampled by a
+    /// fullscreen draw writing gl_FragDepth and, with stencil export, the stencil value.
     vk::FormatFeatureFlags Features(vk::Format) const;
     bool Blittable(vk::Format) const;
+    /// Whether the format can be filtered while it is copied (colour formats only).
+    bool Filterable(vk::Format) const;
     bool ShaderResampled(const VideoCore::Image&) const;
     void Resample(vk::Image src, vk::Image dst, const VideoCore::Image& original,
                   vk::Extent2D dst_size);
@@ -92,6 +154,8 @@ private:
     void CreateResampleResources();
     void Transition(Entry&, vk::ImageAspectFlags, vk::ImageLayout,
                     vk::PipelineStageFlags2, vk::AccessFlags2);
+    /// Prints the counters of the window (the frame statistics) and resets them.
+    void ReportStats();
     const Instance& instance;
     Scheduler& scheduler;
     Runtime& runtime;
@@ -111,5 +175,24 @@ private:
     vk::UniqueDescriptorSetLayout resample_set_layout;
     vk::UniquePipelineLayout resample_layout;
     std::vector<std::pair<std::pair<vk::Format, bool>, vk::UniquePipeline>> resample_pipelines;
+    /// The counters of the frame (the statistics are read from another thread).
+    struct Counters {
+        std::atomic<u64> eligible{0};
+        std::array<std::atomic<u64>, u32(ProxySkip::Count)> skipped{};
+        std::atomic<u64> size_changes{0};
+        std::atomic<u64> proxies{0};
+        std::atomic<u64> fills{0};
+        std::atomic<u64> resolves{0};
+        std::atomic<u64> samples{0};
+        std::atomic<u64> writes{0};
+    };
+    mutable Counters counters;
+    /// The proxy size of the last check: the rasterizer asks for the size of every
+    /// attachment of a pass and keeps the first one; a change means the pass mixes sizes.
+    mutable std::optional<SceneResolution::Size> last_proxy_size;
+    /// The counters are only collected with the frame statistics on (TLG_FRAME_STATS=1).
+    bool stats_on = false;
+    /// When the counters were last printed (the clock of the statistics).
+    std::chrono::steady_clock::time_point stats_window{};
 };
 } // namespace Vulkan
