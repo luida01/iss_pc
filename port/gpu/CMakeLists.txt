@@ -608,6 +608,18 @@ if (WIN32)
 endif()
 target_link_libraries(chunk-cost-test PRIVATE tlggpu)
 
+# tlg: the queue of the guest memory copies (the copies the guest's writes and the fences
+# wait for) and the wait it saves. docs/analysis/record-cost.md.
+add_executable(host-copies-test EXCLUDE_FROM_ALL ../tests/test_host_copies.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(host-copies-test PRIVATE shim shadps4)
+target_compile_options(host-copies-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+if (WIN32)
+    target_compile_options(host-copies-test PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/tlg_win_compat.h)
+endif()
+target_link_libraries(host-copies-test PRIVATE tlggpu)
+
 # tlg: the scene proxy (the reduced-size copy of the guest's targets): which sizes can
 # have one, that drawing into it and resolving it back keeps the image, and that a native
 # write invalidates it. docs/analysis/scene-proxy-halfres.md.

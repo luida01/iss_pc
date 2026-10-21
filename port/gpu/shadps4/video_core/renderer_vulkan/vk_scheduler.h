@@ -19,6 +19,7 @@
 #include <thread>
 #include <queue>
 
+#include "tlg_copy.h"
 #include "tlg_toggles.h"
 #include "common/assert.h"
 #include "common/interval_set.h"
@@ -687,6 +688,79 @@ private:
     size_t num_commands = 0;
 };
 
+/// tlg: the guest memory copies the port issues (the guest's data into the buffers the GPU
+/// reads). They are host memcpys: they do not belong in the command stream, and the thread
+/// that needs them done runs them itself.
+///
+/// tlg: they used to be recorded in the command chunk, so the tasks that wait for them (the
+/// guest's writes, the fences) waited for the Vulkan recording thread to record the chunk up
+/// to them: 262 us per wait, 12 % of the recording (the profile of 2026-10-21). The copies
+/// are queued here instead, and the waiter runs them: the wait is then the copy's time.
+///
+/// The copies come from several threads (the draw recording thread and the texture helper),
+/// so the queue has a lock; the critical section is a push. The copies run in the order they
+/// were queued.
+class HostCopyQueue {
+public:
+    /// Queues a copy.
+    template <typename Func>
+    void Push(Func&& copy) {
+        issued_.fetch_add(1, std::memory_order_relaxed);
+        const auto run = [copy = std::forward<Func>(copy), this](vk::CommandBuffer) {
+            copy();
+            done_.fetch_add(1, std::memory_order_release);
+        };
+        std::unique_lock lock{mutex_};
+        if (!chunk_->Push(run)) {
+            // The chunk is full (it holds thousands of copies): this one runs here.
+            lock.unlock();
+            run({});
+        }
+    }
+
+    /// Runs the pending copies on this thread; returns how many it ran.
+    u32 Run() {
+        std::unique_ptr<RecordChunk> pending;
+        {
+            std::scoped_lock lock{mutex_};
+            if (chunk_->Empty()) {
+                return 0;
+            }
+            // The chunk is taken whole: the copies run outside the lock (they can be big).
+            pending = std::move(chunk_);
+            chunk_ = std::move(spare_);
+            if (!chunk_) {
+                chunk_ = std::make_unique<RecordChunk>();
+            }
+        }
+        const u32 count = pending->Execute({});
+        {
+            std::scoped_lock lock{mutex_};
+            spare_ = std::move(pending);
+        }
+        return count;
+    }
+
+    /// The copies issued and the copies done (counts: the copies do not finish in order).
+    [[nodiscard]] u64 Issued() const {
+        return issued_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] u64 Done() const {
+        return done_.load(std::memory_order_acquire);
+    }
+    /// True when there are copies that have not run yet.
+    [[nodiscard]] bool Pending() const {
+        return Done() < Issued();
+    }
+
+private:
+    std::mutex mutex_;
+    std::unique_ptr<RecordChunk> chunk_{std::make_unique<RecordChunk>()};
+    std::unique_ptr<RecordChunk> spare_;
+    std::atomic<u64> issued_{0};
+    std::atomic<u64> done_{0};
+};
+
 class Scheduler {
 public:
     /// `threaded_recording`: Vulkan commands passed to Record() are recorded by a worker thread.
@@ -913,20 +987,30 @@ public:
     /// submission that reads them. Waits for all.
     void WaitHostCopies();
 
-    /// Runs `copy` on the recording thread in order with the commands (the thread spins for
-    /// work anyway, so small copies cost no wakeup); WaitHostCopies() covers it.
+    /// tlg: runs `copy` on the copy threads, in the calling thread's batch (the copies of a
+    /// frame are many and small: one pool task per copy would cost more than the copies).
+    ///
+    /// tlg: it used to be recorded in the command chunk, so the thread that needs it done (the
+    /// draw recording thread, in a task: the guest's writes and the fences) had to wait for
+    /// the Vulkan recording thread to record the chunk up to it: 262 us per wait, 12 % of the
+    /// recording (the profile of 2026-10-21). The copies are host memcpys, they do not belong
+    /// in the command stream: they go to a chunk of their own, and the thread that waits for
+    /// them runs them itself (RunHostCopies), so the wait is the copy's time and not the time
+    /// the recording thread needs to reach the copy.
     template <typename Func>
     void RecordHostCopy(Func&& copy) {
-        Record([copy = std::forward<Func>(copy), this,
-                seq = ++host_copies_issued](vk::CommandBuffer) {
-            copy();
-            host_copies_done.store(seq, std::memory_order_release);
-        });
+        host_copies.Push(std::forward<Func>(copy));
+    }
+
+    /// tlg: runs the pending host copies on this thread (the copies are host memcpys; the
+    /// command buffer is not used).
+    void RunHostCopies() {
+        host_copies.Run();
     }
 
     /// tlg: runs `signal` once the guest memory copies issued so far are done, without
-    /// waiting here: the recording thread reaches it after the copies queued before it and hands
-    /// it to the copy threads' completion (TlgCopy::AfterCopies).
+    /// waiting here: the copy threads run it when the copies queued before it are done
+    /// (TlgCopy::AfterCopies).
     void SignalAfterHostCopies(std::function<void()> signal);
 
     /// tlg: before a guest-visible write that is not deferred (WriteData, end-of-shader
@@ -1081,8 +1165,8 @@ private:
     BindState bind_state;
     std::atomic<u32> work_since_submit{0}; ///< tlg: CountWork(), reset by each submission
     bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
-    u64 host_copies_issued = 0;
-    std::atomic<u64> host_copies_done{0};
+    /// tlg: the host copies (issued, done and the ones not run yet).
+    HostCopyQueue host_copies;
     std::atomic<u64> deferred_signals_issued{0}; ///< by the thread recording (A or B)
     std::shared_ptr<std::atomic<u64>> deferred_signals_done =
         std::make_shared<std::atomic<u64>>(0);

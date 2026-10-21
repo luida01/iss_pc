@@ -258,13 +258,20 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
     }
     TlgCopy::FlushBatch();
     deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
-    Record([signal = std::move(signal), done = deferred_signals_done](vk::CommandBuffer) mutable {
-        TlgCopy::AfterCopies([signal = std::move(signal), done = std::move(done)] {
-            signal();
-            done->fetch_add(1, std::memory_order_release);
-        });
+    // tlg: the registration used to be a command in the chunk: the Vulkan recording thread ran
+    // it when it reached that point, and the thread that waited for the signal (the next
+    // task) had to wait for the recording thread to get there: 119 us per wait, 11.6 % of
+    // the recording (the profile of 2026-10-21). The copy threads run the callback as soon
+    // as the copies queued before it are done, and the order with them is the same (the
+    // copies and the signals are queued in order).
+    //
+    // The copies of our own chunk have to be done before the signal too: they are the
+    // ones the guest may rewrite the memory of once it sees the fence.
+    RunHostCopies();
+    TlgCopy::AfterCopies([signal = std::move(signal), done = deferred_signals_done] {
+        signal();
+        done->fetch_add(1, std::memory_order_release);
     });
-    KickRecording(true);
 }
 
 void Scheduler::WaitDeferredSignals() {
@@ -273,12 +280,11 @@ void Scheduler::WaitDeferredSignals() {
         TlgToggle::Disabled(TlgToggle::OrderedGuestWrites)) {
         return;
     }
-    // tlg: the wait for the signals the recording thread has to run: it is a wait, not
+    // tlg: the wait for the signals the copy threads have to run: it is a wait, not
     // work, and the profile tells it apart from the work (TLG_DRAW_PROFILE=1).
     DrawProfile::Scope scope{DrawPhase::Signals};
     TlgStats::WaitTimer timer{TlgStats::host_copies_wait_ns};
     TlgPerf::Span perf_wait{TlgPerf::Kind::WaitBegin, TlgPerf::Kind::WaitEnd, TlgPerf::Label("host_copies")};
-    KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
         // Helps the copy threads the signals wait for.
         TlgCopy::WaitAsync();
@@ -287,15 +293,19 @@ void Scheduler::WaitDeferredSignals() {
 }
 
 void Scheduler::WaitHostCopies() {
-    if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
+    if (host_copies.Pending()) {
         // tlg: the wait for the host copies: a wait, not work (TLG_DRAW_PROFILE=1).
         DrawProfile::Scope scope{DrawPhase::HostCopies};
         TlgStats::WaitTimer timer{TlgStats::host_copies_wait_ns};
         TlgPerf::Span perf_wait{TlgPerf::Kind::WaitBegin, TlgPerf::Kind::WaitEnd, TlgPerf::Label("host_copies")};
         TlgStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
-        KickRecording(true);
-        while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
-            std::this_thread::yield();
+        // tlg: the copies are ours (a queue of their own): the thread that waits for them
+        // runs them, so the wait is the copy's time and not the time the Vulkan recording
+        // thread needs to reach the copy in the command chunk.
+        while (host_copies.Pending()) {
+            // Copies of another thread may have arrived meanwhile: run them too.
+            RunHostCopies();
+            TlgCopy::WaitAsync();
         }
     }
     TlgStats::WaitTimer timer{TlgStats::copy_threads_wait_ns};

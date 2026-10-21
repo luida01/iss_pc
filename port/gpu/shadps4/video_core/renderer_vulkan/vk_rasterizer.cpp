@@ -1490,8 +1490,16 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         BindIndexBuffer();
     }
 
+    // tlg: the arguments of an indirect draw are written by the GPU (the compute that
+    // counts the particles): they cannot be served from a copy of the guest's memory (the
+    // "stream path" of BufferCache::ObtainBuffer, which returns a fresh copy of a small
+    // read-only buffer the GPU has not written), nor uploaded from it on top of what the
+    // compute wrote. Obtaining them as "written" skips the stream path: the draw reads the
+    // buffer the GPU wrote. The proper fix is a BufferCache::ObtainIndirectBuffer (the
+    // buffer cache is not this agent's scope): it would also skip the upload of the pages
+    // the GPU wrote.
     const auto [buffer, base] =
-        buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
+        buffer_cache.ObtainBuffer(indirect.args, stride * max_count, true);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
     // tlg: BP10 (shadPS4 c09fa46a, #5262) record the fetch so a later writer gets a barrier.
     if (Common::Backports::On(Common::Backports::Id::VertexIndexBarriers)) {
