@@ -119,7 +119,9 @@ El modo `guardwin` es el que conserva el número de fallos del port (la ventana 
 amortizando) y es el único candidato real: **la protección del fallo baja de 53 a 9,4 µs** (la
 guardia no necesita *shootdown* de TLB, §7) y el parón total cae de 310 a 70 ms/s.
 
-En el port real (log `evidence/20261021-015502-final-2/run.log` y el análisis de la TLB):
+### 2.3 El coste por fallo en el port real
+
+Log `evidence/20261021-015502-final-2/run.log` y el análisis de la TLB:
 
 | Dato | Lectura |
 |---|---|
@@ -130,8 +132,6 @@ En el port real (log `evidence/20261021-015502-final-2/run.log` y el análisis d
 
 Con esos números, **el coste por fallo en el port es ~107 µs y la protección son 14-24 µs**: el
 80-85 % del fallo es el drain y las invalidaciones, que el patrón guard **no toca**.
-
-### 2.3 El coste por fallo en el port
 
 ## 3. Qué hace `PAGE_GUARD` exactamente (medido en este equipo)
 
