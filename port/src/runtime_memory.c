@@ -18,6 +18,7 @@
 #include <errno.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -134,6 +135,52 @@ static uint64_t align_up(uint64_t n, uint64_t a) { return (n+a-1) & ~(a-1); }
 static int host_prot(int prot) {
     /* GPU read/write bits (0x10/0x20) need host access for the future GPU backend. */
     return ((prot & 0x11) ? PROT_READ : 0) | ((prot & 0x22) ? PROT_WRITE|PROT_READ : 0) | ((prot & 4) ? PROT_EXEC|PROT_READ : 0);
+}
+/* ---- 2 MiB pages for the guest pool (opt-in) ----
+ * The pool is one section; with TLG_HUGE_PAGES=1 the runtime asks Windows for a
+ * large-page section (SEC_LARGE_PAGES), whose views are backed by 2 MiB pages.
+ * That needs SeLockMemoryPrivilege, which a normal user's token does not have
+ * (error 1314 when the section is created, 1300 when the privilege is looked up),
+ * and the views of a large-page section must be 2 MiB aligned in address, in
+ * section offset and in size. So in that mode the runtime:
+ *   - hands out 2 MiB aligned physical offsets and rounds the mapped sizes up to
+ *     2 MiB (the padding stays inside the allocation, so nothing else is aliased),
+ *   - aligns the guest addresses up to 2 MiB (the guest is told the real address),
+ *   - maps the backing view at a 2 MiB aligned address.
+ * If the privilege is not held, or the section does not end up with 2 MiB pages,
+ * the runtime says so and keeps the normal pool. TLG_HUGE_PAGES=align applies the
+ * same geometry with 4 KiB pages, to check the geometry without the privilege.
+ * The gain is measured to be small (docs/analysis/guest-memory-tlb.md): the TLB of
+ * this CPU reaches 8-16 MiB, the guest's hot set fits in it, and the section costs
+ * the same as plain memory. */
+#define HUGE_ALIGN (UINT64_C(2) * 1024 * 1024)
+enum { HUGE_OFF=0, HUGE_GEOMETRY=1, HUGE_PAGES=2 };
+static int huge_mode;    /* what TLG_HUGE_PAGES asks for */
+static int huge_ready;   /* the setting has been read */
+static int huge_pages;   /* the pool's pages are 2 MiB */
+#ifdef _WIN32
+static int lock_memory_privilege(void);
+#endif
+static int huge_setting(void) {
+#ifdef _WIN32
+    if (!huge_ready) {
+        huge_ready=1;
+        const char *e=getenv("TLG_HUGE_PAGES");
+        if (e && *e) {
+            if (!strcmp(e,"align")) huge_mode=HUGE_GEOMETRY;
+            else if (!strcmp(e,"1")) huge_mode=HUGE_PAGES;
+        }
+        /* Without the privilege the flag changes nothing: the pool stays exactly as it
+         * is today, so an A/B run without it measures the same thing as before. */
+        if (huge_mode==HUGE_PAGES && !lock_memory_privilege()) {
+            fprintf(stderr,"Runtime: TLG_HUGE_PAGES=1 needs SeLockMemoryPrivilege (error 1300: it is not in this user's token); the pool keeps 4 KiB pages\n");
+            huge_mode=HUGE_OFF;
+        }
+    }
+#else
+    (void)huge_ready;
+#endif
+    return huge_mode;
 }
 #ifdef _WIN32
 /* ---- host mappings (Windows) ----
@@ -274,15 +321,88 @@ static int host_protect(uintptr_t address, uint64_t size, int prot) {
 }
 /* Released pages read as zero when reused, like the memfd's punched holes. */
 static void host_discard(uint64_t phys, uint64_t size) { memset(backing_base+phys,0,size); }
+/* SeLockMemoryPrivilege is what SEC_LARGE_PAGES needs; a normal user does not have it. */
+static int lock_memory_privilege(void) {
+    HANDLE token=NULL;
+    if (!OpenProcessToken(GetCurrentProcess(),TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY,&token)) return 0;
+    LUID luid;
+    int ok=0;
+    if (LookupPrivilegeValueA(NULL,"SeLockMemoryPrivilege",&luid)) {
+        TOKEN_PRIVILEGES tp;
+        tp.PrivilegeCount=1;
+        tp.Privileges[0].Luid=luid;
+        tp.Privileges[0].Attributes=SE_PRIVILEGE_ENABLED;
+        SetLastError(0);
+        if (AdjustTokenPrivileges(token,FALSE,&tp,sizeof(tp),NULL,NULL) && !GetLastError()) ok=1;
+    }
+    CloseHandle(token);
+    return ok;
+}
+/* A view of a large-page section has to start at a 2 MiB boundary: the address space
+ * is reserved as a placeholder and an aligned range is carved out of it. */
+static unsigned char *map_backing(HANDLE s, uint64_t bytes, int aligned) {
+    if (!aligned) return (unsigned char *)MapViewOfFile3(s,GetCurrentProcess(),NULL,0,(size_t)bytes,0,PAGE_READWRITE,NULL,0);
+    size_t total=(size_t)bytes+HUGE_ALIGN;
+    void *base=VirtualAlloc2(NULL,NULL,total,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0);
+    if (!base) return NULL;
+    uintptr_t start=((uintptr_t)base+HUGE_ALIGN-1)&~(uintptr_t)(HUGE_ALIGN-1);
+    uintptr_t end=(uintptr_t)base+total;
+    if (start>(uintptr_t)base && !VirtualFree(base,start-(uintptr_t)base,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) {
+        VirtualFree(base,0,MEM_RELEASE); return NULL;
+    }
+    if (end>start+(uintptr_t)bytes && !VirtualFree((void*)(start+(uintptr_t)bytes),end-(start+(uintptr_t)bytes),MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) {
+        VirtualFree(base,0,MEM_RELEASE); return NULL;
+    }
+    return (unsigned char *)MapViewOfFile3(s,GetCurrentProcess(),(void *)start,0,(size_t)bytes,MEM_REPLACE_PLACEHOLDER,PAGE_READWRITE,NULL,0);
+}
+/* One byte per 2 MiB over 64 MiB: 32 faults with 2 MiB pages, 16384 with 4 KiB ones. */
+static int verify_large_pages(unsigned char *view) {
+    const uint64_t span=UINT64_C(64)<<20;
+    PROCESS_MEMORY_COUNTERS before,after;
+    if (!GetProcessMemoryInfo(GetCurrentProcess(),&before,sizeof(before))) return 0;
+    for (uint64_t at=0; at<span; at+=HUGE_ALIGN) view[at]=1;
+    if (!GetProcessMemoryInfo(GetCurrentProcess(),&after,sizeof(after))) return 0;
+    unsigned long faults=(unsigned long)(after.PageFaultCount-before.PageFaultCount);
+    printf("Runtime: pool page size check: %lu faults for %llu MiB of 2 MiB chunks\n",faults,(unsigned long long)(span>>20));
+    return faults<=4*(unsigned long)(span/HUGE_ALIGN);
+}
 /* Direct memory occupies [0,POOL_SIZE) of the section, flexible memory [POOL_SIZE,+FLEX_SPAN). */
-static int pool(void) {
-    if (backing_base) return 0;
-    runtime_memory_reserve();
-    uint64_t bytes=POOL_SIZE+FLEX_SPAN;
+static int pool_normal(uint64_t bytes) {
     section=CreateFileMapping2(INVALID_HANDLE_VALUE,NULL,FILE_MAP_ALL_ACCESS,PAGE_EXECUTE_READWRITE,SEC_COMMIT,bytes,NULL,NULL,0);
     if (!section) { fprintf(stderr,"Runtime: cannot create %" PRIu64 " MiB of guest memory (error %lu); is the page file large enough?\n",bytes>>20,GetLastError()); return -1; }
     backing_base=MapViewOfFile3(section,GetCurrentProcess(),NULL,0,bytes,0,PAGE_READWRITE,NULL,0);
     return backing_base ? 0 : -1;
+}
+/* The large-page pool; it falls back to the normal one when it cannot be used. */
+static int pool_huge(uint64_t bytes) {
+    int large=huge_mode==HUGE_PAGES;
+    HANDLE s=CreateFileMapping2(INVALID_HANDLE_VALUE,NULL,FILE_MAP_ALL_ACCESS,PAGE_EXECUTE_READWRITE,
+                                SEC_COMMIT|(large?SEC_LARGE_PAGES:0),bytes,NULL,NULL,0);
+    if (!s) {
+        fprintf(stderr,"Runtime: the guest pool section failed (error %lu); the pool keeps 4 KiB pages\n",GetLastError());
+        huge_mode=HUGE_OFF; return pool_normal(bytes);
+    }
+    unsigned char *view=map_backing(s,bytes,large);
+    if (!view) {
+        fprintf(stderr,"Runtime: the backing view of the pool failed (error %lu); the pool keeps 4 KiB pages\n",GetLastError());
+        CloseHandle(s); huge_mode=HUGE_OFF; return pool_normal(bytes);
+    }
+    if (large && !verify_large_pages(view)) {
+        fprintf(stderr,"Runtime: the pool section does not use 2 MiB pages; the pool keeps 4 KiB pages\n");
+        UnmapViewOfFile(view); CloseHandle(s); huge_mode=HUGE_OFF; return pool_normal(bytes);
+    }
+    section=s; backing_base=view; huge_pages=large;
+    printf("Runtime: guest pool: %" PRIu64 " MiB, %s pages%s\n",bytes>>20,large?"2 MiB":"4 KiB",
+           huge_mode==HUGE_GEOMETRY?" (TLG_HUGE_PAGES=align: 2 MiB aligned geometry, 4 KiB pages)":"");
+    return 0;
+}
+static int pool(void) {
+    if (backing_base) return 0;
+    runtime_memory_reserve();
+    uint64_t bytes=POOL_SIZE+FLEX_SPAN;
+    huge_setting();
+    if (huge_mode) return pool_huge(bytes);
+    return pool_normal(bytes);
 }
 #else
 /* Direct memory occupies [0,POOL_SIZE) of the memfd, flexible memory [POOL_SIZE,+FLEX_SPAN). */
@@ -335,6 +455,18 @@ static void flex_set(uint64_t first, uint64_t count, int used) {
 }
 static uint64_t flex_alloc(uint64_t size) {
     uint64_t pages=size/PAGE, total=FLEX_SPAN/PAGE, run=0;
+    if (huge_setting()) {
+        /* Large-page mode: the flexible offsets have to be 2 MiB aligned. */
+        uint64_t unit=HUGE_ALIGN/PAGE, need=(pages+unit-1)/unit*unit;
+        for (uint64_t p=0; p+need<=total; p+=unit) {
+            int free=1;
+            for (uint64_t i=0;i<need;++i) if (flex_test(p+i)) { free=0; break; }
+            if (!free) continue;
+            flex_set(p,need,1);
+            return POOL_SIZE+p*PAGE;
+        }
+        return UINT64_MAX;
+    }
     for (uint64_t p=0;p<total;++p) {
         run = flex_test(p) ? 0 : run+1;
         if (run==pages) { flex_set(p+1-pages,pages,1); return POOL_SIZE+(p+1-pages)*PAGE; }
@@ -342,6 +474,7 @@ static uint64_t flex_alloc(uint64_t size) {
     return UINT64_MAX;
 }
 static void flex_free(uint64_t phys, uint64_t size) {
+    if (huge_setting()) size=align_up(size,HUGE_ALIGN);
     flex_set((phys-POOL_SIZE)/PAGE,size/PAGE,0);
     host_discard(phys,size);
 }
@@ -420,8 +553,20 @@ static void drop_range(uintptr_t start, uintptr_t end) {
 static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t alignment,
                      int kind, int type, uint64_t phys) {
     uintptr_t address=(uintptr_t)*inout;
+    /* Large-page mode: a view of the pool has to be 2 MiB aligned in address, in
+     * section offset and in size. The offsets and the sizes come from the runtime
+     * (the pool's allocations are 2 MiB aligned), the address from the guest's hint:
+     * it is aligned up, and the guest is told the real address. */
+    if (huge_setting() && kind!=KIND_RESERVED) {
+        size=align_up(size,HUGE_ALIGN);
+        if (alignment<HUGE_ALIGN) alignment=HUGE_ALIGN;
+    }
     if (flags & MAP_FIXED_FLAG) {
         if (!address || address%PAGE) return INVALID;
+        if (huge_setting() && kind!=KIND_RESERVED && address%HUGE_ALIGN) {
+            fprintf(stderr,"Runtime: a fixed mapping at %p is not 2 MiB aligned (TLG_HUGE_PAGES)\n",(void *)address);
+            return INVALID;
+        }
         if ((flags & MAP_NO_OVERWRITE) && overlaps(address,address+size,1)) return NO_MEMORY;
     } else {
         address=find_free(address,size,alignment);
@@ -458,6 +603,13 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     if (!alignment) alignment = PAGE;
     if (!out || low < 0 || high < 0 || !size || size % PAGE || !valid_alignment(alignment) || type < 0 || type > 10)
         return INVALID;
+    /* Large-page mode: the physical offsets and the sizes have to be 2 MiB aligned so
+     * that the views of the pool can be backed by 2 MiB pages. The padding belongs to
+     * this allocation, so nothing else is aliased. */
+    if (huge_setting()) {
+        if (alignment<HUGE_ALIGN) alignment=HUGE_ALIGN;
+        size=align_up(size,HUGE_ALIGN);
+    }
     uint64_t end = (uint64_t)high < POOL_SIZE ? (uint64_t)high : POOL_SIZE;
     if ((uint64_t)low >= end || size > end - (uint64_t)low) return NO_SPACE;
     write_lock();
@@ -505,6 +657,12 @@ static ABI int32_t direct_map_named(void **out, uint64_t size, int prot, int fla
 }
 static int32_t unmap_locked(uintptr_t start, uint64_t size) {
     if (start%PAGE || !size) return INVALID;
+    /* Large-page mode: the views are re-mapped when a range is carved out of them, so
+     * the range has to keep the 2 MiB alignment of the view. */
+    if (huge_setting() && (start%HUGE_ALIGN || size%HUGE_ALIGN)) {
+        fprintf(stderr,"Runtime: TLG_HUGE_PAGES needs 2 MiB aligned unmaps (this one is at %p, %" PRIu64 " bytes)\n",(void *)start,size);
+        return INVALID;
+    }
     uint64_t end=start+align_up(size,PAGE);
     for (size_t i=vma_index(start); i<vma_count && vmas[i].start<end; ++i)
         if (vmas[i].kind!=KIND_RESERVED) {
@@ -531,6 +689,8 @@ static ABI int32_t direct_unmap(void *address, uint64_t size) {
 static ABI int32_t direct_release(uint64_t start, uint64_t size) {
     if (start % PAGE || size % PAGE) return INVALID;
     if (!size) return 0;
+    /* Large-page mode: the allocation was rounded up to 2 MiB, so the release is too. */
+    if (huge_setting()) size=align_up(size,HUGE_ALIGN);
     write_lock();
     if (!direct_range_allocated(start,size)) { write_unlock(); return INVALID; }
     /* Mappings of released physical pages disappear with them. */
@@ -539,7 +699,8 @@ static ABI int32_t direct_release(uint64_t start, uint64_t size) {
         uint64_t length=v.end-v.start;
         if (v.kind==KIND_DIRECT && v.phys<start+size && start<v.phys+length) {
             uint64_t a=v.phys>start ? v.phys : start, b=v.phys+length<start+size ? v.phys+length : start+size;
-            unmap_locked(v.start+(a-v.phys),b-a);
+            /* A failed unmap leaves the range in the table: stop here instead of looping. */
+            if (unmap_locked(v.start+(a-v.phys),b-a)) { write_unlock(); return INVALID; }
             i=vma_index(v.start);
             continue;
         }
@@ -609,6 +770,13 @@ static ABI int32_t reserve_range(void **inout, uint64_t size, int flags, uint64_
 static int32_t protect_locked(uintptr_t start, uint64_t size, int prot, int type) {
     uintptr_t end=start+align_up(size,PAGE);
     start&=~(uintptr_t)(PAGE-1);
+    /* Large-page mode: the protection change splits the region table, and the pieces
+     * have to keep the 2 MiB alignment of the views (a piece that is not aligned would
+     * split a view into two that cannot be large-page backed). */
+    if (huge_setting() && (start%HUGE_ALIGN || end%HUGE_ALIGN)) {
+        fprintf(stderr,"Runtime: TLG_HUGE_PAGES needs 2 MiB aligned protections (this one is at %p, %" PRIu64 " bytes)\n",(void *)start,(uint64_t)(end-start));
+        return INVALID;
+    }
     if ((prot & ~0x37) || !covered(start,end,0)) return INVALID;
     if (host_protect(start,end-start,host_prot(prot))) return INVALID;
     int error; size_t i=carve(start,end,&error);
@@ -911,5 +1079,8 @@ void runtime_memory_report(void) {
            allocations, maps, live_bytes, POOL_SIZE);
     printf("Runtime: flexible maps=%zu, in use=%" PRIu64 ", protects=%zu, queries=%zu, regions=%zu\n",
            flexible_maps, flexible_bytes, protects, queries, vma_count);
+    if (backing_base)
+        printf("Runtime: guest pool=%" PRIu64 " MiB, %s pages%s\n",(POOL_SIZE+FLEX_SPAN)>>20,
+               huge_pages?"2 MiB":"4 KiB",huge_mode==HUGE_GEOMETRY?" (2 MiB aligned geometry)":"");
 }
 
