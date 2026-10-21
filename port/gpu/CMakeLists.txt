@@ -431,6 +431,11 @@ target_include_directories(lighting-test-knob-test PRIVATE shadps4)
 add_executable(bc-decode-test EXCLUDE_FROM_ALL ../tests/test_bc_decode.cpp)
 target_compile_options(bc-decode-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(bc-decode-test PRIVATE shadps4)
+   # tlg: lo que cuesta un write fault del tracker de paginas en este equipo (standalone).
+   if (WIN32)
+       add_executable(write-fault-test EXCLUDE_FROM_ALL ../tests/writefault/test_write_fault.cpp)
+       target_compile_options(write-fault-test PRIVATE -O2)
+   endif()
 # tlg: the same decoder against the driver's own (the CPU decode is what the port uploads
 # when the driver refuses a 1D BC image). The shader is compiled with glslang, as the host
 # shaders are.

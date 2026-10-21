@@ -8,6 +8,9 @@
 #include <vector>
 #include <chrono>
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 #include <boost/container/small_vector.hpp>
 #include "tlg_toggles.h"
@@ -53,6 +56,97 @@ namespace VideoCore {
 constexpr size_t PM_PAGE_SIZE = 4_KB;
 constexpr size_t PM_PAGE_BITS = 12;
 
+namespace {
+
+// tlg: the protection changes asked for while a fault is being handled are applied together,
+// at the end of the handler. The invalidation leaves the faulting page accessible and the
+// fault also leaves a window around it accessible: two calls, two address space locks and two
+// TLB shootdowns. With the game's 91 threads the shootdown is the expensive part (the bench
+// in port/tests/writefault measures 116 us per fault with the two calls and 64 us with the
+// merged one), and the guest loses that time on every fault.
+//
+// The ranges are the pages whose protection changed; the newer request wins over the older one
+// on the pages they share.
+struct PendingRange {
+    u64 first_page = 0;
+    u64 last_page = 0; ///< exclusive
+    Core::MemoryPermission perms = Core::MemoryPermission::ReadWrite;
+};
+
+/// The batch of the thread that is handling the fault (the changes are per thread).
+struct ProtectionBatch {
+    std::vector<PendingRange> ranges;
+    bool active = false;
+};
+thread_local ProtectionBatch tl_batch;
+
+// tlg: the cost of the write faults, printed every 5 s with TLG_FAULT_COST=1: how long the
+// handler takes, how much of it is the protection change, and how many calls were merged.
+struct FaultCost {
+    std::atomic<u64> faults{0};
+    std::atomic<u64> handler_ns{0};
+    std::atomic<u64> protect_ns{0};
+    std::atomic<u64> protect_calls{0};
+    std::atomic<u64> merged{0};
+    std::atomic<u64> pages{0};
+    std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+};
+FaultCost& Cost() {
+    static FaultCost cost;
+    return cost;
+}
+bool CostEnabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("TLG_FAULT_COST");
+        return e && e[0] == '1';
+    }();
+    return enabled;
+}
+void ReportCost() {
+    if (!CostEnabled()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    auto& cost = Cost();
+    if (now - cost.window < std::chrono::seconds(5)) {
+        return;
+    }
+    cost.window = now;
+    const u64 faults = cost.faults.exchange(0);
+    const u64 handler = cost.handler_ns.exchange(0);
+    const u64 protect = cost.protect_ns.exchange(0);
+    const u64 calls = cost.protect_calls.exchange(0);
+    const u64 merged = cost.merged.exchange(0);
+    const u64 pages = cost.pages.exchange(0);
+    if (!faults) {
+        return;
+    }
+    std::printf("Fault cost (5 s): %llu write faults, handler %.2f us/fault, protect %.2f us/fault "
+                "(%llu calls, %llu pages, %llu batches)\n",
+                static_cast<unsigned long long>(faults), handler / 1000.0 / faults,
+                protect / 1000.0 / faults, static_cast<unsigned long long>(calls),
+                static_cast<unsigned long long>(pages), static_cast<unsigned long long>(merged));
+    std::fflush(stdout);
+}
+
+/// Opens the batch of the thread for the time of a fault.
+class BatchScope {
+public:
+    BatchScope() : previous(tl_batch.active) {
+        tl_batch.active = true;
+    }
+    ~BatchScope() {
+        tl_batch.active = previous;
+    }
+    BatchScope(const BatchScope&) = delete;
+    BatchScope& operator=(const BatchScope&) = delete;
+
+private:
+    bool previous;
+};
+
+} // namespace
+
 struct PageManager::Impl {
     using PageState = VideoCore::PageState;
 
@@ -60,8 +154,12 @@ struct PageManager::Impl {
     static constexpr size_t NUM_ADDRESS_PAGES = 1ULL << (40 - PM_PAGE_BITS);
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / PAGES_PER_LOCK;
     inline static Vulkan::Rasterizer* rasterizer;
+    // tlg: the tracker is a singleton: the fault handler needs it to apply the batch of the
+    // protection changes of the fault it is handling.
+    inline static Impl* instance;
 
     Impl() {
+        instance = this;
 #if defined(__linux__) && defined(MADV_FREE)
         // tlg: cached_pages is one zero counter pair per 4 KiB of the 40-bit address space (512
         // MiB) and is value-initialized, which commits all of it. Hand the untouched part back to
@@ -85,6 +183,96 @@ struct PageManager::Impl {
     }
 
     virtual void Protect(VAddr address, size_t size, Core::MemoryPermission perms) = 0;
+
+    // tlg: the protection change of a range of pages. While a fault is being handled the
+    // changes are batched (see ProtectionBatch above) and applied together at the end of the
+    // handler: the invalidation and the window the fault leaves loose ask for the same thing
+    // (the pages accessible) and two calls cost two address space locks and two TLB
+    // shootdowns, which with the game's 91 threads is most of the cost of the fault.
+    void ApplyProtect(u64 first_page, u64 last_page, Core::MemoryPermission perms) {
+        if (first_page >= last_page) {
+            return;
+        }
+        if (!tl_batch.active) {
+            ApplyRange(first_page, last_page, perms);
+            return;
+        }
+        // The newer request wins over the older one on the pages they share.
+        std::vector<PendingRange> kept;
+        kept.reserve(tl_batch.ranges.size() + 2);
+        for (const auto& old : tl_batch.ranges) {
+            if (old.last_page <= first_page || old.first_page >= last_page) {
+                kept.push_back(old);
+                continue;
+            }
+            if (old.first_page < first_page) {
+                kept.push_back({old.first_page, first_page, old.perms});
+            }
+            if (old.last_page > last_page) {
+                kept.push_back({last_page, old.last_page, old.perms});
+            }
+        }
+        kept.push_back({first_page, last_page, perms});
+        tl_batch.ranges.swap(kept);
+    }
+
+    // tlg: applies the batch of the fault: one call per range of pages that need the same
+    // protection. The protection applied is the one the state of the pages asks for *now*, not
+    // the one that was asked for when the fault started: the upload may have re-protected the
+    // pages while the fault was being handled, and applying the older request would leave them
+    // accessible (the next write to them would not be seen and the GPU would read old data).
+    void FlushProtectionBatch() {
+        if (tl_batch.ranges.empty()) {
+            return;
+        }
+        std::vector<PendingRange> ranges;
+        ranges.swap(tl_batch.ranges);
+        std::sort(ranges.begin(), ranges.end(),
+                  [](const auto& a, const auto& b) { return a.first_page < b.first_page; });
+        // The ranges do not overlap; the ones that touch and want the same protection are one.
+        std::vector<PendingRange> merged;
+        for (const auto& r : ranges) {
+            if (!merged.empty() && merged.back().last_page == r.first_page &&
+                merged.back().perms == r.perms) {
+                merged.back().last_page = r.last_page;
+            } else {
+                merged.push_back(r);
+            }
+        }
+        Cost().merged.fetch_add(1, std::memory_order_relaxed);
+        for (const auto& r : merged) {
+            const auto lock_begin = locks.begin() + r.first_page / PAGES_PER_LOCK;
+            const auto lock_end = locks.begin() + Common::DivCeil(r.last_page, PAGES_PER_LOCK);
+            Common::RangeLockGuard lk(lock_begin, lock_end);
+            // The protection of every page, as its state asks now.
+            u64 run_start = r.first_page;
+            auto run_perms = cached_pages[run_start].Perms();
+            for (u64 page = r.first_page + 1; page < r.last_page; ++page) {
+                const auto perms = cached_pages[page].Perms();
+                if (perms != run_perms) {
+                    ApplyRange(run_start, page, run_perms);
+                    run_start = page;
+                    run_perms = perms;
+                }
+            }
+            ApplyRange(run_start, r.last_page, run_perms);
+        }
+    }
+
+    // tlg: one protection change, with the time it takes (TLG_FAULT_COST=1).
+    void ApplyRange(u64 first_page, u64 last_page, Core::MemoryPermission perms) {
+        const auto start = std::chrono::steady_clock::now();
+        Protect(first_page << PM_PAGE_BITS, (last_page - first_page) << PM_PAGE_BITS, perms);
+        if (!CostEnabled()) {
+            return;
+        }
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+        Cost().protect_ns.fetch_add(ns, std::memory_order_relaxed);
+        Cost().protect_calls.fetch_add(1, std::memory_order_relaxed);
+        Cost().pages.fetch_add(last_page - first_page, std::memory_order_relaxed);
+    }
 
     // tlg: TLG_FAULT_PROFILE=1 prints, every 5 s, the guest instructions whose faults on GPU
     // tracked pages cost the most time (which game code waits on the GPU, and for what).
@@ -146,7 +334,24 @@ struct PageManager::Impl {
             e.object=TlgPerf::Hash(addr);e.a=site;e.b=write;
             TlgPerf::Emit(e);
         }
-        const bool handled = HandleGuestFault(context, addr);
+        // tlg: the protection changes of this fault are applied together, at the end (the
+        // invalidation and the window the fault leaves loose ask for the same thing).
+        bool handled = false;
+        {
+            BatchScope batch;
+            handled = HandleGuestFault(context, addr);
+        }
+        if (instance) {
+            instance->FlushProtectionBatch();
+        }
+        if (CostEnabled()) {
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count();
+            Cost().handler_ns.fetch_add(ns, std::memory_order_relaxed);
+            Cost().faults.fetch_add(1, std::memory_order_relaxed);
+            ReportCost();
+        }
         ProfileFault(context, addr, write,
                      static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                          std::chrono::steady_clock::now() - start).count()));
@@ -191,7 +396,7 @@ struct PageManager::Impl {
             if (range_bytes > 0) {
                 RENDERER_TRACE;
                 // Perform pending (un)protect action
-                Protect(range_begin << PM_PAGE_BITS, range_bytes, perms);
+                ApplyProtect(range_begin, range_begin + (range_bytes >> PM_PAGE_BITS), perms);
                 range_bytes = 0;
                 potential_range_bytes = 0;
             }
@@ -262,7 +467,7 @@ struct PageManager::Impl {
             if (range_bytes > 0) {
                 RENDERER_TRACE;
                 // Perform pending (un)protect action
-                Protect((range_begin << PM_PAGE_BITS), range_bytes, perms);
+                ApplyProtect(range_begin, range_begin + (range_bytes >> PM_PAGE_BITS), perms);
                 range_bytes = 0;
                 potential_range_bytes = 0;
             }
@@ -443,7 +648,12 @@ public:
             const auto ptid = msg.arg.pagefault.feat.ptid;
             {
                 TlgStats::Timer timer{TlgStats::t_write_faults};
+                // tlg: the protection changes of this fault are applied together, at the end.
+                BatchScope batch;
                 rasterizer->OnWriteFault(addr, rasterizer->IsGpuSideThreadId(ptid));
+            }
+            if (instance) {
+                instance->FlushProtectionBatch();
             }
             // Protect() clears with DONTWAKE (it may run for pages nobody waits on).
             uffdio_range wake{};
