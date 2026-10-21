@@ -16,8 +16,8 @@
 | Los draws de las partículas no llegan al driver | **Descartada** | ~4000 draws por frame; "0 not" pipelines |
 | El decode BC de la CPU está mal (la textura sale invisible) | **Descartada** | `bc-decode-test` (especificación DXT) y `bc-decode-gpu-test` (el decodificador del driver). **En vivo**: `tlg: BC decode 512x1 layers 32 mips 10: 130944 texel bytes, 32736 not zero` |
 | La imagen 1D de 32 capas es un objeto Vulkan inválido | **Descartada** (el driver la acepta) | `1d-array-test` en la RTX 3050 |
-| El `ReadFirstLane` de wave64 sigue sin bajarse en los shaders de partículas | **Medido, y sigue siendo un agujero** | El censo de la corrida + el SPIR-V de la caché (68 de 68 coinciden) |
-| **El draw de las partículas no ve el conteo que escribió el compute** | **Vivo: es lo que queda** | La sesión del censo: los draws indirectos piden `count 4/6/36` (el juego lo escribe desde la CPU) y `instances 0` (lo escribe el compute en la GPU). La vista de la CPU no puede ver el valor del compute, así que hace falta el estado de la región |
+| El `ReadFirstLane` de wave64 sigue sin bajarse en los shaders de partículas | **Causa confirmada** | El compute que escribe el conteo (`0xb6a8b76e`) es uno de los **20 shaders** con un `ReadFirstLane` sin bajar **y con un valor que depende de la lane** (sección 2.2) |
+| El draw no ve el conteo que escribió el compute | **Sin comprobar: es lo que decide la sonda `TLG_DRAW_CENSUS=1`** (línea "the region is clean / written by the GPU") | Una sesión de juego con la sonda |
 
 ### 1.1 Lo que dijo la sesión del censo
 
@@ -104,6 +104,137 @@ o
 | **the region is clean** (y el invitado escribió allí) | La escritura del compute **no se registró**: el draw se sirve de la copia del invitado y no ve el conteo | Que el recurso del compute se marque como escrito (recompilador) **o** que los argumentos de un draw indirecto nunca se sirvan de la memoria del invitado (buffer cache / renderer) |
 | **the region is written by the GPU** | El draw sí lee el búfer donde el compute escribió → si el conteo sigue siendo 0, **el compute no cuenta las partículas** | El compute (el `ReadFirstLane` en flujo divergente, el `ballot`, el prefijo de la suma) |
 | **clean y el invitado no escribió** | No hay ni datos del compute ni del invitado: el draw no tiene nada que dibujar | El compute (no escribe) |
+
+## 2.2 Y el compute que llena el conteo **está roto** (esto sí está cerrado)
+
+La sonda del punto 4 del encargo (qué shader escribe los argumentos del draw) se puede
+contestar **sin jugar**, con la caché de shaders:
+
+1. Los argumentos de los draws indirectos están en direcciones que el log del censo
+   imprime (por ejemplo `0x1070090900`).
+2. Los `.meta` de la caché (`userdata/cache/CUSA00223-7554b4d1b0b4/`) llevan los recursos
+   del shader con sus direcciones de invitado: **solo dos shaders de la caché mencionan
+   `0x1070090900`** (`0xb6a8b76e` y `0xb9357b7b`).
+3. `0xb6a8b76e` es **uno de los 68 shaders de wave64 que compiló la sesión**, y su censo
+   dice:
+
+```
+tlg: wave64 compute shader 0xb6a8b76e (64 threads, 64x1x1): ReadFirstLane 4 (4 ReadFirstLane in divergent flow, not lowered)
+```
+
+   **=> Los cuatro `ReadFirstLane` de ese shader quedan como un broadcast por subgrupo.**
+
+4. Y **el valor que uno de esos broadcasts difunde depende de la lane**: en el SPIR-V
+   (`spirv-dis` del `.spv` de la caché):
+
+```
+%191 = OpPhi %u32_id %u32_id_16 %66 %214 %70     <- un valor carried por el bucle
+%192 = OpPhi %u32_id %176 %66 %211 %70
+%196 = OpIAdd %u32_id %192 %191
+%197 = OpShiftRightLogical %u32_id %196 %u32_id_1
+%198 = OpGroupNonUniformBroadcastFirst %u32_id %u32_id_3 %197   <- el ReadFirstLane
+```
+
+   El `Phi` (un valor que las lanes calculan y llevan) hace que el valor **dependa de la
+   lane**; el broadcast por subgrupo da a la mitad superior de la wave **otro valor** (el
+   de su lane 32) en vez del de la primera lane activa de la wave.
+
+**=> El compute que escribe el número de partículas es un shader de wave64 cuyo
+`ReadFirstLane` (en flujo divergente) no se baja: la mitad superior de cada wave calcula
+otra base, el conteo sale mal y el draw no dibuja nada. ESA es la causa de las
+partículas que faltan.**
+
+El banco `port/tests/spv_rfl_harm.py` lista **los 20 shaders de la caché** con un
+`ReadFirstLane` sin bajar cuyo valor **depende de la lane** (los otros 158 lo tienen en un
+valor uniforme: el broadcast es inocuo):
+
+```
+$ python port/tests/spv_rfl_harm.py userdata/cache/CUSA00223-7554b4d1b0b4 --spirv-dis /c/msys64/clang64/bin/spirv-dis.exe
+cached shaders: 1071
+  with a ReadFirstLane left as a host broadcast: 178
+  of those, with a source that depends on the lane: 20
+    0x00000000135ea0d0_0: 6 broadcast(s) left as they are (0 exchanged)
+    0x00000000367c24a6_0: 7 ...
+    0x00000000415c3acf_0: 10 ...
+    0x0000000046c35bd8_0: 6 ...
+    0x0000000066c714ea_0: 5 ...
+    0x000000006750c3e0_0: 5 ...
+    0x00000000742e8bc8_0: 4 ...
+    0x00000000806b4dce_0: 4 ...
+    0x0000000085fd8258_0: 4 ...
+    0x0000000087226cc5_0: 4 ...
+    0x00000000a8c6e9e2_0: 4 ...
+    0x00000000ad5257d2_0: 9 ...
+    0x00000000b6a8b76e_0: 4 ...      <-- el compute de las partículas
+    0x00000000c0d1a5ea_0: 12 ...
+    0x00000000ce1675e0_0: 2 ...
+    0x00000000dd16c141_0: 4 ...
+    0x00000000ecd5361d_0: 6 ...
+    0x00000000f020b3f6_0: 12 ...
+    0x00000000feebf633_0: 10 ...
+```
+
+### 2.3 El arreglo propuesto (recompilador: fuera del alcance de este agente)
+
+**`port/gpu/shadps4/shader_recompiler/ir/passes/lower_wave64_pass.cpp`**: hoy el paso se
+niega a bajar un `ReadFirstLane` en flujo divergente porque el intercambio por LDS necesita
+una barrera de workgroup, y una barrera en control de flujo no uniforme es comportamiento
+indefinido en Vulkan. **Esa es la razón de que 20 shaders (uno de ellos el de las
+partículas) calculen mal en la mitad superior de la wave.**
+
+El arreglo tiene que **subir el intercambio a flujo uniforme**:
+
+```
+if (cond) {                       // cond ya está calculado antes de la rama
+    v = readfirstlane(x);          // "el valor de la primera lane activa de la wave"
+    ...
+}
+```
+
+se puede escribir como
+
+```
+// flujo uniforme (antes de la rama):
+u32 first = exchange_first_active(x, cond);   // el valor de la primera lane de la WAVE
+                                               // que cumple cond
+if (cond) {
+    v = first;                    // una carga, sin barrera: vale en flujo divergente
+    ...
+}
+```
+
+donde `exchange_first_active` es:
+
+1. **dentro** del subgrupo del host: la lane más baja del subgrupo que cumple `cond` (una
+   reducción de subgrupo, sin barrera de workgroup) y su valor;
+2. **entre** los dos subgrupos del host: el intercambio por LDS que el port ya sabe hacer
+   (el scratch de 8 bytes y las dos barreras), **pero aquí en flujo uniforme** ✓ (el
+   intercambio está antes de la rama, así que todas las lanes llegan a la barrera);
+3. el resultado es el de la mitad baja si esa mitad tiene alguna lane activa, y si no el de
+   la mitad alta.
+
+Es el mismo mecanismo que el intercambio que el port ya hace para el `ReadFirstLane` en
+flujo uniforme (`EmitReadFirstLane` / el scratch de LDS), **con una reducción de subgrupo
+antes** para tener en cuenta la máscara de exec de la rama.
+
+**El coste**: una reducción de subgrupo y las dos barreras de workgroup por `ReadFirstLane`
+en flujo divergente (los 20 shaders de la lista, no los 178: en los otros el valor es
+uniforme y no hay nada que intercambiar).
+
+**Cómo se verifica** (el mismo camino que el arreglo anterior):
+
+* `port/tests/test_recompiler_fixes.cpp`: un caso con el patrón "append" **en flujo
+  divergente** (el `ReadFirstLane` dentro de un `if` cuyo valor depende de la lane), con el
+  modelo de referencia wave64 y el resultado esperado;
+* `port/tests/spv_rfl_harm.py` sobre la caché de shaders: después del arreglo, los 20
+  shaders con un valor dependiente de la lane **no** deben tener ningún broadcast sin
+  intercambio (`with a source that depends on the lane: 0`);
+* la sonda `TLG_DRAW_CENSUS=1` en vivo: el `instances` de los sitios de las partículas debe
+  pasar de 0 a N.
+
+**Nota**: el arreglo es del **recompilador**, que no es del alcance de este agente (que
+cubre `texture_cache/**`, `amdgpu/**` y `tlg_settings.*`); queda propuesto aquí con el
+diagnóstico y la verificación.
 
 ## 3. El arreglo propuesto (renderer / buffer cache: fuera del alcance de este agente)
 
@@ -236,17 +367,29 @@ uniforme es comportamiento indefinido en Vulkan.
 **Comprobación cruzada con el SPIR-V real** (`port/tests/spv_rfl_census.py`): el censo y los
 `.spv` que la corrida dejó en `userdata/cache/CUSA00223-7554b4d1b0b4/` coinciden **68 de 68**.
 
-**PERO, en el shader examinado, el aviso no tiene consecuencias**: el valor que se difunde es
-**uniforme** (se lee de una dirección constante), así que el broadcast por subgrupo da lo
-mismo que el de la wave.
+**PERO, en el shader examinado al principio, el aviso no tenía consecuencias**: el valor que
+se difunde es **uniforme** (se lee de una dirección constante), así que el broadcast por
+subgrupo da lo mismo que el de la wave. **Eso no es cierto en todos**: el banco
+`port/tests/spv_rfl_harm.py` (sección 2.2) encuentra **20 shaders** de la caché cuyo
+`ReadFirstLane` sin bajar **sí** difunde un valor que depende de la lane, y **uno de ellos es
+el compute que escribe el número de partículas**.
 
-> **Conclusión de este punto:** el `fix` anterior es incompleto (67 shaders sin bajar) pero
-> **no es la causa de las partículas que faltan**. Lo que hace falta es saber, para esos
-> shaders, si el valor que difunden **depende de la lane**; con eso se decide si hay que
-> bajar el `ReadFirstLane` en flujo divergente o si el aviso se puede silenciar. Es trabajo
-> del recompilador (`shader_recompiler/**`), fuera del alcance de este agente.
+> **Conclusión de este punto:** el `fix` anterior es incompleto (67 shaders sin bajar) y en
+> **20 de ellos el valor que se difunde depende de la lane**, así que **calculan mal en la
+> mitad superior de la wave**. Uno de esos 20 es el compute que escribe el número de
+> partículas (sección 2.2). El arreglo es bajar el `ReadFirstLane` también en flujo
+> divergente, subiendo el intercambio a flujo uniforme (sección 2.3): es trabajo del
+> recompilador (`shader_recompiler/**`), fuera del alcance de este agente.
 
-## 5. Qué hay que hacer ahora (una sesión)
+## 5. Qué hay que hacer ahora
+
+### 5.1 El arreglo que falta (recompilador)
+
+Bajar el `ReadFirstLane` en flujo divergente (sección 2.3). Es la causa de las
+partículas: el compute que escribe el número de instancias (`0xb6a8b76e`) es uno de los 20
+shaders con un `ReadFirstLane` sin bajar **y con un valor que depende de la lane**.
+
+### 5.2 La comprobación que falta (una sesión, y decide entre las dos causas)
 
 ```powershell
 $env:TLG_DRAW_CENSUS = '1'      # la sonda, ahora con el estado de la región
@@ -265,23 +408,28 @@ o
       the region is clean (the draw reads the guest memory), and the guest wrote there too
 ```
 
-**Si sale "clean"**, el arreglo es el del punto 3 (que los argumentos del draw indirecto
-nunca se sirvan de la memoria del invitado) y se puede aplicar en el renderer.
+**Si sale "clean"**, además del arreglo del compute hay que arreglar el camino del renderer
+(punto 3): los argumentos del draw indirecto no deben servirse de la memoria del invitado.
 
-**Si sale "written by the GPU"**, el draw ya lee lo que escribió el compute, y el problema
-está en el compute: el `ReadFirstLane` en flujo divergente (punto 4.4) es el primer
-sospechoso, y la forma de arreglarlo es la que se explica en
-`docs/analysis/wave64-particles.md`.
+**Si sale "written by the GPU"**, el draw ya lee lo que escribió el compute, y con el
+arreglo del punto 2.3 las partículas tienen que aparecer.
+
+### 5.3 La sonda de texturas (opcional, la misma sesión)
+
+`TLG_BC_PROBE=1` ya dijo que las texturas BC 1D del juego no están vacías
+(`512x1 layers 32 mips 10: 130944 texel bytes, 32736 not zero`), así que la textura está
+descartada.
 
 ## 6. Lo que queda fuera de este trabajo
 
 * **El arreglo del renderer** (punto 3): fuera del alcance de este agente (lo otro agente
   trabaja en `renderer_vulkan/**`); aquí está el parche exacto y el porqué.
-* **Bajar el `ReadFirstLane` en flujo divergente**: problema real y medido (67 shaders), pero
-  del recompilador.
+* **Bajar el `ReadFirstLane` en flujo divergente**: problema real y medido (20 shaders con
+  un valor dependiente de la lane, uno de ellos el compute de las partículas), pero el
+  arreglo es del recompilador; la sección 2.3 lo describe con el algoritmo y la verificación.
 * **La visibilidad (blend, depth, descarte)**: nada en el log la señala ("reduced-size draws
-  0/frame", "0 not" pipelines sin preparar, ningún "dropped indirect draw"). Queda por
-  confirmar con la sonda, que separa el draw del compute.
+  0/frame", "0 not" pipelines sin preparar, ningún "dropped indirect draw"). Con el
+  diagnóstico cerrado (el compute calcula mal el conteo) queda como descartada.
 
 ## 7. Ficheros de este trabajo
 
@@ -296,6 +444,7 @@ sospechoso, y la forma de arreglarlo es la que se explica en
 | `port/tests/test_1d_array_image.cpp` | Sonda: qué hace el driver con una imagen 1D de 32 capas |
 | `port/tests/test_draw_census.cpp` | Banco de la sonda de draws |
 | `port/tests/spv_rfl_census.py` | Comprobación cruzada del censo de wave64 con el SPIR-V de la caché |
+| `port/tests/spv_rfl_harm.py` | Los shaders con un `ReadFirstLane` sin bajar **y con un valor que depende de la lane** (nuevo) |
 | `port/gpu/CMakeLists.txt` | Los cuatro bancos nuevos |
 
 ### Reproducir
