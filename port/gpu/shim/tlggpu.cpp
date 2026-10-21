@@ -98,11 +98,22 @@ public:
 
 void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
     rasterizer = rasterizer_;
+    // tlg: TLG_NO_PAGE_TRACK=1 no registra las paginas del invitado para el tracker de la GPU.
+    // Es una prueba de diagnostico: el tracker protege las paginas para detectar las escrituras
+    // (el write fault y el mprotect invalidan el TLB del invitado), pero sin el las lecturas de
+    // vuelta pueden ver memoria vieja. Sirve para medir cuanto cuesta el tracker.
+    static const bool no_page_track = [] {
+        const char* e = std::getenv("TLG_NO_PAGE_TRACK");
+        return e && e[0] == '1';
+    }();
     // Existing guest mappings are replayed by the runtime when hooks are installed.
     runtime_memory_set_gpu_hooks(
         [](uintptr_t address, uint64_t size) {
             auto* r = Memory::Instance()->GetRasterizer();
             r->RegisterMemory(address, size);
+            if (no_page_track) {
+                return;
+            }
             r->MapMemory(address, size);
         },
         [](uintptr_t address, uint64_t size) { Memory::Instance()->GetRasterizer()->UnmapMemory(address, size); },
