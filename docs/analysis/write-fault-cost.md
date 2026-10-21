@@ -290,12 +290,13 @@ de la subida se paga una vez por subida, no por fallo).
 | `window` (dos llamadas) | 68,1 µs | 41,5 µs | 1 519 | 310 ms/s |
 | `merged` (una llamada) | 59,9 µs | 37,1 µs | 1 430 | 256 ms/s |
 
-**El valor medido es del 12 % por fallo** (y del 17 % del parón total): el coste fijo de una
-llamada a `VirtualProtect` (el bloqueo del espacio de direcciones y la ida y vuelta del
-*shootdown*) es de ~15-20 µs, y el margen son las 64 páginas de la ventana (~0,06 µs/página).
-El cambio sigue siendo correcto y más simple (una llamada, un rango), y es **la mitad del
-beneficio del patrón guard** (que en el banco baja la protección de 53 a 9,4 µs) **sin tocar la
-corrección**. Con la guardia, las dos llamadas se reducen a una de verdad (la del kernel, gratis).
+**El valor medido es del 12-18 % por fallo** (12 % en la mediana de 3, 18 % en una repetición
+suelta: el ruido del banco es de ese orden): el coste fijo de una llamada a `VirtualProtect` (el
+bloqueo del espacio de direcciones y la ida y vuelta del *shootdown*) es de ~15-20 µs, y el
+margen son las 64 páginas de la ventana (~0,06 µs/página). El cambio sigue siendo correcto y más
+simple (una llamada, un rango), y es **la mitad del beneficio del patrón guard** (que en el banco
+baja la protección de 53 a 9,4 µs) **sin tocar la corrección**. Con la guardia, las dos llamadas
+se reducen a una de verdad (la del kernel, gratis).
 
 ## 9. Qué mirar ahora (las palancas que quedan, con su dueño)
 
