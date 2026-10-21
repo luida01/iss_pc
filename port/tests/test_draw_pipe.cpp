@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -24,6 +25,7 @@
 #include <time.h>
 #endif
 
+#include "tlg_threads.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 
 using Clock = std::chrono::steady_clock;
@@ -101,10 +103,9 @@ struct Result {
     u64 sleeps{};
 };
 
-Result Measure(int spin_budget_us, int interval_us, int burst_size) {
+Result Measure(int interval_us, int burst_size) {
     Context context;
     Vulkan::DrawPipe pipe(&Handler, &context);
-    pipe.SetSpinBudget(spin_budget_us);
 
     std::vector<u8> payload(64);
     std::atomic<bool> stop{false};
@@ -162,16 +163,22 @@ int main() {
     };
     constexpr Case cases[] = {{"close (burst 20)", 20, 20}, {"far (burst 1)", 200, 1}};
 
+    // tlg: the spin budget of the recording thread is a policy of the pipe (200 us with
+    // 12 threads or more, 50 us otherwise); TLG_PIPE_SPIN_US overrides it. The pipe reads
+    // it once, so a run measures one budget: the runner varies the variable.
+    int budget = TlgThreads::SizingCount() >= 12 ? 200 : 50;
+    if (const char* env = std::getenv("TLG_PIPE_SPIN_US")) {
+        budget = std::max(0, std::atoi(env));
+    }
+    std::printf("spin budget: %d us\n", budget);
     std::printf("%-18s %8s %13s %13s %13s %12s %10s %8s\n", "producer", "spin us",
                 "spin/pkt us", "sleep/pkt us", "cpu/pkt us", "latency us", "max us", "sleeps");
     for (const auto& c : cases) {
-        for (const int budget : {200, 50, 20, 0}) {
-            const auto r = Measure(budget, c.interval_us, c.burst_size);
-            std::printf("%-18s %8d %13.2f %13.2f %13.2f %12.2f %10.2f %8llu\n", c.name, budget,
-                        r.spin_us_per_packet, r.sleep_us_per_packet, r.cpu_us_per_packet,
-                        r.mean_latency_us, r.max_latency_us,
-                        static_cast<unsigned long long>(r.sleeps));
-        }
+        const auto r = Measure(c.interval_us, c.burst_size);
+        std::printf("%-18s %8d %13.2f %13.2f %13.2f %12.2f %10.2f %8llu\n", c.name, budget,
+                    r.spin_us_per_packet, r.sleep_us_per_packet, r.cpu_us_per_packet,
+                    r.mean_latency_us, r.max_latency_us,
+                    static_cast<unsigned long long>(r.sleeps));
     }
     std::printf("draw pipe test: ok\n");
     return 0;

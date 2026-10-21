@@ -594,3 +594,16 @@ target_link_libraries(fsr4-bench PRIVATE ffx-vulkan::fsr4-v07-vulkan ffx-vulkan:
 
 add_executable(cheat-hook-test EXCLUDE_FROM_ALL ../tests/test_cheat_hook.cpp)
 target_compile_options(cheat-hook-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+
+# tlg: what the port's own recording chunk costs the Vulkan recording thread (the walk
+# of the chunk and the payload of its closures). docs/analysis/record-cost.md.
+add_executable(chunk-cost-test EXCLUDE_FROM_ALL ../tests/test_chunk_cost.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(chunk-cost-test PRIVATE shim shadps4)
+target_compile_options(chunk-cost-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+# The scheduler includes the draw pipe, which uses gettid() (the TEB) on Windows.
+if (WIN32)
+    target_compile_options(chunk-cost-test PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/tlg_win_compat.h)
+endif()
+target_link_libraries(chunk-cost-test PRIVATE tlggpu)
